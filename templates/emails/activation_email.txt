@@ -1,0 +1,26 @@
+Welcome to Payrova HR
+=====================
+
+Activate Your Account
+
+Hello,
+
+An administrator has created an HR employer account for you. To activate your account and set your password, please use the activation link below:
+
+{{ activation_link }}
+
+Or use this activation code: {{ activation_code }}
+
+Important:
+- This activation link will expire in {{ expiry_hours }} hours
+- You will need to set a new password when activating your account
+- After activation, you'll be able to log in and complete your employer profile
+
+If you didn't expect this email or believe it was sent by mistake, please contact your administrator.
+
+Best regards,
+The Payrova HR Team
+
+---
+© 2025 Payrova HR. All rights reserved.
+This is an automated message, please do not reply to this email.
