@@ -133,6 +133,11 @@ class EmployerProfile(models.Model):
     bank_account_number = models.CharField(max_length=50)
     bank_iban_swift = models.CharField(max_length=50, blank=True, null=True, help_text='IBAN/SWIFT code if applicable')
     
+    # Database Information (for multi-tenancy)
+    database_name = models.CharField(max_length=100, unique=True, null=True, blank=True, help_text='Tenant database name')
+    database_created = models.BooleanField(default=False, help_text='Whether tenant database has been created')
+    database_created_at = models.DateTimeField(null=True, blank=True, help_text='When the tenant database was created')
+    
     # Timestamps
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
@@ -144,6 +149,10 @@ class EmployerProfile(models.Model):
 
     def __str__(self):
         return f"{self.company_name} - {self.user.email}"
+    
+    def get_database_alias(self):
+        """Get the database alias for this employer's tenant database"""
+        return f"tenant_{self.id}" if self.database_name else 'default'
 
 
 class EmployeeProfile(models.Model):

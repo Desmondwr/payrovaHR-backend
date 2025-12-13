@@ -14,6 +14,10 @@ from .utils import (
     api_response, send_activation_email, generate_totp_secret,
     generate_qr_code, verify_totp_code
 )
+from .database_utils import create_tenant_database
+import logging
+
+logger = logging.getLogger(__name__)
 
 User = get_user_model()
 
@@ -292,12 +296,27 @@ class CompleteEmployerProfileView(APIView):
         serializer = EmployerProfileSerializer(data=request.data, context={'request': request})
         
         if serializer.is_valid():
-            serializer.save()
+            employer_profile = serializer.save()
+            
+            # Create tenant database for this employer
+            logger.info(f"Creating tenant database for employer: {user.email}")
+            success, db_name, error_msg = create_tenant_database(employer_profile)
+            
+            if success:
+                logger.info(f"Tenant database created successfully: {db_name}")
+                response_message = f'Employer profile completed successfully. Tenant database "{db_name}" created.'
+            else:
+                logger.error(f"Failed to create tenant database: {error_msg}")
+                response_message = f'Employer profile completed, but database creation failed: {error_msg}'
             
             return api_response(
                 success=True,
-                message='Employer profile completed successfully.',
-                data=serializer.data,
+                message=response_message,
+                data={
+                    'profile': serializer.data,
+                    'database_created': success,
+                    'database_name': db_name,
+                },
                 status=status.HTTP_201_CREATED
             )
         

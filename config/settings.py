@@ -94,6 +94,9 @@ DATABASES = {
     }
 }
 
+# Database Router for Multi-tenancy
+DATABASE_ROUTERS = ['accounts.database_router.TenantDatabaseRouter']
+
 
 # Custom User Model
 AUTH_USER_MODEL = 'accounts.User'
@@ -208,6 +211,9 @@ DEFAULT_FROM_EMAIL = config('DEFAULT_FROM_EMAIL', default='noreply@payrova.com')
 # Application Settings
 FRONTEND_URL = config('FRONTEND_URL', default='http://localhost:3000')
 ACTIVATION_TOKEN_EXPIRY_HOURS = 48
+
+# Multi-tenancy Settings
+CURRENT_TENANT_DB = None  # Thread-local storage for current tenant database
 
 
 # Security Settings (for production)
