@@ -40,7 +40,8 @@ class User(AbstractUser):
     email = models.EmailField(unique=True, db_index=True)
     is_admin = models.BooleanField(default=False, help_text='Designates whether the user is a super admin')
     is_employer = models.BooleanField(default=False, help_text='Designates whether the user is an employer')
-    profile_completed = models.BooleanField(default=False, help_text='Designates whether the employer has completed their profile')
+    is_employee = models.BooleanField(default=False, help_text='Designates whether the user is an employee')
+    profile_completed = models.BooleanField(default=False, help_text='Designates whether the user has completed their profile')
     two_factor_enabled = models.BooleanField(default=False, help_text='Designates whether 2FA is enabled')
     two_factor_secret = models.CharField(max_length=32, blank=True, null=True, help_text='TOTP secret for 2FA')
     created_at = models.DateTimeField(auto_now_add=True)
@@ -143,4 +144,74 @@ class EmployerProfile(models.Model):
 
     def __str__(self):
         return f"{self.company_name} - {self.user.email}"
+
+
+class EmployeeProfile(models.Model):
+    """Model to store employee profile information"""
+    
+    GENDER_CHOICES = [
+        ('MALE', 'Male'),
+        ('FEMALE', 'Female'),
+        ('OTHER', 'Other'),
+        ('PREFER_NOT_TO_SAY', 'Prefer not to say'),
+    ]
+    
+    MARITAL_STATUS_CHOICES = [
+        ('SINGLE', 'Single'),
+        ('MARRIED', 'Married'),
+        ('DIVORCED', 'Divorced'),
+        ('WIDOWED', 'Widowed'),
+    ]
+
+    user = models.OneToOneField(User, on_delete=models.CASCADE, related_name='employee_profile')
+    
+    # Personal Information
+    first_name = models.CharField(max_length=100)
+    last_name = models.CharField(max_length=100)
+    middle_name = models.CharField(max_length=100, blank=True, null=True)
+    date_of_birth = models.DateField()
+    gender = models.CharField(max_length=20, choices=GENDER_CHOICES)
+    marital_status = models.CharField(max_length=20, choices=MARITAL_STATUS_CHOICES)
+    nationality = models.CharField(max_length=100)
+    
+    # Contact Information
+    phone_number = models.CharField(max_length=20)
+    alternative_phone = models.CharField(max_length=20, blank=True, null=True)
+    personal_email = models.EmailField(blank=True, null=True)
+    address = models.TextField()
+    city = models.CharField(max_length=100)
+    state_region = models.CharField(max_length=100)
+    postal_code = models.CharField(max_length=20, blank=True, null=True)
+    country = models.CharField(max_length=100)
+    
+    # Emergency Contact
+    emergency_contact_name = models.CharField(max_length=200)
+    emergency_contact_relationship = models.CharField(max_length=100)
+    emergency_contact_phone = models.CharField(max_length=20)
+    
+    # Identification
+    national_id_number = models.CharField(max_length=50, unique=True)
+    passport_number = models.CharField(max_length=50, blank=True, null=True, unique=True)
+    
+    # Employment Preferences (for initial registration)
+    desired_position = models.CharField(max_length=255, blank=True, null=True)
+    years_of_experience = models.IntegerField(default=0)
+    highest_education_level = models.CharField(max_length=100, blank=True, null=True)
+    skills = models.TextField(blank=True, null=True, help_text='Comma-separated list of skills')
+    
+    # Profile Picture
+    profile_picture = models.ImageField(upload_to='employee_profiles/', blank=True, null=True)
+    
+    # Timestamps
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = 'employee_profiles'
+        verbose_name = 'Employee Profile'
+        verbose_name_plural = 'Employee Profiles'
+
+    def __str__(self):
+        return f"{self.first_name} {self.last_name} - {self.user.email}"
+
 

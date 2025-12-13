@@ -4,11 +4,11 @@ from rest_framework_simplejwt.tokens import RefreshToken
 from django.contrib.auth import get_user_model
 from django_ratelimit.decorators import ratelimit
 from django.utils.decorators import method_decorator
-from .models import ActivationToken, EmployerProfile
+from .models import ActivationToken, EmployerProfile, EmployeeProfile
 from .serializers import (
     UserSerializer, CreateEmployerSerializer, ActivateAccountSerializer,
     LoginSerializer, EmployerProfileSerializer, Enable2FASerializer,
-    Disable2FASerializer
+    Disable2FASerializer, EmployeeRegistrationSerializer, EmployeeProfileSerializer
 )
 from .utils import (
     api_response, send_activation_email, generate_totp_secret,
@@ -322,10 +322,106 @@ class UserProfileView(APIView):
         if user.is_employer and hasattr(user, 'employer_profile'):
             user_data['employer_profile'] = EmployerProfileSerializer(user.employer_profile).data
         
+        # Add employee profile if exists
+        if user.is_employee and hasattr(user, 'employee_profile'):
+            user_data['employee_profile'] = EmployeeProfileSerializer(user.employee_profile).data
+        
         return api_response(
             success=True,
             message='User profile retrieved successfully.',
             data=user_data,
             status=status.HTTP_200_OK
         )
+
+
+@method_decorator(ratelimit(key='ip', rate='5/h', method='POST'), name='dispatch')
+class EmployeeRegistrationView(APIView):
+    """View for employee self-registration"""
+    
+    permission_classes = [permissions.AllowAny]
+    
+    def post(self, request):
+        serializer = EmployeeRegistrationSerializer(data=request.data)
+        
+        if serializer.is_valid():
+            user, employee_profile = serializer.save()
+            
+            # Generate JWT tokens for immediate login
+            refresh = RefreshToken.for_user(user)
+            
+            return api_response(
+                success=True,
+                message='Employee account created successfully. You are now logged in.',
+                data={
+                    'user': UserSerializer(user).data,
+                    'employee_profile': EmployeeProfileSerializer(employee_profile).data,
+                    'tokens': {
+                        'refresh': str(refresh),
+                        'access': str(refresh.access_token),
+                    },
+                },
+                status=status.HTTP_201_CREATED
+            )
+        
+        return api_response(
+            success=False,
+            message='Failed to create employee account.',
+            errors=serializer.errors,
+            status=status.HTTP_400_BAD_REQUEST
+        )
+
+
+class EmployeeProfileDetailView(generics.RetrieveUpdateAPIView):
+    """View to retrieve and update employee profile"""
+    
+    serializer_class = EmployeeProfileSerializer
+    permission_classes = [permissions.IsAuthenticated]
+    
+    def get_object(self):
+        user = self.request.user
+        
+        if not user.is_employee:
+            from rest_framework.exceptions import PermissionDenied
+            raise PermissionDenied("Only employees can access this endpoint.")
+        
+        # Get employee profile
+        try:
+            return user.employee_profile
+        except EmployeeProfile.DoesNotExist:
+            from rest_framework.exceptions import NotFound
+            raise NotFound("Employee profile not found.")
+    
+    def retrieve(self, request, *args, **kwargs):
+        instance = self.get_object()
+        serializer = self.get_serializer(instance)
+        
+        return api_response(
+            success=True,
+            message='Employee profile retrieved successfully.',
+            data=serializer.data,
+            status=status.HTTP_200_OK
+        )
+    
+    def update(self, request, *args, **kwargs):
+        partial = kwargs.pop('partial', False)
+        instance = self.get_object()
+        serializer = self.get_serializer(instance, data=request.data, partial=partial)
+        
+        if serializer.is_valid():
+            serializer.save()
+            
+            return api_response(
+                success=True,
+                message='Employee profile updated successfully.',
+                data=serializer.data,
+                status=status.HTTP_200_OK
+            )
+        
+        return api_response(
+            success=False,
+            message='Failed to update employee profile.',
+            errors=serializer.errors,
+            status=status.HTTP_400_BAD_REQUEST
+        )
+
 

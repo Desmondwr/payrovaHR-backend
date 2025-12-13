@@ -1,21 +1,21 @@
 from django.contrib import admin
 from django.contrib.auth.admin import UserAdmin as BaseUserAdmin
-from .models import User, ActivationToken, EmployerProfile
+from .models import User, ActivationToken, EmployerProfile, EmployeeProfile
 
 
 @admin.register(User)
 class UserAdmin(BaseUserAdmin):
     """Admin interface for User model"""
     
-    list_display = ('email', 'is_admin', 'is_employer', 'is_active', 'profile_completed', 'two_factor_enabled', 'created_at')
-    list_filter = ('is_admin', 'is_employer', 'is_active', 'profile_completed', 'two_factor_enabled', 'created_at')
+    list_display = ('email', 'is_admin', 'is_employer', 'is_employee', 'is_active', 'profile_completed', 'two_factor_enabled', 'created_at')
+    list_filter = ('is_admin', 'is_employer', 'is_employee', 'is_active', 'profile_completed', 'two_factor_enabled', 'created_at')
     search_fields = ('email', 'first_name', 'last_name')
     ordering = ('-created_at',)
     
     fieldsets = (
         (None, {'fields': ('email', 'password')}),
         ('Personal Info', {'fields': ('first_name', 'last_name')}),
-        ('Permissions', {'fields': ('is_active', 'is_admin', 'is_employer', 'is_staff', 'is_superuser', 'groups', 'user_permissions')}),
+        ('Permissions', {'fields': ('is_active', 'is_admin', 'is_employer', 'is_employee', 'is_staff', 'is_superuser', 'groups', 'user_permissions')}),
         ('Status', {'fields': ('profile_completed',)}),
         ('Two-Factor Authentication', {'fields': ('two_factor_enabled', 'two_factor_secret')}),
         ('Important dates', {'fields': ('last_login', 'created_at', 'updated_at')}),
@@ -24,7 +24,7 @@ class UserAdmin(BaseUserAdmin):
     add_fieldsets = (
         (None, {
             'classes': ('wide',),
-            'fields': ('email', 'password1', 'password2', 'is_admin', 'is_employer'),
+            'fields': ('email', 'password1', 'password2', 'is_admin', 'is_employer', 'is_employee'),
         }),
     )
     
@@ -65,6 +65,40 @@ class EmployerProfileAdmin(admin.ModelAdmin):
         }),
         ('Financial Information', {
             'fields': ('bank_name', 'bank_account_number', 'bank_iban_swift')
+        }),
+        ('Timestamps', {'fields': ('created_at', 'updated_at')}),
+    )
+
+
+@admin.register(EmployeeProfile)
+class EmployeeProfileAdmin(admin.ModelAdmin):
+    """Admin interface for EmployeeProfile model"""
+    
+    list_display = ('first_name', 'last_name', 'user', 'phone_number', 'national_id_number', 'created_at')
+    list_filter = ('gender', 'marital_status', 'created_at')
+    search_fields = ('first_name', 'last_name', 'user__email', 'phone_number', 'national_id_number', 'passport_number')
+    readonly_fields = ('created_at', 'updated_at')
+    ordering = ('-created_at',)
+    
+    fieldsets = (
+        ('User', {'fields': ('user',)}),
+        ('Personal Information', {
+            'fields': ('first_name', 'last_name', 'middle_name', 'date_of_birth', 'gender', 'marital_status', 'nationality')
+        }),
+        ('Contact Information', {
+            'fields': ('phone_number', 'alternative_phone', 'personal_email', 'address', 'city', 'state_region', 'postal_code', 'country')
+        }),
+        ('Emergency Contact', {
+            'fields': ('emergency_contact_name', 'emergency_contact_relationship', 'emergency_contact_phone')
+        }),
+        ('Identification', {
+            'fields': ('national_id_number', 'passport_number')
+        }),
+        ('Employment Information', {
+            'fields': ('desired_position', 'years_of_experience', 'highest_education_level', 'skills')
+        }),
+        ('Profile Picture', {
+            'fields': ('profile_picture',)
         }),
         ('Timestamps', {'fields': ('created_at', 'updated_at')}),
     )

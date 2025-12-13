@@ -209,3 +209,128 @@ class Disable2FASerializer(serializers.Serializer):
             raise serializers.ValidationError({"password": "Invalid password."})
         
         return data
+
+
+class EmployeeRegistrationSerializer(serializers.Serializer):
+    """Serializer for employee self-registration"""
+    
+    # Account Information
+    email = serializers.EmailField()
+    password = serializers.CharField(write_only=True, validators=[validate_password])
+    confirm_password = serializers.CharField(write_only=True)
+    
+    # Personal Information
+    first_name = serializers.CharField(max_length=100)
+    last_name = serializers.CharField(max_length=100)
+    middle_name = serializers.CharField(max_length=100, required=False, allow_blank=True)
+    date_of_birth = serializers.DateField()
+    gender = serializers.ChoiceField(choices=['MALE', 'FEMALE', 'OTHER', 'PREFER_NOT_TO_SAY'])
+    marital_status = serializers.ChoiceField(choices=['SINGLE', 'MARRIED', 'DIVORCED', 'WIDOWED'])
+    nationality = serializers.CharField(max_length=100)
+    
+    # Contact Information
+    phone_number = serializers.CharField(max_length=20)
+    alternative_phone = serializers.CharField(max_length=20, required=False, allow_blank=True)
+    personal_email = serializers.EmailField(required=False, allow_blank=True)
+    address = serializers.CharField()
+    city = serializers.CharField(max_length=100)
+    state_region = serializers.CharField(max_length=100)
+    postal_code = serializers.CharField(max_length=20, required=False, allow_blank=True)
+    country = serializers.CharField(max_length=100)
+    
+    # Emergency Contact
+    emergency_contact_name = serializers.CharField(max_length=200)
+    emergency_contact_relationship = serializers.CharField(max_length=100)
+    emergency_contact_phone = serializers.CharField(max_length=20)
+    
+    # Identification
+    national_id_number = serializers.CharField(max_length=50)
+    passport_number = serializers.CharField(max_length=50, required=False, allow_blank=True)
+    
+    # Employment Preferences
+    desired_position = serializers.CharField(max_length=255, required=False, allow_blank=True)
+    years_of_experience = serializers.IntegerField(default=0, required=False)
+    highest_education_level = serializers.CharField(max_length=100, required=False, allow_blank=True)
+    skills = serializers.CharField(required=False, allow_blank=True)
+    
+    def validate_email(self, value):
+        if User.objects.filter(email=value).exists():
+            raise serializers.ValidationError("A user with this email already exists.")
+        return value
+    
+    def validate_national_id_number(self, value):
+        from .models import EmployeeProfile
+        if EmployeeProfile.objects.filter(national_id_number=value).exists():
+            raise serializers.ValidationError("This national ID number is already registered.")
+        return value
+    
+    def validate_passport_number(self, value):
+        if value:
+            from .models import EmployeeProfile
+            if EmployeeProfile.objects.filter(passport_number=value).exists():
+                raise serializers.ValidationError("This passport number is already registered.")
+        return value
+    
+    def validate(self, data):
+        # Check if passwords match
+        if data['password'] != data['confirm_password']:
+            raise serializers.ValidationError({"confirm_password": "Passwords do not match."})
+        
+        return data
+    
+    def create(self, validated_data):
+        from .models import EmployeeProfile
+        
+        # Remove confirm_password as it's not needed
+        validated_data.pop('confirm_password')
+        
+        # Extract user data
+        email = validated_data.pop('email')
+        password = validated_data.pop('password')
+        
+        # Create user account
+        user = User.objects.create_user(
+            email=email,
+            password=password,
+            is_employee=True,
+            is_active=True,  # Employee accounts are active immediately
+            profile_completed=True  # Profile is completed during registration
+        )
+        
+        # Create employee profile
+        employee_profile = EmployeeProfile.objects.create(
+            user=user,
+            **validated_data
+        )
+        
+        return user, employee_profile
+
+
+class EmployeeProfileSerializer(serializers.ModelSerializer):
+    """Serializer for EmployeeProfile model"""
+    
+    user_email = serializers.EmailField(source='user.email', read_only=True)
+    
+    class Meta:
+        from .models import EmployeeProfile
+        model = EmployeeProfile
+        fields = '__all__'
+        read_only_fields = ('user', 'created_at', 'updated_at')
+    
+    def validate_national_id_number(self, value):
+        from .models import EmployeeProfile
+        # Check if national ID exists for a different user
+        if self.instance:
+            if EmployeeProfile.objects.exclude(pk=self.instance.pk).filter(national_id_number=value).exists():
+                raise serializers.ValidationError("This national ID number is already registered.")
+        return value
+    
+    def validate_passport_number(self, value):
+        if value:
+            from .models import EmployeeProfile
+            # Check if passport exists for a different user
+            if self.instance:
+                if EmployeeProfile.objects.exclude(pk=self.instance.pk).filter(passport_number=value).exists():
+                    raise serializers.ValidationError("This passport number is already registered.")
+        return value
+

@@ -3,7 +3,8 @@ from rest_framework_simplejwt.views import TokenRefreshView
 from .views import (
     CreateEmployerView, ActivateAccountView, LoginView,
     Setup2FAView, Verify2FAView, Disable2FAView,
-    EmployerProfileView, CompleteEmployerProfileView, UserProfileView
+    EmployerProfileView, CompleteEmployerProfileView, UserProfileView,
+    EmployeeRegistrationView, EmployeeProfileDetailView
 )
 
 app_name = 'accounts'
@@ -16,6 +17,7 @@ urlpatterns = [
     path('auth/activate/', ActivateAccountView.as_view(), name='activate-account'),
     path('auth/login/', LoginView.as_view(), name='login'),
     path('auth/token/refresh/', TokenRefreshView.as_view(), name='token-refresh'),
+    path('auth/register/employee/', EmployeeRegistrationView.as_view(), name='register-employee'),
     
     # 2FA endpoints
     path('auth/2fa/setup/', Setup2FAView.as_view(), name='setup-2fa'),
@@ -26,4 +28,6 @@ urlpatterns = [
     path('profile/', UserProfileView.as_view(), name='user-profile'),
     path('employer/profile/', EmployerProfileView.as_view(), name='employer-profile'),
     path('employer/profile/complete/', CompleteEmployerProfileView.as_view(), name='complete-employer-profile'),
+    path('employee/profile/', EmployeeProfileDetailView.as_view(), name='employee-profile'),
 ]
+
