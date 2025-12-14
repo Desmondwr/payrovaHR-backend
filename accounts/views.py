@@ -1,5 +1,99 @@
 from rest_framework import status, generics, permissions
 from rest_framework.views import APIView
+from rest_framework.response import Response
+from rest_framework.permissions import IsAdminUser
+from rest_framework_simplejwt.tokens import RefreshToken
+from django.contrib.auth import get_user_model
+from django_ratelimit.decorators import ratelimit
+from django.utils.decorators import method_decorator
+from .models import ActivationToken, EmployerProfile, EmployeeProfile
+from .serializers import (
+    UserSerializer, CreateEmployerSerializer, ActivateAccountSerializer,
+    LoginSerializer, EmployerProfileSerializer, Enable2FASerializer,
+    Disable2FASerializer, EmployeeRegistrationSerializer, EmployeeProfileSerializer,
+    EmployerListSerializer
+)
+from .utils import (
+    api_response, send_activation_email, generate_totp_secret,
+    generate_qr_code, verify_totp_code
+)
+from .database_utils import create_tenant_database
+import logging
+
+logger = logging.getLogger(__name__)
+
+User = get_user_model()
+
+# --- All class definitions below ---
+
+class EmployerStatusView(APIView):
+    """Admin-only view to enable or disable an employer account"""
+    permission_classes = [IsAdminUser]
+
+    def patch(self, request, pk):
+        try:
+            employer = User.objects.get(pk=pk, is_employer=True)
+        except User.DoesNotExist:
+            return api_response(
+                success=False,
+                message='Employer not found.',
+                status=status.HTTP_404_NOT_FOUND
+            )
+        is_active = request.data.get('is_active')
+        if is_active is None:
+            return api_response(
+                success=False,
+                message='Missing is_active field.',
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        employer.is_active = bool(is_active)
+        employer.save()
+        return api_response(
+            success=True,
+            message=f'Employer account {"enabled" if employer.is_active else "disabled"}.',
+            data={'id': employer.id, 'is_active': employer.is_active},
+            status=status.HTTP_200_OK
+        )
+from rest_framework import status, generics, permissions
+from rest_framework.views import APIView
+from rest_framework.response import Response
+from rest_framework_simplejwt.tokens import RefreshToken
+from django.contrib.auth import get_user_model
+from django_ratelimit.decorators import ratelimit
+from django.utils.decorators import method_decorator
+from .models import ActivationToken, EmployerProfile, EmployeeProfile
+from .serializers import (
+    UserSerializer, CreateEmployerSerializer, ActivateAccountSerializer,
+    LoginSerializer, EmployerProfileSerializer, Enable2FASerializer,
+    Disable2FASerializer, EmployeeRegistrationSerializer, EmployeeProfileSerializer,
+    EmployerListSerializer
+)
+from .utils import (
+    api_response, send_activation_email, generate_totp_secret,
+    generate_qr_code, verify_totp_code
+)
+from .database_utils import create_tenant_database
+import logging
+
+logger = logging.getLogger(__name__)
+
+User = get_user_model()
+
+class ListEmployersView(APIView):
+    """Admin-only view to list all employer users and their profiles"""
+    permission_classes = [IsAdminUser]
+
+    def get(self, request):
+        employers = User.objects.filter(is_employer=True)
+        serializer = EmployerListSerializer(employers, many=True)
+        return api_response(
+            success=True,
+            message='List of all employers.',
+            data=serializer.data,
+            status=status.HTTP_200_OK
+        )
+from rest_framework import status, generics, permissions
+from rest_framework.views import APIView
 from rest_framework_simplejwt.tokens import RefreshToken
 from django.contrib.auth import get_user_model
 from django_ratelimit.decorators import ratelimit

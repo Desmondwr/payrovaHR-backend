@@ -4,7 +4,7 @@ from .views import (
     CreateEmployerView, ActivateAccountView, LoginView,
     Setup2FAView, Verify2FAView, Disable2FAView,
     EmployerProfileView, CompleteEmployerProfileView, UserProfileView,
-    EmployeeRegistrationView, EmployeeProfileDetailView
+    EmployeeRegistrationView, EmployeeProfileDetailView, ListEmployersView, EmployerStatusView
 )
 
 app_name = 'accounts'
@@ -12,6 +12,8 @@ app_name = 'accounts'
 urlpatterns = [
     # Admin endpoints
     path('admin/create-employer/', CreateEmployerView.as_view(), name='create-employer'),
+    path('admin/employers/', ListEmployersView.as_view(), name='list-employers'),
+    path('admin/employers/<int:pk>/status/', EmployerStatusView.as_view(), name='employer-status'),
     
     # Authentication endpoints
     path('auth/activate/', ActivateAccountView.as_view(), name='activate-account'),

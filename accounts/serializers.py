@@ -1,8 +1,52 @@
+
 from rest_framework import serializers
 from django.contrib.auth import authenticate
 from django.contrib.auth.password_validation import validate_password
 from django.utils import timezone
-from .models import User, ActivationToken, EmployerProfile
+
+from .models import User, ActivationToken, EmployerProfile, EmployeeProfile
+
+
+
+# ...existing code...
+
+class EmployerProfileSerializer(serializers.ModelSerializer):
+    """Serializer for EmployerProfile model"""
+    class Meta:
+        model = EmployerProfile
+        fields = '__all__'
+        read_only_fields = ('user', 'created_at', 'updated_at')
+    def validate(self, data):
+        # Custom validation can be added here
+        return data
+    def create(self, validated_data):
+        user = self.context['request'].user
+        # Check if profile already exists
+        if hasattr(user, 'employer_profile'):
+            raise serializers.ValidationError("Employer profile already exists.")
+        # Create profile
+        profile = EmployerProfile.objects.create(user=user, **validated_data)
+        # Mark profile as completed
+        user.profile_completed = True
+        user.save()
+        return profile
+    def update(self, instance, validated_data):
+        for attr, value in validated_data.items():
+            setattr(instance, attr, value)
+        instance.save()
+        # Ensure profile is marked as completed
+        if not instance.user.profile_completed:
+            instance.user.profile_completed = True
+            instance.user.save()
+        return instance
+
+class EmployerListSerializer(serializers.ModelSerializer):
+    """Serializer for listing employers with their profile"""
+    employer_profile = EmployerProfileSerializer(read_only=True)
+    class Meta:
+        model = User
+        fields = ('id', 'email', 'first_name', 'last_name', 'is_employer', 'is_active', 'created_at', 'employer_profile')
+        read_only_fields = fields
 
 
 class UserSerializer(serializers.ModelSerializer):
@@ -105,14 +149,14 @@ class LoginSerializer(serializers.Serializer):
         except User.DoesNotExist:
             raise serializers.ValidationError({"email": "Invalid email or password."})
         
-        # Check if account is activated
-        if not user.is_active:
-            raise serializers.ValidationError({"email": "Account is not activated. Please check your email for activation instructions."})
-        
-        # Authenticate user
+        # Authenticate user first
         user = authenticate(username=email, password=password)
         if user is None:
             raise serializers.ValidationError({"email": "Invalid email or password."})
+        
+        # Check if account is active (not disabled by admin)
+        if not user.is_active:
+            raise serializers.ValidationError({"email": "Your account has been disabled. Please contact the administrator."})
         
         # Check 2FA if enabled
         if user.two_factor_enabled:
@@ -302,35 +346,20 @@ class EmployeeRegistrationSerializer(serializers.Serializer):
             user=user,
             **validated_data
         )
-        
-        return user, employee_profile
+        return user
 
 
 class EmployeeProfileSerializer(serializers.ModelSerializer):
     """Serializer for EmployeeProfile model"""
     
-    user_email = serializers.EmailField(source='user.email', read_only=True)
-    
     class Meta:
-        from .models import EmployeeProfile
         model = EmployeeProfile
         fields = '__all__'
         read_only_fields = ('user', 'created_at', 'updated_at')
     
-    def validate_national_id_number(self, value):
-        from .models import EmployeeProfile
-        # Check if national ID exists for a different user
-        if self.instance:
-            if EmployeeProfile.objects.exclude(pk=self.instance.pk).filter(national_id_number=value).exists():
-                raise serializers.ValidationError("This national ID number is already registered.")
-        return value
-    
-    def validate_passport_number(self, value):
-        if value:
-            from .models import EmployeeProfile
-            # Check if passport exists for a different user
-            if self.instance:
-                if EmployeeProfile.objects.exclude(pk=self.instance.pk).filter(passport_number=value).exists():
-                    raise serializers.ValidationError("This passport number is already registered.")
-        return value
+    def update(self, instance, validated_data):
+        for attr, value in validated_data.items():
+            setattr(instance, attr, value)
+        instance.save()
+        return instance
 
