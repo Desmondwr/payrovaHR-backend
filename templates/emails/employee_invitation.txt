@@ -1,0 +1,36 @@
+Welcome to {{ employer.company_name }}!
+
+Dear {{ employee.first_name }} {{ employee.last_name }},
+
+We are pleased to inform you that you have been added as an employee at {{ employer.company_name }}.
+
+YOUR EMPLOYMENT DETAILS:
+------------------------
+Employee ID: {{ employee.employee_id }}
+Position: {{ employee.job_title }}
+{% if employee.department %}Department: {{ employee.department.name }}{% endif %}
+{% if employee.branch %}Branch: {{ employee.branch.name }}{% endif %}
+Start Date: {{ employee.hire_date|date:"F d, Y" }}
+
+To complete your registration and access your employee portal, please visit:
+{{ invitation_url }}
+
+IMPORTANT: This invitation link will expire on {{ expires_at|date:"F d, Y" }} at {{ expires_at|time:"g:i A" }}.
+
+Once you accept the invitation, you will be able to:
+- Complete your employee profile
+- Upload required documents
+- View your employment details
+- Access payroll information
+- And much more...
+
+If you have any questions or did not expect this invitation, please contact the HR department at {{ employer.official_company_email }}.
+
+We look forward to working with you!
+
+Best regards,
+{{ employer.company_name }} HR Team
+
+---
+This is an automated message. Please do not reply to this email.
+© {{ employer.company_name }}. All rights reserved.

@@ -85,6 +85,24 @@
       "parentId": "folder_auth"
     },
     {
+      "_id": "req_2fa_login",
+      "_type": "request",
+      "name": "Login with 2FA",
+      "method": "POST",
+      "url": "{{ _.base_url }}/auth/login/",
+      "headers": [
+        {
+          "name": "Content-Type",
+          "value": "application/json"
+        }
+      ],
+      "body": {
+        "mimeType": "application/json",
+        "text": "{\n  \"email\": \"employer@company.com\",\n  \"password\": \"YourPassword123!\",\n  \"two_factor_code\": \"123456\"\n}"
+      },
+      "parentId": "folder_auth"
+    },
+    {
       "_id": "req_activate_account",
       "_type": "request",
       "name": "Activate Account",
