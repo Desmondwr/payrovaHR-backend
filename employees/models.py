@@ -282,6 +282,8 @@ class Department(models.Model):
     
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     employer = models.ForeignKey(EmployerProfile, on_delete=models.CASCADE, related_name='departments')
+    branch = models.ForeignKey('Branch', on_delete=models.CASCADE, related_name='departments', 
+                                null=True, blank=True, help_text='Branch this department belongs to (optional for company-wide departments)')
     name = models.CharField(max_length=255)
     code = models.CharField(max_length=20, help_text='Department code (e.g., HR, IT, FIN)')
     description = models.TextField(blank=True, null=True)
@@ -298,7 +300,8 @@ class Department(models.Model):
         ordering = ['name']
 
     def __str__(self):
-        return f"{self.name} - {self.employer.company_name}"
+        branch_info = f" - {self.branch.name}" if self.branch else ""
+        return f"{self.name}{branch_info} ({self.employer.company_name})"
 
 
 class Branch(models.Model):
