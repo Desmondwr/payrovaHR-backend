@@ -8,14 +8,14 @@ from .models import (
 
 @admin.register(EmployeeConfiguration)
 class EmployeeConfigurationAdmin(admin.ModelAdmin):
-    list_display = ['employer', 'employee_id_format', 'duplicate_detection_level', 'allow_concurrent_employment']
+    list_display = ['employer_id', 'employee_id_format', 'duplicate_detection_level', 'allow_concurrent_employment']
     list_filter = ['employee_id_format', 'duplicate_detection_level', 'allow_concurrent_employment']
-    search_fields = ['employer__company_name']
+    search_fields = ['employer_id']
     readonly_fields = ['id', 'created_at', 'updated_at']
     
     fieldsets = (
         ('Employer', {
-            'fields': ('id', 'employer')
+            'fields': ('id', 'employer_id')
         }),
         ('Employee ID Configuration', {
             'fields': ('employee_id_format', 'employee_id_prefix', 'employee_id_suffix',
@@ -84,23 +84,23 @@ class EmployeeConfigurationAdmin(admin.ModelAdmin):
 
 @admin.register(Department)
 class DepartmentAdmin(admin.ModelAdmin):
-    list_display = ['name', 'code', 'employer', 'parent_department', 'is_active', 'created_at']
+    list_display = ['name', 'code', 'employer_id', 'parent_department', 'is_active', 'created_at']
     list_filter = ['is_active', 'created_at']
-    search_fields = ['name', 'code', 'employer__company_name']
-    ordering = ['employer', 'name']
+    search_fields = ['name', 'code']
+    ordering = ['employer_id', 'name']
 
 
 @admin.register(Branch)
 class BranchAdmin(admin.ModelAdmin):
-    list_display = ['name', 'code', 'employer', 'city', 'is_headquarters', 'is_active']
+    list_display = ['name', 'code', 'employer_id', 'city', 'is_headquarters', 'is_active']
     list_filter = ['is_headquarters', 'is_active', 'country']
-    search_fields = ['name', 'code', 'employer__company_name', 'city']
-    ordering = ['employer', 'name']
+    search_fields = ['name', 'code', 'city']
+    ordering = ['employer_id', 'name']
 
 
 @admin.register(Employee)
 class EmployeeAdmin(admin.ModelAdmin):
-    list_display = ['employee_id', 'full_name', 'job_title', 'employer', 'employment_status', 'hire_date']
+    list_display = ['employee_id', 'full_name', 'job_title', 'employer_id', 'employment_status', 'hire_date']
     list_filter = ['employment_status', 'employment_type', 'gender', 'is_concurrent_employment']
     search_fields = ['employee_id', 'first_name', 'last_name', 'email', 'national_id_number']
     readonly_fields = ['id', 'created_at', 'updated_at', 'invitation_sent_at', 'invitation_accepted_at']
@@ -108,7 +108,7 @@ class EmployeeAdmin(admin.ModelAdmin):
     
     fieldsets = (
         ('Basic Information', {
-            'fields': ('id', 'employer', 'employee_id', 'first_name', 'middle_name', 'last_name',
+            'fields': ('id', 'employer_id', 'employee_id', 'first_name', 'middle_name', 'last_name',
                       'date_of_birth', 'gender', 'marital_status', 'nationality', 'profile_photo')
         }),
         ('Contact Information', {
@@ -130,18 +130,18 @@ class EmployeeAdmin(admin.ModelAdmin):
             'fields': ('emergency_contact_name', 'emergency_contact_relationship', 'emergency_contact_phone')
         }),
         ('System Access', {
-            'fields': ('user', 'invitation_sent', 'invitation_sent_at', 'invitation_accepted',
+            'fields': ('user_id', 'invitation_sent', 'invitation_sent_at', 'invitation_accepted',
                       'invitation_accepted_at', 'is_concurrent_employment')
         }),
         ('Timestamps', {
-            'fields': ('created_at', 'updated_at', 'created_by')
+            'fields': ('created_at', 'updated_at', 'created_by_id')
         }),
     )
 
 
 @admin.register(EmployeeDocument)
 class EmployeeDocumentAdmin(admin.ModelAdmin):
-    list_display = ['title', 'employee', 'document_type', 'has_expiry', 'expiry_date', 'is_verified', 'uploaded_by', 'uploaded_at']
+    list_display = ['title', 'employee', 'document_type', 'has_expiry', 'expiry_date', 'is_verified', 'uploaded_by_id', 'uploaded_at']
     list_filter = ['document_type', 'has_expiry', 'is_verified', 'uploaded_at']
     search_fields = ['title', 'employee__first_name', 'employee__last_name']
     readonly_fields = ['file_size', 'uploaded_at', 'verified_at']
@@ -150,19 +150,19 @@ class EmployeeDocumentAdmin(admin.ModelAdmin):
 
 @admin.register(EmployeeCrossInstitutionRecord)
 class EmployeeCrossInstitutionRecordAdmin(admin.ModelAdmin):
-    list_display = ['employee', 'detected_employer', 'status', 'consent_status', 'verified', 'detected_at']
+    list_display = ['employee', 'detected_employer_id', 'status', 'consent_status', 'verified', 'detected_at']
     list_filter = ['status', 'consent_status', 'verified', 'detected_at']
-    search_fields = ['employee__first_name', 'employee__last_name', 'detected_employer__company_name']
+    search_fields = ['employee__first_name', 'employee__last_name']
     readonly_fields = ['detected_at', 'consent_requested_at', 'consent_responded_at']
     ordering = ['-detected_at']
 
 
 @admin.register(EmployeeAuditLog)
 class EmployeeAuditLogAdmin(admin.ModelAdmin):
-    list_display = ['employee', 'action', 'performed_by', 'timestamp']
+    list_display = ['employee', 'action', 'performed_by_id', 'timestamp']
     list_filter = ['action', 'timestamp']
-    search_fields = ['employee__first_name', 'employee__last_name', 'performed_by__email']
-    readonly_fields = ['id', 'employee', 'action', 'performed_by', 'timestamp', 'changes', 'notes', 'ip_address']
+    search_fields = ['employee__first_name', 'employee__last_name']
+    readonly_fields = ['id', 'employee', 'action', 'performed_by_id', 'timestamp', 'changes', 'notes', 'ip_address']
     ordering = ['-timestamp']
 
 

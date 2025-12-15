@@ -138,15 +138,13 @@ def add_tenant_database_to_settings(db_name, employer_id):
     alias = f"tenant_{employer_id}"
     default_db = settings.DATABASES['default']
     
-    # Add to DATABASES dictionary
-    settings.DATABASES[alias] = {
-        'ENGINE': default_db['ENGINE'],
-        'NAME': db_name,
-        'USER': default_db['USER'],
-        'PASSWORD': default_db['PASSWORD'],
-        'HOST': default_db['HOST'],
-        'PORT': default_db['PORT'],
-    }
+    # Create a copy of the default database configuration
+    tenant_db_config = default_db.copy()
+    
+    # Override the NAME with the tenant database name
+    tenant_db_config['NAME'] = db_name
+    
+    settings.DATABASES[alias] = tenant_db_config
     
     # Ensure the connection is available
     connections.databases[alias] = settings.DATABASES[alias]
@@ -161,8 +159,8 @@ def run_migrations_on_tenant_database(db_name, employer_id):
     try:
         alias = f"tenant_{employer_id}"
         
-        # Run migrations
-        call_command('migrate', database=alias, verbosity=0)
+        # Run migrations for employees app (and any other tenant-specific apps)
+        call_command('migrate', 'employees', database=alias, verbosity=2)
         
         logger.info(f"Successfully ran migrations on database: {db_name}")
         return True

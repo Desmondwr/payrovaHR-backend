@@ -1,6 +1,7 @@
 from django.db import models
 from django.contrib.auth import get_user_model
-from accounts.models import EmployerProfile
+# Remove direct import to avoid cross-database foreign key issues
+# from accounts.models import EmployerProfile
 from django.utils import timezone
 import uuid
 import json
@@ -60,7 +61,8 @@ class EmployeeConfiguration(models.Model):
     ]
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    employer = models.OneToOneField(EmployerProfile, on_delete=models.CASCADE, related_name='employee_config')
+    # Use IntegerField instead of ForeignKey for cross-database compatibility
+    employer_id = models.IntegerField(db_index=True, help_text='ID of the employer (from main database)')
     
     # ===== Employee ID Configuration =====
     employee_id_format = models.CharField(max_length=20, choices=ID_FORMAT_CHOICES, default=ID_FORMAT_SEQUENTIAL)
@@ -196,14 +198,14 @@ class EmployeeConfiguration(models.Model):
         verbose_name_plural = 'Employee Configurations'
 
     def __str__(self):
-        return f"Employee Config - {self.employer.company_name}"
+        return f"Employee Config - Employer ID: {self.employer_id}"
     
     def get_next_employee_id(self, branch=None, department=None):
         """Generate next employee ID based on configuration"""
         from employees.models import Employee
         
         # Get current count for this employer
-        current_count = Employee.objects.filter(employer=self.employer).count()
+        current_count = Employee.objects.filter(employer_id=self.employer_id).count()
         next_number = current_count + self.employee_id_starting_number
         
         # Format number with padding
@@ -281,7 +283,7 @@ class Department(models.Model):
     """Department within an institution/company"""
     
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    employer = models.ForeignKey(EmployerProfile, on_delete=models.CASCADE, related_name='departments')
+    employer_id = models.IntegerField(db_index=True, help_text='ID of the employer (from main database)')
     branch = models.ForeignKey('Branch', on_delete=models.CASCADE, related_name='departments', 
                                 null=True, blank=True, help_text='Branch this department belongs to (optional for company-wide departments)')
     name = models.CharField(max_length=255)
@@ -296,19 +298,19 @@ class Department(models.Model):
         db_table = 'departments'
         verbose_name = 'Department'
         verbose_name_plural = 'Departments'
-        unique_together = [['employer', 'name'], ['employer', 'code']]
+        unique_together = [['employer_id', 'name'], ['employer_id', 'code']]
         ordering = ['name']
 
     def __str__(self):
         branch_info = f" - {self.branch.name}" if self.branch else ""
-        return f"{self.name}{branch_info} ({self.employer.company_name})"
+        return f"{self.name}{branch_info} (Employer ID: {self.employer_id})"
 
 
 class Branch(models.Model):
     """Branch/Location of an institution"""
     
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    employer = models.ForeignKey(EmployerProfile, on_delete=models.CASCADE, related_name='branches')
+    employer_id = models.IntegerField(db_index=True, help_text='ID of the employer (from main database)')
     name = models.CharField(max_length=255)
     code = models.CharField(max_length=50, help_text='Branch code/identifier')
     address = models.TextField()
@@ -326,11 +328,11 @@ class Branch(models.Model):
         db_table = 'branches'
         verbose_name = 'Branch'
         verbose_name_plural = 'Branches'
-        unique_together = [['employer', 'code']]
+        unique_together = [['employer_id', 'code']]
         ordering = ['name']
 
     def __str__(self):
-        return f"{self.name} ({self.code}) - {self.employer.company_name}"
+        return f"{self.name} ({self.code}) - Employer ID: {self.employer_id}"
 
 
 class Employee(models.Model):
@@ -369,10 +371,10 @@ class Employee(models.Model):
     ]
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    employer = models.ForeignKey(EmployerProfile, on_delete=models.CASCADE, related_name='employees')
+    employer_id = models.IntegerField(db_index=True, help_text='ID of the employer (from main database)')
     
     # Link to user account (optional - employee may not have created account yet)
-    user = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, blank=True, related_name='employee_records')
+    user_id = models.IntegerField(null=True, blank=True, db_index=True, help_text='ID of the user account (from main database)')
     
     # Basic Information
     employee_id = models.CharField(max_length=50, help_text='Company-assigned employee ID')
@@ -436,15 +438,15 @@ class Employee(models.Model):
     # Timestamps
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
-    created_by = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, related_name='created_employees')
+    created_by_id = models.IntegerField(null=True, db_index=True, help_text='ID of the user who created this record')
 
     class Meta:
         db_table = 'employees'
         verbose_name = 'Employee'
         verbose_name_plural = 'Employees'
-        unique_together = [['employer', 'employee_id']]
+        unique_together = [['employer_id', 'employee_id']]
         indexes = [
-            models.Index(fields=['employer', 'employment_status']),
+            models.Index(fields=['employer_id', 'employment_status']),
             models.Index(fields=['national_id_number']),
             models.Index(fields=['email']),
         ]
@@ -499,12 +501,12 @@ class EmployeeDocument(models.Model):
     expiry_reminder_sent = models.BooleanField(default=False)
     expiry_reminder_sent_at = models.DateTimeField(null=True, blank=True)
     
-    uploaded_by = models.ForeignKey(User, on_delete=models.SET_NULL, null=True)
+    uploaded_by_id = models.IntegerField(null=True, db_index=True, help_text='ID of the user who uploaded this document')
     uploaded_at = models.DateTimeField(auto_now_add=True)
     
     # Verification
     is_verified = models.BooleanField(default=False, help_text='Document verified by HR')
-    verified_by = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, blank=True, related_name='verified_documents')
+    verified_by_id = models.IntegerField(null=True, blank=True, db_index=True, help_text='ID of the user who verified this document')
     verified_at = models.DateTimeField(null=True, blank=True)
     
     class Meta:
@@ -550,7 +552,7 @@ class EmployeeCrossInstitutionRecord(models.Model):
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     employee = models.ForeignKey(Employee, on_delete=models.CASCADE, related_name='cross_institution_records')
-    detected_employer = models.ForeignKey(EmployerProfile, on_delete=models.CASCADE, related_name='detected_employees')
+    detected_employer_id = models.IntegerField(db_index=True, help_text='ID of the other employer (from main database)')
     detected_employee_id = models.CharField(max_length=50)
     status = models.CharField(max_length=20, choices=STATUS_CHOICES)
     
@@ -563,7 +565,7 @@ class EmployeeCrossInstitutionRecord(models.Model):
     detected_at = models.DateTimeField(auto_now_add=True)
     verified = models.BooleanField(default=False)
     verified_at = models.DateTimeField(null=True, blank=True)
-    verified_by = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, blank=True, related_name='verified_cross_records')
+    verified_by_id = models.IntegerField(null=True, blank=True, db_index=True, help_text='ID of the user who verified this record')
     notes = models.TextField(blank=True, null=True)
     
     class Meta:
@@ -573,7 +575,7 @@ class EmployeeCrossInstitutionRecord(models.Model):
         ordering = ['-detected_at']
 
     def __str__(self):
-        return f"{self.employee.full_name} at {self.detected_employer.company_name}"
+        return f"{self.employee.full_name} at Employer ID: {self.detected_employer_id}"
 
 
 class EmployeeAuditLog(models.Model):
@@ -592,7 +594,7 @@ class EmployeeAuditLog(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     employee = models.ForeignKey(Employee, on_delete=models.CASCADE, related_name='audit_logs')
     action = models.CharField(max_length=50, choices=ACTION_CHOICES)
-    performed_by = models.ForeignKey(User, on_delete=models.SET_NULL, null=True)
+    performed_by_id = models.IntegerField(null=True, db_index=True, help_text='ID of the user who performed this action')
     timestamp = models.DateTimeField(auto_now_add=True)
     changes = models.JSONField(null=True, blank=True, help_text='JSON object describing changes')
     notes = models.TextField(blank=True, null=True)
@@ -627,7 +629,7 @@ class EmployeeInvitation(models.Model):
     expires_at = models.DateTimeField()
     accepted_at = models.DateTimeField(null=True, blank=True)
     revoked_at = models.DateTimeField(null=True, blank=True)
-    revoked_by = models.ForeignKey(User, on_delete=models.SET_NULL, null=True, blank=True, related_name='revoked_invitations')
+    revoked_by_id = models.IntegerField(null=True, blank=True, db_index=True, help_text='ID of the user who revoked this invitation')
     
     class Meta:
         db_table = 'employee_invitations'

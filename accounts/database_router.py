@@ -18,6 +18,7 @@ class TenantDatabaseRouter:
         'user',
         'activationtoken',
         'employerprofile',
+        'employeeprofile',  # Employee user profiles stay in main DB
         'session',
         'contenttype',
         'permission',
