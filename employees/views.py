@@ -41,14 +41,28 @@ class DepartmentViewSet(viewsets.ModelViewSet):
     serializer_class = DepartmentSerializer
     
     def get_queryset(self):
-        """Return departments for the employer's organization"""
-        return Department.objects.filter(
+        """Return departments for the employer's organization from tenant database"""
+        from accounts.database_utils import get_tenant_database_alias
+        tenant_db = get_tenant_database_alias(self.request.user.employer_profile)
+        
+        return Department.objects.using(tenant_db).filter(
             employer_id=self.request.user.employer_profile.id
         ).select_related('parent_department')
     
     def perform_create(self, serializer):
-        """Set employer when creating department"""
+        """Set employer when creating department in tenant database"""
         serializer.save(employer_id=self.request.user.employer_profile.id)
+    
+    def perform_update(self, serializer):
+        """Update department in tenant database"""
+        serializer.save()
+    
+    def perform_destroy(self, instance):
+        """Delete department from tenant database"""
+        from accounts.database_utils import get_tenant_database_alias
+        tenant_db = get_tenant_database_alias(self.request.user.employer_profile)
+        
+        instance.delete(using=tenant_db)
 
 
 class BranchViewSet(viewsets.ModelViewSet):
@@ -58,14 +72,28 @@ class BranchViewSet(viewsets.ModelViewSet):
     serializer_class = BranchSerializer
     
     def get_queryset(self):
-        """Return branches for the employer's organization"""
-        return Branch.objects.filter(
+        """Return branches for the employer's organization from tenant database"""
+        from accounts.database_utils import get_tenant_database_alias
+        tenant_db = get_tenant_database_alias(self.request.user.employer_profile)
+        
+        return Branch.objects.using(tenant_db).filter(
             employer_id=self.request.user.employer_profile.id
         )
     
     def perform_create(self, serializer):
-        """Set employer when creating branch"""
+        """Set employer when creating branch in tenant database"""
         serializer.save(employer_id=self.request.user.employer_profile.id)
+    
+    def perform_update(self, serializer):
+        """Update branch in tenant database"""
+        serializer.save()
+    
+    def perform_destroy(self, instance):
+        """Delete branch from tenant database"""
+        from accounts.database_utils import get_tenant_database_alias
+        tenant_db = get_tenant_database_alias(self.request.user.employer_profile)
+        
+        instance.delete(using=tenant_db)
 
 
 class EmployeeViewSet(viewsets.ModelViewSet):
