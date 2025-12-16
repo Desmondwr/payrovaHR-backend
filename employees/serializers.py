@@ -150,6 +150,69 @@ class CreateEmployeeSerializer(serializers.ModelSerializer):
             )
         return value
     
+    def validate_department(self, value):
+        """Validate that department belongs to employer's organization"""
+        if value is None:
+            return value
+        
+        request = self.context['request']
+        employer_id = request.user.employer_profile.id
+        
+        # Get tenant database alias
+        from accounts.database_utils import get_tenant_database_alias
+        tenant_db = get_tenant_database_alias(request.user.employer_profile)
+        
+        # Check if department exists and belongs to this employer
+        if not Department.objects.using(tenant_db).filter(
+            id=value.id, employer_id=employer_id
+        ).exists():
+            raise serializers.ValidationError(
+                "Department does not exist or does not belong to your organization."
+            )
+        return value
+    
+    def validate_branch(self, value):
+        """Validate that branch belongs to employer's organization"""
+        if value is None:
+            return value
+        
+        request = self.context['request']
+        employer_id = request.user.employer_profile.id
+        
+        # Get tenant database alias
+        from accounts.database_utils import get_tenant_database_alias
+        tenant_db = get_tenant_database_alias(request.user.employer_profile)
+        
+        # Check if branch exists and belongs to this employer
+        if not Branch.objects.using(tenant_db).filter(
+            id=value.id, employer_id=employer_id
+        ).exists():
+            raise serializers.ValidationError(
+                "Branch does not exist or does not belong to your organization."
+            )
+        return value
+    
+    def validate_manager(self, value):
+        """Validate that manager belongs to employer's organization"""
+        if value is None:
+            return value
+        
+        request = self.context['request']
+        employer_id = request.user.employer_profile.id
+        
+        # Get tenant database alias
+        from accounts.database_utils import get_tenant_database_alias
+        tenant_db = get_tenant_database_alias(request.user.employer_profile)
+        
+        # Check if manager exists and belongs to this employer
+        if not Employee.objects.using(tenant_db).filter(
+            id=value.id, employer_id=employer_id
+        ).exists():
+            raise serializers.ValidationError(
+                "Manager does not exist or does not belong to your organization."
+            )
+        return value
+    
     def create(self, validated_data):
         send_invitation = validated_data.pop('send_invitation', False)
         request = self.context['request']

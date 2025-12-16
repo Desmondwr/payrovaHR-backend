@@ -93,7 +93,9 @@ The absolute minimum fields required for employer to initiate employee creation:
   "email": "john.doe@example.com",
   "job_title": "Software Developer",
   "employment_type": "FULL_TIME",
-  "hire_date": "2025-01-15"
+  "hire_date": "2025-01-15",
+  "department": 1,  // Department ID (optional but recommended)
+  "branch": 2       // Branch ID (optional but recommended)
   // send_invitation defaults to true automatically
 }
 ```
@@ -102,7 +104,8 @@ The absolute minimum fields required for employer to initiate employee creation:
 - Most fields are now optional during initial creation (date_of_birth, phone_number, address, national_id, etc.)
 - The employee will complete these fields themselves after accepting the invitation and logging in
 - `send_invitation` defaults to `true` - invitations are sent automatically unless explicitly set to `false`
-- Only 6 fields are required: first_name, last_name, email, job_title, employment_type, hire_date
+- **Required fields**: first_name, last_name, email, job_title, employment_type, hire_date
+- **Recommended fields**: department, branch (helps organize employees from the start)
 
 ### Complete Payload (All Available Fields)
 
@@ -163,10 +166,12 @@ The absolute minimum fields required for employer to initiate employee creation:
 }
 
 **Recommended Workflow**: 
-- Employer provides minimal information (name, email, job_title, hire_date)
+- Employer provides minimal information (name, email, job_title, hire_date, department, branch)
 - `send_invitation` defaults to `true` - email sent automatically
 - Employee receives email, accepts invitation, logs in
-- Employee completes remaining profile fields themselves "acknowledge_cross_institution": false  // Optional - Boolean: Acknowledge concurrent employment
+- Employee completes remaining profile fields themselves
+
+  "acknowledge_cross_institution": false  // Optional - Boolean: Acknowledge concurrent employment
 }
 ```
 
@@ -940,11 +945,11 @@ const newEmployee = {
   first_name: 'John',
   last_name: 'Doe',
   email: 'john.doe@example.com',
-  phone_number: '+237123456789',
   job_title: 'Software Developer',
   employment_type: 'FULL_TIME',
-  employment_status: 'ACTIVE',
   hire_date: '2025-01-15',
+  department: 1,  // Department ID
+  branch: 2,      // Branch ID
   send_invitation: true
 };
 
@@ -1195,10 +1200,29 @@ const CreateEmployeeForm = () => {
       </div>
 
       <div>
+        <label>Department</label>
+        <select {...register('department')}>
+          <option value="">Select Department...</option>
+          {/* Load departments from API */}
+        </select>
+        {errors.department && <span className="error">{errors.department.message}</span>}
+      </div>
+
+      <div>
+        <label>Branch</label>
+        <select {...register('branch')}>
+          <option value="">Select Branch...</option>
+          {/* Load branches from API */}
+        </select>
+        {errors.branch && <span className="error">{errors.branch.message}</span>}
+      </div>
+
+      <div>
         <label>
           <input
             type="checkbox"
             {...register('send_invitation')}
+            defaultChecked
           />
           Send invitation email to employee
         </label>
@@ -1275,17 +1299,23 @@ export default CreateEmployeeForm;
           Send invitation email
         </label>
       </div>
-
-      <button type="submit" :disabled="loading">
-        {{ loading ? 'Creating...' : 'Create Employee' }}
-      </button>
-    </form>
-  </div>
-</template>
-
-<script>
-import axios from 'axios';
-
+job_title: '',
+        employment_type: 'FULL_TIME',
+        hire_date: '',
+        department: null,
+        branch: null,
+        send_invitation: true
+      },
+      departments: [],
+      branches: [],
+      errors: {},
+      loading: false,
+      duplicateWarning: null
+    };
+  },
+  mounted() {
+    this.loadDepartments();
+    this.loadBranches()
 export default {
   name: 'CreateEmployee',
   data() {
@@ -1354,6 +1384,36 @@ export default {
         }
       } finally {
         this.loading = false;
+      }
+    },
+    
+    async loadDepartments() {
+      try {
+        const token = localStorage.getItem('access_token');
+        const response = await axios.get(
+          `${process.env.VUE_APP_API_URL}/employees/departments/`,
+          {
+            headers: { 'Authorization': `Bearer ${token}` }
+          }
+        );
+        this.departments = response.data.results || response.data;
+      } catch (error) {
+        console.error('Error loading departments:', error);
+      }
+    },
+    
+    async loadBranches() {
+      try {
+        const token = localStorage.getItem('access_token');
+        const response = await axios.get(
+          `${process.env.VUE_APP_API_URL}/employees/branches/`,
+          {
+            headers: { 'Authorization': `Bearer ${token}` }
+          }
+        );
+        this.branches = response.data.results || response.data;
+      } catch (error) {
+        console.error('Error loading branches:', error);
       }
     },
     
