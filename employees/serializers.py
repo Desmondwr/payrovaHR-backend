@@ -93,6 +93,22 @@ class CreateEmployeeSerializer(serializers.ModelSerializer):
     """Serializer for creating a new employee - minimal fields required by employer"""
     
     send_invitation = serializers.BooleanField(default=True, write_only=True)
+    # Override ForeignKey fields to handle tenant database routing
+    department = serializers.PrimaryKeyRelatedField(
+        queryset=Department.objects.none(),
+        required=False,
+        allow_null=True
+    )
+    branch = serializers.PrimaryKeyRelatedField(
+        queryset=Branch.objects.none(),
+        required=False,
+        allow_null=True
+    )
+    manager = serializers.PrimaryKeyRelatedField(
+        queryset=Employee.objects.none(),
+        required=False,
+        allow_null=True
+    )
     
     class Meta:
         model = Employee
@@ -125,10 +141,28 @@ class CreateEmployeeSerializer(serializers.ModelSerializer):
         ]
         extra_kwargs = {
             'employee_id': {'required': False},  # Auto-generated if not provided
-            'department': {'required': False, 'allow_null': True},
-            'branch': {'required': False, 'allow_null': True},
-            'manager': {'required': False, 'allow_null': True},
         }
+    
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # Set the correct queryset for ForeignKey fields using tenant database
+        if 'request' in self.context:
+            request = self.context['request']
+            if hasattr(request.user, 'employer_profile') and request.user.employer_profile:
+                from accounts.database_utils import get_tenant_database_alias
+                tenant_db = get_tenant_database_alias(request.user.employer_profile)
+                employer_id = request.user.employer_profile.id
+                
+                # Set querysets to use tenant database
+                self.fields['department'].queryset = Department.objects.using(tenant_db).filter(
+                    employer_id=employer_id, is_active=True
+                )
+                self.fields['branch'].queryset = Branch.objects.using(tenant_db).filter(
+                    employer_id=employer_id, is_active=True
+                )
+                self.fields['manager'].queryset = Employee.objects.using(tenant_db).filter(
+                    employer_id=employer_id, employment_status='ACTIVE'
+                )
     
     def validate_employee_id(self, value):
         """Validate employee_id is unique within employer"""
@@ -147,69 +181,6 @@ class CreateEmployeeSerializer(serializers.ModelSerializer):
         if Employee.objects.filter(employer_id=employer_id, email=value).exists():
             raise serializers.ValidationError(
                 "This email is already assigned to another employee."
-            )
-        return value
-    
-    def validate_department(self, value):
-        """Validate that department belongs to employer's organization"""
-        if value is None:
-            return value
-        
-        request = self.context['request']
-        employer_id = request.user.employer_profile.id
-        
-        # Get tenant database alias
-        from accounts.database_utils import get_tenant_database_alias
-        tenant_db = get_tenant_database_alias(request.user.employer_profile)
-        
-        # Check if department exists and belongs to this employer
-        if not Department.objects.using(tenant_db).filter(
-            id=value.id, employer_id=employer_id
-        ).exists():
-            raise serializers.ValidationError(
-                "Department does not exist or does not belong to your organization."
-            )
-        return value
-    
-    def validate_branch(self, value):
-        """Validate that branch belongs to employer's organization"""
-        if value is None:
-            return value
-        
-        request = self.context['request']
-        employer_id = request.user.employer_profile.id
-        
-        # Get tenant database alias
-        from accounts.database_utils import get_tenant_database_alias
-        tenant_db = get_tenant_database_alias(request.user.employer_profile)
-        
-        # Check if branch exists and belongs to this employer
-        if not Branch.objects.using(tenant_db).filter(
-            id=value.id, employer_id=employer_id
-        ).exists():
-            raise serializers.ValidationError(
-                "Branch does not exist or does not belong to your organization."
-            )
-        return value
-    
-    def validate_manager(self, value):
-        """Validate that manager belongs to employer's organization"""
-        if value is None:
-            return value
-        
-        request = self.context['request']
-        employer_id = request.user.employer_profile.id
-        
-        # Get tenant database alias
-        from accounts.database_utils import get_tenant_database_alias
-        tenant_db = get_tenant_database_alias(request.user.employer_profile)
-        
-        # Check if manager exists and belongs to this employer
-        if not Employee.objects.using(tenant_db).filter(
-            id=value.id, employer_id=employer_id
-        ).exists():
-            raise serializers.ValidationError(
-                "Manager does not exist or does not belong to your organization."
             )
         return value
     
