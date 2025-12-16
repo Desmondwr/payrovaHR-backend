@@ -19,11 +19,11 @@ class DepartmentSerializer(serializers.ModelSerializer):
     class Meta:
         model = Department
         fields = [
-            'id', 'employer', 'name', 'code', 'description', 'parent_department',
+            'id', 'employer_id', 'name', 'code', 'description', 'parent_department',
             'parent_department_name', 'is_active', 'employee_count',
             'created_at', 'updated_at'
         ]
-        read_only_fields = ['id', 'created_at', 'updated_at']
+        read_only_fields = ['id', 'employer_id', 'created_at', 'updated_at']
     
     def get_employee_count(self, obj):
         return obj.employees.count()
@@ -37,12 +37,12 @@ class BranchSerializer(serializers.ModelSerializer):
     class Meta:
         model = Branch
         fields = [
-            'id', 'employer', 'name', 'code', 'address', 'city',
+            'id', 'employer_id', 'name', 'code', 'address', 'city',
             'state_region', 'country', 'phone_number', 'email',
             'is_headquarters', 'is_active', 'employee_count',
             'created_at', 'updated_at'
         ]
-        read_only_fields = ['id', 'created_at', 'updated_at']
+        read_only_fields = ['id', 'employer_id', 'created_at', 'updated_at']
     
     def get_employee_count(self, obj):
         return obj.employees.count()
