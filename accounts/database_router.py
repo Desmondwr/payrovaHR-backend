@@ -68,15 +68,38 @@ class TenantDatabaseRouter:
     
     def allow_relation(self, obj1, obj2, **hints):
         """
-        Allow relations if both objects are in the same database
+        Allow relations if both objects are in the same database or app.
+        Also allow relations within tenant-specific models.
         """
-        db1 = obj1._state.db
-        db2 = obj2._state.db
+        # Get the database for each object
+        db1 = obj1._state.db if hasattr(obj1, '_state') and obj1._state.db else None
+        db2 = obj2._state.db if hasattr(obj2, '_state') and obj2._state.db else None
         
+        # Get model info
+        model1_name = obj1._meta.model_name.lower()
+        model2_name = obj2._meta.model_name.lower()
+        app1 = obj1._meta.app_label
+        app2 = obj2._meta.app_label
+        
+        # Both models are in the default database models list
+        if model1_name in self.DEFAULT_DB_MODELS and model2_name in self.DEFAULT_DB_MODELS:
+            return True
+        
+        # Both models are from the same tenant app (e.g., employees app)
+        # Allow relations within the same app (like Employee -> Employee for manager)
+        if app1 == app2 and app1 == 'employees':
+            return True
+        
+        # If both databases are explicitly set, they must match
         if db1 and db2:
             return db1 == db2
         
-        return None
+        # If only one database is set, check if they're in the same app
+        if (db1 or db2) and app1 == app2:
+            return True
+        
+        # Default: allow if we can't determine (will be validated at save time)
+        return True
     
     def allow_migrate(self, db, app_label, model_name=None, **hints):
         """

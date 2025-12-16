@@ -229,3 +229,71 @@ def delete_tenant_database(employer_profile):
         error_msg = f"Error deleting tenant database: {str(e)}"
         logger.error(error_msg)
         return False, error_msg
+
+
+def load_all_tenant_databases():
+    """
+    Load all existing tenant databases into Django settings.
+    This should be called on application startup to ensure all
+    tenant database connections are available.
+    """
+    try:
+        # Import here to avoid circular imports
+        from accounts.models import EmployerProfile
+        
+        # Get all employers with created databases
+        employer_profiles = EmployerProfile.objects.filter(
+            database_created=True,
+            database_name__isnull=False
+        )
+        
+        loaded_count = 0
+        for employer in employer_profiles:
+            alias = f"tenant_{employer.id}"
+            
+            # Skip if already loaded
+            if alias in settings.DATABASES:
+                continue
+            
+            # Add to settings
+            default_db = settings.DATABASES['default']
+            tenant_db_config = default_db.copy()
+            tenant_db_config['NAME'] = employer.database_name
+            
+            settings.DATABASES[alias] = tenant_db_config
+            connections.databases[alias] = settings.DATABASES[alias]
+            
+            loaded_count += 1
+            logger.info(f"Loaded tenant database: {alias} ({employer.database_name})")
+        
+        logger.info(f"Successfully loaded {loaded_count} tenant database(s)")
+        return loaded_count
+        
+    except Exception as e:
+        logger.error(f"Error loading tenant databases: {str(e)}")
+        return 0
+
+
+def ensure_tenant_database_loaded(employer_profile):
+    """
+    Ensure a specific tenant database is loaded into Django settings.
+    Returns the database alias.
+    """
+    if not employer_profile or not employer_profile.database_created:
+        return 'default'
+    
+    alias = f"tenant_{employer_profile.id}"
+    
+    # Check if already loaded
+    if alias not in settings.DATABASES:
+        # Load it now
+        default_db = settings.DATABASES['default']
+        tenant_db_config = default_db.copy()
+        tenant_db_config['NAME'] = employer_profile.database_name
+        
+        settings.DATABASES[alias] = tenant_db_config
+        connections.databases[alias] = settings.DATABASES[alias]
+        
+        logger.info(f"Dynamically loaded tenant database: {alias} ({employer_profile.database_name})")
+    
+    return alias

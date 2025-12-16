@@ -3,7 +3,7 @@ Middleware for multi-tenant database routing
 """
 from django.conf import settings
 from django.utils.deprecation import MiddlewareMixin
-from accounts.database_utils import get_tenant_database_alias
+from accounts.database_utils import get_tenant_database_alias, ensure_tenant_database_loaded
 import threading
 
 # Thread-local storage for tenant context
@@ -44,7 +44,8 @@ class TenantDatabaseMiddleware(MiddlewareMixin):
             if hasattr(request.user, 'employer_profile') and request.user.employer_profile:
                 employer_profile = request.user.employer_profile
                 if employer_profile.database_created:
-                    tenant_db = get_tenant_database_alias(employer_profile)
+                    # Ensure the tenant database is loaded before using it
+                    tenant_db = ensure_tenant_database_loaded(employer_profile)
             
             # If user is an employee, we need to find their employer's database
             # This is done by querying the employees app for their record
