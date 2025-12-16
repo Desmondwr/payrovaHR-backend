@@ -4,7 +4,7 @@ from rest_framework.routers import DefaultRouter
 from .views import (
     DepartmentViewSet, BranchViewSet, EmployeeViewSet,
     EmployeeDocumentViewSet, EmployeeConfigurationViewSet,
-    EmployeeInvitationViewSet
+    EmployeeInvitationViewSet, EmployeeProfileViewSet
 )
 
 app_name = 'employees'
@@ -16,6 +16,7 @@ router.register(r'employees', EmployeeViewSet, basename='employee')
 router.register(r'documents', EmployeeDocumentViewSet, basename='employee-document')
 router.register(r'configuration', EmployeeConfigurationViewSet, basename='employee-config')
 router.register(r'invitations', EmployeeInvitationViewSet, basename='employee-invitation')
+router.register(r'profile', EmployeeProfileViewSet, basename='employee-profile')
 
 urlpatterns = [
     path('', include(router.urls)),

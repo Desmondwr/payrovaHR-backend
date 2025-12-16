@@ -5,6 +5,7 @@ from rest_framework.response import Response
 from django.utils import timezone
 from django.db.models import Q
 from django.shortcuts import get_object_or_404
+from django.db import IntegrityError
 from datetime import timedelta
 
 from .models import (
@@ -21,7 +22,8 @@ from .serializers import (
     EmployeeInvitationSerializer, EmployeeSearchSerializer,
     EmployeeConfigurationSerializer, DuplicateDetectionResultSerializer,
     CreateEmployeeWithDetectionSerializer, EmployeeDocumentUploadSerializer,
-    AcceptInvitationSerializer
+    AcceptInvitationSerializer, EmployeeProfileCompletionSerializer,
+    EmployeeSelfProfileSerializer
 )
 from .utils import (
     detect_duplicate_employees, generate_employee_invitation_token,
@@ -41,12 +43,12 @@ class DepartmentViewSet(viewsets.ModelViewSet):
     def get_queryset(self):
         """Return departments for the employer's organization"""
         return Department.objects.filter(
-            employer=self.request.user.employer_profile
+            employer_id=self.request.user.employer_profile.id
         ).select_related('parent_department')
     
     def perform_create(self, serializer):
         """Set employer when creating department"""
-        serializer.save(employer=self.request.user.employer_profile)
+        serializer.save(employer_id=self.request.user.employer_profile.id)
 
 
 class BranchViewSet(viewsets.ModelViewSet):
@@ -58,12 +60,12 @@ class BranchViewSet(viewsets.ModelViewSet):
     def get_queryset(self):
         """Return branches for the employer's organization"""
         return Branch.objects.filter(
-            employer=self.request.user.employer_profile
+            employer_id=self.request.user.employer_profile.id
         )
     
     def perform_create(self, serializer):
         """Set employer when creating branch"""
-        serializer.save(employer=self.request.user.employer_profile)
+        serializer.save(employer_id=self.request.user.employer_profile.id)
 
 
 class EmployeeViewSet(viewsets.ModelViewSet):
@@ -87,9 +89,9 @@ class EmployeeViewSet(viewsets.ModelViewSet):
     def get_queryset(self):
         """Return employees for the employer's organization"""
         queryset = Employee.objects.filter(
-            employer=self.request.user.employer_profile
+            employer_id=self.request.user.employer_profile.id
         ).select_related(
-            'department', 'branch', 'manager', 'employer', 'user'
+            'department', 'branch', 'manager'
         ).prefetch_related('documents', 'cross_institution_records')
         
         # Filter by status if provided
@@ -124,11 +126,54 @@ class EmployeeViewSet(viewsets.ModelViewSet):
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         
-        employee = serializer.save()
+        try:
+            employee = serializer.save()
+        except IntegrityError as e:
+            error_message = str(e)
+            
+            # Check for specific constraint violations
+            if 'employees_employer_id_employee_id' in error_message:
+                return Response(
+                    {
+                        'error': 'Duplicate Employee ID',
+                        'detail': 'An employee with this Employee ID already exists in your organization. Please use a different Employee ID or leave it empty for auto-generation.',
+                        'field': 'employee_id'
+                    },
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+            elif 'employees_employer_id_email' in error_message:
+                return Response(
+                    {
+                        'error': 'Duplicate Email',
+                        'detail': 'An employee with this email address already exists in your organization. Please use a different email address.',
+                        'field': 'email'
+                    },
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+            elif 'employees_employer_id_national_id' in error_message or 'national_id_number' in error_message:
+                return Response(
+                    {
+                        'error': 'Duplicate National ID',
+                        'detail': 'An employee with this National ID number already exists in your organization.',
+                        'field': 'national_id_number'
+                    },
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+            else:
+                # Generic integrity error
+                return Response(
+                    {
+                        'error': 'Data Integrity Error',
+                        'detail': 'The employee data conflicts with existing records. Please check all fields and try again.',
+                        'technical_detail': error_message
+                    },
+                    status=status.HTTP_400_BAD_REQUEST
+                )
         
         # Send invitation if requested
         if getattr(employee, '_send_invitation', False):
-            self._send_invitation(employee)
+            tenant_db = getattr(employee, '_tenant_db', None)
+            self._send_invitation(employee, tenant_db)
         
         # Prepare response with duplicate info if available
         response_data = EmployeeDetailSerializer(employee).data
@@ -145,38 +190,49 @@ class EmployeeViewSet(viewsets.ModelViewSet):
         
         return Response(response_data, status=status.HTTP_201_CREATED)
     
-    def _send_invitation(self, employee):
+    def _send_invitation(self, employee, tenant_db=None):
         """Helper method to send employee invitation"""
-        # Get configuration
+        # If tenant_db not provided, get it from employer
+        if not tenant_db:
+            from accounts.database_utils import get_tenant_database_alias
+            from accounts.models import EmployerProfile
+            try:
+                employer_profile = EmployerProfile.objects.get(id=employee.employer_id)
+                tenant_db = get_tenant_database_alias(employer_profile)
+            except EmployerProfile.DoesNotExist:
+                tenant_db = 'default'
+        
+        # Get configuration from tenant database
         try:
-            config = EmployeeConfiguration.objects.get(employer=employee.employer)
+            config = EmployeeConfiguration.objects.using(tenant_db).get(employer_id=employee.employer_id)
         except EmployeeConfiguration.DoesNotExist:
             config = None
         
-        # Create invitation
-        invitation = EmployeeInvitation.objects.create(
+        # Create invitation in tenant database
+        invitation = EmployeeInvitation.objects.using(tenant_db).create(
             employee=employee,
             token=generate_employee_invitation_token(),
             email=employee.email or employee.personal_email,
             expires_at=get_invitation_expiry_date(config)
         )
         
-        # Update employee flags
+        # Update employee flags in tenant database
         employee.invitation_sent = True
         employee.invitation_sent_at = timezone.now()
-        employee.save(update_fields=['invitation_sent', 'invitation_sent_at'])
+        employee.save(using=tenant_db, update_fields=['invitation_sent', 'invitation_sent_at'])
         
         # Send email
         if not config or config.send_invitation_email:
             send_employee_invitation_email(employee, invitation)
         
-        # Create audit log
+        # Create audit log in tenant database
         create_employee_audit_log(
             employee=employee,
             action='INVITED',
             performed_by=self.request.user,
             notes=f'Invitation sent to {invitation.email}',
-            request=self.request
+            request=self.request,
+            tenant_db=tenant_db
         )
     
     @action(detail=True, methods=['post'])
@@ -246,10 +302,14 @@ class EmployeeViewSet(viewsets.ModelViewSet):
         
         # Revoke system access based on configuration
         try:
-            config = EmployeeConfiguration.objects.get(employer=employee.employer)
-            if config.termination_revoke_access_timing == 'IMMEDIATE' and employee.user:
-                employee.user.is_active = False
-                employee.user.save()
+            config = EmployeeConfiguration.objects.get(employer_id=employee.employer_id)
+            if config.termination_revoke_access_timing == 'IMMEDIATE' and employee.user_id:
+                # Update user in main database
+                from django.contrib.auth import get_user_model
+                User = get_user_model()
+                user = User.objects.get(id=employee.user_id)
+                user.is_active = False
+                user.save()
         except EmployeeConfiguration.DoesNotExist:
             pass
         
@@ -272,7 +332,7 @@ class EmployeeViewSet(viewsets.ModelViewSet):
         
         # Check if reactivation is allowed
         try:
-            config = EmployeeConfiguration.objects.get(employer=employee.employer)
+            config = EmployeeConfiguration.objects.get(employer_id=employee.employer_id)
             if not config.allow_employee_reactivation:
                 return Response(
                     {'error': 'Employee reactivation is not allowed by policy'},
@@ -335,7 +395,7 @@ class EmployeeViewSet(viewsets.ModelViewSet):
         employee = self.get_object()
         
         try:
-            config = EmployeeConfiguration.objects.get(employer=employee.employer)
+            config = EmployeeConfiguration.objects.get(employer_id=employee.employer_id)
         except EmployeeConfiguration.DoesNotExist:
             config = None
         
@@ -358,7 +418,7 @@ class EmployeeViewSet(viewsets.ModelViewSet):
         serializer.is_valid(raise_exception=True)
         
         try:
-            config = EmployeeConfiguration.objects.get(employer=request.user.employer_profile)
+            config = EmployeeConfiguration.objects.get(employer_id=request.user.employer_profile.id)
         except EmployeeConfiguration.DoesNotExist:
             config = None
         
@@ -432,13 +492,13 @@ class EmployeeConfigurationViewSet(viewsets.ModelViewSet):
     def get_queryset(self):
         """Return configuration for the employer"""
         return EmployeeConfiguration.objects.filter(
-            employer=self.request.user.employer_profile
+            employer_id=self.request.user.employer_profile.id
         )
     
     def get_object(self):
         """Get or create configuration for employer"""
         config, created = EmployeeConfiguration.objects.get_or_create(
-            employer=self.request.user.employer_profile,
+            employer_id=self.request.user.employer_profile.id,
             defaults={
                 'employee_id_prefix': 'EMP',
                 'required_documents': ['RESUME', 'ID_COPY', 'CERTIFICATE'],
@@ -511,22 +571,48 @@ class EmployeeInvitationViewSet(viewsets.ReadOnlyModelViewSet):
         invitation = serializer.validated_data['token']
         password = serializer.validated_data['password']
         
-        # Check if user already exists with this email
+        # Get employee and determine tenant database
         employee = invitation.employee
-        if employee.user:
+        employer_id = employee.employer_id
+        
+        # Get tenant database alias
+        from accounts.database_utils import get_tenant_database_alias
+        from accounts.models import EmployerProfile
+        
+        # Get employer profile from main database to determine tenant DB
+        try:
+            employer_profile = EmployerProfile.objects.get(id=employer_id)
+            tenant_db = get_tenant_database_alias(employer_profile)
+        except EmployerProfile.DoesNotExist:
+            return Response(
+                {'error': 'Employer profile not found'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        # Re-query employee from tenant database
+        try:
+            employee = Employee.objects.using(tenant_db).get(id=employee.id)
+        except Employee.DoesNotExist:
+            return Response(
+                {'error': 'Employee record not found'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        # Check if user already exists with this email
+        if employee.user_id:
             return Response(
                 {'error': 'This employee already has a user account'},
                 status=status.HTTP_400_BAD_REQUEST
             )
         
-        # Check if a user account exists with this email
+        # Check if a user account exists with this email in main database
         try:
             user = User.objects.get(email=invitation.email)
             # Link existing user to employee
-            employee.user = user
-            employee.save()
+            employee.user_id = user.id
+            employee.save(using=tenant_db)
         except User.DoesNotExist:
-            # Create new user account
+            # Create new user account in main database
             from django.contrib.auth import get_user_model
             User = get_user_model()
             
@@ -537,30 +623,197 @@ class EmployeeInvitationViewSet(viewsets.ReadOnlyModelViewSet):
                 is_active=True
             )
             
-            # Link user to employee
-            employee.user = user
-            employee.save()
+            # Link user to employee in tenant database
+            employee.user_id = user.id
+            employee.save(using=tenant_db)
         
-        # Update invitation status
+        # Update invitation status in tenant database
         invitation.status = 'ACCEPTED'
         invitation.accepted_at = timezone.now()
-        invitation.save()
+        invitation.save(using=tenant_db)
         
-        # Update employee flags
+        # Update employee flags in tenant database
         employee.invitation_accepted = True
         employee.invitation_accepted_at = timezone.now()
-        employee.save()
+        employee.save(using=tenant_db)
         
-        # Create audit log
+        # Create audit log in tenant database
         create_employee_audit_log(
             employee=employee,
             action='LINKED',
             performed_by=user,
             notes='Employee accepted invitation and linked user account',
-            request=request
+            request=request,
+            tenant_db=tenant_db
         )
         
         return Response({
             'message': 'Invitation accepted successfully',
             'employee': EmployeeDetailSerializer(employee).data
         }, status=status.HTTP_200_OK)
+
+
+class EmployeeProfileViewSet(viewsets.GenericViewSet):
+    """ViewSet for employees to manage their own profile"""
+    
+    permission_classes = [IsAuthenticated, IsEmployee]
+    
+    def get_queryset(self):
+        """Get the employee record for the authenticated user"""
+        from accounts.database_utils import get_tenant_database_alias
+        
+        user = self.request.user
+        if not user.is_employee or not hasattr(user, 'employee_profile') or not user.employee_profile:
+            return Employee.objects.none()
+        
+        # Get tenant database
+        try:
+            employee = user.employee_profile
+            from accounts.models import EmployerProfile
+            employer = EmployerProfile.objects.get(id=employee.employer_id)
+            tenant_db = get_tenant_database_alias(employer)
+            
+            return Employee.objects.using(tenant_db).filter(user_id=user.id)
+        except:
+            return Employee.objects.none()
+    
+    @action(detail=False, methods=['get'], url_path='me')
+    def get_own_profile(self, request):
+        """Get authenticated employee's own profile"""
+        from accounts.database_utils import get_tenant_database_alias
+        from .serializers import EmployeeSelfProfileSerializer
+        
+        user = request.user
+        
+        # Check if user is an employee
+        if not user.is_employee:
+            return Response({
+                'error': 'Only employees can access this endpoint'
+            }, status=status.HTTP_403_FORBIDDEN)
+        
+        # Get employee record from cache or database
+        try:
+            # Try to get from user relationship first
+            if hasattr(user, 'employee_profile') and user.employee_profile:
+                employee = user.employee_profile
+            else:
+                # Fallback: search all tenant databases
+                from accounts.models import EmployerProfile
+                
+                # Get all employers
+                employers = EmployerProfile.objects.filter(is_active=True)
+                employee = None
+                
+                for employer in employers:
+                    tenant_db = get_tenant_database_alias(employer)
+                    try:
+                        employee = Employee.objects.using(tenant_db).get(user_id=user.id)
+                        break
+                    except Employee.DoesNotExist:
+                        continue
+                
+                if not employee:
+                    return Response({
+                        'error': 'Employee record not found'
+                    }, status=status.HTTP_404_NOT_FOUND)
+            
+            serializer = EmployeeSelfProfileSerializer(employee)
+            return Response(serializer.data, status=status.HTTP_200_OK)
+            
+        except Exception as e:
+            return Response({
+                'error': 'Failed to retrieve employee profile',
+                'detail': str(e)
+            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+    
+    @action(detail=False, methods=['put', 'patch'], url_path='complete-profile')
+    def complete_profile(self, request):
+        """Employee completes their own profile after accepting invitation"""
+        from accounts.database_utils import get_tenant_database_alias
+        from .serializers import EmployeeProfileCompletionSerializer
+        
+        user = request.user
+        
+        # Check if user is an employee
+        if not user.is_employee:
+            return Response({
+                'error': 'Only employees can complete their profile'
+            }, status=status.HTTP_403_FORBIDDEN)
+        
+        try:
+            # Get employee record
+            if hasattr(user, 'employee_profile') and user.employee_profile:
+                employee = user.employee_profile
+                from accounts.models import EmployerProfile
+                employer = EmployerProfile.objects.get(id=employee.employer_id)
+                tenant_db = get_tenant_database_alias(employer)
+            else:
+                # Fallback: search all tenant databases
+                from accounts.models import EmployerProfile
+                employers = EmployerProfile.objects.filter(is_active=True)
+                employee = None
+                tenant_db = None
+                
+                for employer in employers:
+                    tenant_db = get_tenant_database_alias(employer)
+                    try:
+                        employee = Employee.objects.using(tenant_db).get(user_id=user.id)
+                        break
+                    except Employee.DoesNotExist:
+                        continue
+                
+                if not employee:
+                    return Response({
+                        'error': 'Employee record not found'
+                    }, status=status.HTTP_404_NOT_FOUND)
+            
+            # Use partial update for PATCH, full update for PUT
+            partial = request.method == 'PATCH'
+            serializer = EmployeeProfileCompletionSerializer(
+                employee, 
+                data=request.data, 
+                partial=partial
+            )
+            
+            if serializer.is_valid():
+                # Save to tenant database
+                updated_employee = serializer.save()
+                
+                # Update in tenant database
+                Employee.objects.using(tenant_db).filter(id=updated_employee.id).update(
+                    **{field: getattr(updated_employee, field) 
+                       for field in serializer.validated_data.keys()}
+                )
+                
+                # Add profile_completed fields
+                if not partial or ('profile_completed' in dir(updated_employee) and updated_employee.profile_completed):
+                    Employee.objects.using(tenant_db).filter(id=updated_employee.id).update(
+                        profile_completed=updated_employee.profile_completed,
+                        profile_completed_at=updated_employee.profile_completed_at
+                    )
+                
+                # Create audit log
+                create_employee_audit_log(
+                    employee=updated_employee,
+                    action='PROFILE_COMPLETED' if updated_employee.profile_completed else 'PROFILE_UPDATED',
+                    performed_by=user,
+                    notes='Employee completed/updated their profile',
+                    request=request,
+                    tenant_db=tenant_db
+                )
+                
+                # Refresh and return
+                updated_employee = Employee.objects.using(tenant_db).get(id=updated_employee.id)
+                from .serializers import EmployeeSelfProfileSerializer
+                return Response({
+                    'message': 'Profile updated successfully',
+                    'profile': EmployeeSelfProfileSerializer(updated_employee).data
+                }, status=status.HTTP_200_OK)
+            
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+            
+        except Exception as e:
+            return Response({
+                'error': 'Failed to update profile',
+                'detail': str(e)
+            }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)

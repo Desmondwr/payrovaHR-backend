@@ -35,7 +35,7 @@ def detect_duplicate_employees(employer, national_id=None, email=None, phone=Non
     # Get configuration
     if config is None:
         try:
-            config = EmployeeConfiguration.objects.get(employer=employer)
+            config = EmployeeConfiguration.objects.get(employer_id=employer.id)
         except EmployeeConfiguration.DoesNotExist:
             # No config, use default strict matching
             config = None
@@ -141,16 +141,19 @@ def send_employee_invitation_email(employee, invitation):
     # Build invitation URL
     invitation_url = f"{settings.FRONTEND_URL}/employee/accept-invitation/{invitation.token}"
     
-    # Prepare context
+    # Prepare context - need to fetch employer from main DB
+    from accounts.models import EmployerProfile
+    employer = EmployerProfile.objects.get(id=employee.employer_id)
+    
     context = {
         'employee': employee,
-        'employer': employee.employer,
+        'employer': employer,
         'invitation_url': invitation_url,
         'expires_at': invitation.expires_at,
     }
     
     # Render email
-    subject = f"Invitation to join {employee.employer.company_name}"
+    subject = f"Invitation to join {employer.company_name}"
     html_message = render_to_string('emails/employee_invitation.html', context)
     text_message = render_to_string('emails/employee_invitation.txt', context)
     
@@ -170,9 +173,13 @@ def generate_work_email(employee, config):
     if not config.auto_generate_work_email or not config.work_email_template:
         return None
     
+    # Fetch employer from main database
+    from accounts.models import EmployerProfile
+    employer = EmployerProfile.objects.get(id=employee.employer_id)
+    
     # Parse template
     template = config.work_email_template
-    domain = employee.employer.official_company_email.split('@')[1] if '@' in employee.employer.official_company_email else 'company.com'
+    domain = employer.official_company_email.split('@')[1] if '@' in employer.official_company_email else 'company.com'
     
     email = template.replace('{firstname}', employee.first_name.lower())
     email = email.replace('{lastname}', employee.last_name.lower())
@@ -189,7 +196,7 @@ def check_required_documents(employee):
     from employees.models import EmployeeConfiguration, EmployeeDocument
     
     try:
-        config = EmployeeConfiguration.objects.get(employer=employee.employer)
+        config = EmployeeConfiguration.objects.get(employer_id=employee.employer_id)
     except EmployeeConfiguration.DoesNotExist:
         return {'missing': [], 'all_uploaded': True}
     
@@ -293,7 +300,7 @@ def validate_employee_data(data, config):
     }
 
 
-def create_employee_audit_log(employee, action, performed_by, changes=None, notes=None, request=None):
+def create_employee_audit_log(employee, action, performed_by, changes=None, notes=None, request=None, tenant_db=None):
     """Create an audit log entry for employee actions"""
     from employees.models import EmployeeAuditLog
     
@@ -306,14 +313,25 @@ def create_employee_audit_log(employee, action, performed_by, changes=None, note
         else:
             ip_address = request.META.get('REMOTE_ADDR')
     
-    audit_log = EmployeeAuditLog.objects.create(
-        employee=employee,
-        action=action,
-        performed_by=performed_by,
-        changes=changes,
-        notes=notes,
-        ip_address=ip_address
-    )
+    # Use tenant database if provided
+    if tenant_db:
+        audit_log = EmployeeAuditLog.objects.using(tenant_db).create(
+            employee=employee,
+            action=action,
+            performed_by_id=performed_by.id if performed_by else None,
+            changes=changes,
+            notes=notes,
+            ip_address=ip_address
+        )
+    else:
+        audit_log = EmployeeAuditLog.objects.create(
+            employee=employee,
+            action=action,
+            performed_by_id=performed_by.id if performed_by else None,
+            changes=changes,
+            notes=notes,
+            ip_address=ip_address
+        )
     
     return audit_log
 

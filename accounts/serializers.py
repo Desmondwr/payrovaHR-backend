@@ -346,7 +346,7 @@ class EmployeeRegistrationSerializer(serializers.Serializer):
             user=user,
             **validated_data
         )
-        return user
+        return user, employee_profile
 
 
 class EmployeeProfileSerializer(serializers.ModelSerializer):

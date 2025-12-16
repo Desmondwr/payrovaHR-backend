@@ -376,42 +376,42 @@ class Employee(models.Model):
     # Link to user account (optional - employee may not have created account yet)
     user_id = models.IntegerField(null=True, blank=True, db_index=True, help_text='ID of the user account (from main database)')
     
-    # Basic Information
-    employee_id = models.CharField(max_length=50, help_text='Company-assigned employee ID')
-    first_name = models.CharField(max_length=100)
-    last_name = models.CharField(max_length=100)
+    # Basic Information (core fields required by employer)
+    employee_id = models.CharField(max_length=50, blank=True, help_text='Company-assigned employee ID (auto-generated if not provided)')
+    first_name = models.CharField(max_length=100)  # Required by employer
+    last_name = models.CharField(max_length=100)  # Required by employer
     middle_name = models.CharField(max_length=100, blank=True, null=True)
-    date_of_birth = models.DateField()
-    gender = models.CharField(max_length=20, choices=GENDER_CHOICES)
+    date_of_birth = models.DateField(blank=True, null=True)  # Employee completes
+    gender = models.CharField(max_length=20, choices=GENDER_CHOICES, blank=True, null=True)  # Employee completes
     marital_status = models.CharField(max_length=20, choices=MARITAL_STATUS_CHOICES, blank=True, null=True)
-    nationality = models.CharField(max_length=100)
+    nationality = models.CharField(max_length=100, blank=True, null=True)  # Employee completes
     profile_photo = models.ImageField(upload_to='employee_photos/', blank=True, null=True)
     
     # Contact Information
-    email = models.EmailField(help_text='Work email')
+    email = models.EmailField(help_text='Work email')  # Required by employer
     personal_email = models.EmailField(blank=True, null=True)
-    phone_number = models.CharField(max_length=20)
+    phone_number = models.CharField(max_length=20, blank=True, null=True)  # Employee completes
     alternative_phone = models.CharField(max_length=20, blank=True, null=True)
-    address = models.TextField()
-    city = models.CharField(max_length=100)
-    state_region = models.CharField(max_length=100)
+    address = models.TextField(blank=True, null=True)  # Employee completes
+    city = models.CharField(max_length=100, blank=True, null=True)  # Employee completes
+    state_region = models.CharField(max_length=100, blank=True, null=True)  # Employee completes
     postal_code = models.CharField(max_length=20, blank=True, null=True)
-    country = models.CharField(max_length=100)
+    country = models.CharField(max_length=100, blank=True, null=True)  # Employee completes
     
-    # Legal Identification
-    national_id_number = models.CharField(max_length=50, db_index=True)
+    # Legal Identification (employee completes their own sensitive info)
+    national_id_number = models.CharField(max_length=50, blank=True, null=True, db_index=True)  # Employee completes
     passport_number = models.CharField(max_length=50, blank=True, null=True, db_index=True)
-    cnps_number = models.CharField(max_length=50, blank=True, null=True, help_text='CNPS employee number')
+    cnps_number = models.CharField(max_length=50, blank=True, null=True, help_text='CNPS employee number')  # Employee completes
     tax_number = models.CharField(max_length=50, blank=True, null=True, help_text='Tax identification number')
     
-    # Employment Details
-    job_title = models.CharField(max_length=255)
+    # Employment Details (set by employer)
+    job_title = models.CharField(max_length=255)  # Required by employer
     department = models.ForeignKey(Department, on_delete=models.SET_NULL, null=True, blank=True, related_name='employees')
     branch = models.ForeignKey(Branch, on_delete=models.SET_NULL, null=True, blank=True, related_name='employees')
     manager = models.ForeignKey('self', on_delete=models.SET_NULL, null=True, blank=True, related_name='direct_reports')
-    employment_type = models.CharField(max_length=20, choices=EMPLOYMENT_TYPE_CHOICES)
+    employment_type = models.CharField(max_length=20, choices=EMPLOYMENT_TYPE_CHOICES)  # Required by employer
     employment_status = models.CharField(max_length=20, choices=EMPLOYMENT_STATUS_CHOICES, default='ACTIVE')
-    hire_date = models.DateField()
+    hire_date = models.DateField()  # Required by employer
     probation_end_date = models.DateField(blank=True, null=True)
     termination_date = models.DateField(blank=True, null=True)
     termination_reason = models.TextField(blank=True, null=True)
@@ -421,10 +421,10 @@ class Employee(models.Model):
     bank_account_number = models.CharField(max_length=50, blank=True, null=True)
     bank_account_name = models.CharField(max_length=255, blank=True, null=True)
     
-    # Emergency Contact
-    emergency_contact_name = models.CharField(max_length=200)
-    emergency_contact_relationship = models.CharField(max_length=100)
-    emergency_contact_phone = models.CharField(max_length=20)
+    # Emergency Contact (employee completes)
+    emergency_contact_name = models.CharField(max_length=200, blank=True, null=True)  # Employee completes
+    emergency_contact_relationship = models.CharField(max_length=100, blank=True, null=True)  # Employee completes
+    emergency_contact_phone = models.CharField(max_length=20, blank=True, null=True)  # Employee completes
     
     # System Access
     invitation_sent = models.BooleanField(default=False)
@@ -434,6 +434,10 @@ class Employee(models.Model):
     
     # Flags
     is_concurrent_employment = models.BooleanField(default=False, help_text='Employee works for multiple institutions')
+    
+    # Profile Completion Tracking
+    profile_completed = models.BooleanField(default=False, help_text='Whether employee has completed their profile')
+    profile_completed_at = models.DateTimeField(null=True, blank=True, help_text='When employee completed their profile')
     
     # Timestamps
     created_at = models.DateTimeField(auto_now_add=True)

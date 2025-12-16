@@ -59,6 +59,38 @@ class User(AbstractUser):
 
     def __str__(self):
         return self.email
+    
+    @property
+    def employee_profile(self):
+        """Get employee profile if user is an employee"""
+        if not self.is_employee:
+            return None
+        
+        # Try to get from cache
+        if hasattr(self, '_employee_profile_cache'):
+            return self._employee_profile_cache
+        
+        # Search for employee record in tenant databases
+        from employees.models import Employee
+        from accounts.database_utils import get_tenant_database_alias
+        
+        try:
+            # Get all active employers
+            employers = EmployerProfile.objects.filter(is_active=True)
+            
+            for employer in employers:
+                tenant_db = get_tenant_database_alias(employer)
+                try:
+                    employee = Employee.objects.using(tenant_db).get(user_id=self.id)
+                    # Cache it
+                    self._employee_profile_cache = employee
+                    return employee
+                except Employee.DoesNotExist:
+                    continue
+            
+            return None
+        except Exception:
+            return None
 
 
 class ActivationToken(models.Model):

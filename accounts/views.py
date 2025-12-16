@@ -197,6 +197,13 @@ class LoginView(APIView):
             # Generate JWT tokens
             refresh = RefreshToken.for_user(user)
             
+            # Check employee profile completion status
+            employee_profile_completed = None
+            if user.is_employee:
+                employee = user.employee_profile
+                if employee:
+                    employee_profile_completed = employee.profile_completed
+            
             response_data = {
                 'user': UserSerializer(user).data,
                 'tokens': {
@@ -204,6 +211,7 @@ class LoginView(APIView):
                     'access': str(refresh.access_token),
                 },
                 'profile_incomplete': user.is_employer and not user.profile_completed,
+                'employee_profile_completed': employee_profile_completed,
             }
             
             return api_response(

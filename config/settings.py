@@ -57,6 +57,7 @@ MIDDLEWARE = [
     'django.middleware.common.CommonMiddleware',
     'django.middleware.csrf.CsrfViewMiddleware',
     'django.contrib.auth.middleware.AuthenticationMiddleware',
+    'accounts.middleware.TenantDatabaseMiddleware',  # Add tenant context middleware
     'django.contrib.messages.middleware.MessageMiddleware',
     'django.middleware.clickjacking.XFrameOptionsMiddleware',
 ]
@@ -97,6 +98,9 @@ DATABASES = {
 
 # Database Router for Multi-tenancy
 DATABASE_ROUTERS = ['accounts.database_router.TenantDatabaseRouter']
+
+# Thread-local tenant context (set by middleware)
+CURRENT_TENANT_DB = None
 
 
 # Custom User Model
