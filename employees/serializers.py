@@ -553,6 +553,40 @@ class CreateEmployeeWithDetectionSerializer(serializers.ModelSerializer):
             'send_invitation', 'force_create', 'link_existing_user',
             'acknowledge_cross_institution'
         ]
+        extra_kwargs = {
+            # Make most fields optional - employers provide minimal data, employees complete their profiles
+            'employee_id': {'required': False},
+            'middle_name': {'required': False},
+            'date_of_birth': {'required': False},
+            'gender': {'required': False},
+            'marital_status': {'required': False},
+            'nationality': {'required': False},
+            'profile_photo': {'required': False},
+            'personal_email': {'required': False},
+            'phone_number': {'required': False},
+            'alternative_phone': {'required': False},
+            'address': {'required': False},
+            'city': {'required': False},
+            'state_region': {'required': False},
+            'postal_code': {'required': False},
+            'country': {'required': False},
+            'national_id_number': {'required': False},
+            'passport_number': {'required': False},
+            'cnps_number': {'required': False},
+            'tax_number': {'required': False},
+            'job_title': {'required': False},
+            'employment_type': {'required': False},
+            'employment_status': {'required': False},
+            'hire_date': {'required': False},
+            'probation_end_date': {'required': False},
+            'bank_name': {'required': False},
+            'bank_account_number': {'required': False},
+            'bank_account_name': {'required': False},
+            'emergency_contact_name': {'required': False},
+            'emergency_contact_relationship': {'required': False},
+            'emergency_contact_phone': {'required': False},
+        }
+
     
     def validate_department(self, value):
         """Validate that department UUID exists in tenant database"""
@@ -630,11 +664,10 @@ class CreateEmployeeWithDetectionSerializer(serializers.ModelSerializer):
         except EmployeeConfiguration.DoesNotExist:
             config = None
         
-        # Validate required fields based on configuration
-        if config:
-            validation_result = validate_employee_data(data, config)
-            if not validation_result['valid']:
-                raise serializers.ValidationError(validation_result['errors'])
+        # Skip strict validation during employer-initiated creation
+        # The configuration requirements apply when employees complete their own profiles,
+        # not when employers are creating initial employee records
+        # Employers only need to provide minimal fields: first_name, last_name, email, job_title, etc.
         
         # Detect duplicates
         force_create = data.get('force_create', False)
@@ -860,11 +893,39 @@ class EmployeeProfileCompletionSerializer(serializers.ModelSerializer):
             'emergency_contact_name', 'emergency_contact_relationship',
             'emergency_contact_phone',
         ]
+        # String fields that support allow_blank
+        string_fields = [
+            'nationality', 'marital_status', 'phone_number', 'alternative_phone', 
+            'personal_email', 'address', 'city', 'state_region', 'postal_code', 'country',
+            'national_id_number', 'passport_number', 'cnps_number', 'tax_number',
+            'bank_name', 'bank_account_number', 'bank_account_name',
+            'emergency_contact_name', 'emergency_contact_relationship', 'emergency_contact_phone'
+        ]
         extra_kwargs = {
-            # Make all fields optional - employee completes what they can
-            field: {'required': False, 'allow_null': True, 'allow_blank': True} 
-            for field in fields if field != 'profile_photo'
+            **{field: {'required': False, 'allow_null': True, 'allow_blank': True} 
+               for field in string_fields},
+            **{field: {'required': False, 'allow_null': True} 
+               for field in ['date_of_birth', 'gender', 'profile_photo']}
         }
+    
+    def validate(self, data):
+        """Validate employee profile data against configuration requirements"""
+        from employees.utils import validate_employee_data
+        
+        # Get the employee instance being updated
+        if self.instance:
+            try:
+                config = EmployeeConfiguration.objects.get(employer_id=self.instance.employer_id)
+            except EmployeeConfiguration.DoesNotExist:
+                config = None
+            
+            # Enforce configuration requirements when employee is completing profile
+            if config:
+                validation_result = validate_employee_data(data, config)
+                if not validation_result['valid']:
+                    raise serializers.ValidationError(validation_result['errors'])
+        
+        return data
     
     def update(self, instance, validated_data):
         """Update employee profile and mark as completed"""
