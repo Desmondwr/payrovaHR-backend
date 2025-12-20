@@ -115,9 +115,14 @@ class EmployeeViewSet(viewsets.ModelViewSet):
             return EmployeeDetailSerializer
     
     def get_queryset(self):
-        """Return employees for the employer's organization"""
-        queryset = Employee.objects.filter(
-            employer_id=self.request.user.employer_profile.id
+        """Return employees for the employer's organization from tenant database"""
+        from accounts.database_utils import get_tenant_database_alias
+        
+        employer = self.request.user.employer_profile
+        tenant_db = get_tenant_database_alias(employer)
+        
+        queryset = Employee.objects.using(tenant_db).filter(
+            employer_id=employer.id
         ).select_related(
             'department', 'branch', 'manager'
         ).prefetch_related('documents', 'cross_institution_records')
