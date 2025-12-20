@@ -97,9 +97,9 @@ class BranchSerializer(serializers.ModelSerializer):
 class EmployeeListSerializer(serializers.ModelSerializer):
     """Serializer for Employee list view (minimal fields)"""
     
-    department_name = serializers.CharField(source='department.name', read_only=True)
-    branch_name = serializers.CharField(source='branch.name', read_only=True)
-    manager_name = serializers.CharField(source='manager.full_name', read_only=True)
+    department_name = serializers.SerializerMethodField()
+    branch_name = serializers.SerializerMethodField()
+    manager_name = serializers.SerializerMethodField()
     
     class Meta:
         model = Employee
@@ -109,14 +109,62 @@ class EmployeeListSerializer(serializers.ModelSerializer):
             'branch_name', 'manager_name', 'employment_status', 'employment_type',
             'hire_date', 'profile_photo', 'is_concurrent_employment'
         ]
+    
+    def get_department_name(self, obj):
+        """Get department name from tenant database"""
+        if not obj.department_id:
+            return None
+        
+        try:
+            from accounts.database_utils import get_tenant_database_alias
+            request = self.context.get('request')
+            if request and hasattr(request.user, 'employer_profile'):
+                tenant_db = get_tenant_database_alias(request.user.employer_profile)
+                department = Department.objects.using(tenant_db).get(id=obj.department_id)
+                return department.name
+        except Department.DoesNotExist:
+            pass
+        return None
+    
+    def get_branch_name(self, obj):
+        """Get branch name from tenant database"""
+        if not obj.branch_id:
+            return None
+        
+        try:
+            from accounts.database_utils import get_tenant_database_alias
+            request = self.context.get('request')
+            if request and hasattr(request.user, 'employer_profile'):
+                tenant_db = get_tenant_database_alias(request.user.employer_profile)
+                branch = Branch.objects.using(tenant_db).get(id=obj.branch_id)
+                return branch.name
+        except Branch.DoesNotExist:
+            pass
+        return None
+    
+    def get_manager_name(self, obj):
+        """Get manager name from tenant database"""
+        if not obj.manager_id:
+            return None
+        
+        try:
+            from accounts.database_utils import get_tenant_database_alias
+            request = self.context.get('request')
+            if request and hasattr(request.user, 'employer_profile'):
+                tenant_db = get_tenant_database_alias(request.user.employer_profile)
+                manager = Employee.objects.using(tenant_db).get(id=obj.manager_id)
+                return manager.full_name
+        except Employee.DoesNotExist:
+            pass
+        return None
 
 
 class EmployeeDetailSerializer(serializers.ModelSerializer):
     """Serializer for Employee detail view (all fields)"""
     
-    department_name = serializers.CharField(source='department.name', read_only=True)
-    branch_name = serializers.CharField(source='branch.name', read_only=True)
-    manager_name = serializers.CharField(source='manager.full_name', read_only=True)
+    department_name = serializers.SerializerMethodField()
+    branch_name = serializers.SerializerMethodField()
+    manager_name = serializers.SerializerMethodField()
     has_user_account = serializers.SerializerMethodField()
     cross_institution_count = serializers.SerializerMethodField()
     
@@ -127,6 +175,54 @@ class EmployeeDetailSerializer(serializers.ModelSerializer):
             'id', 'created_at', 'updated_at', 'invitation_sent_at',
             'invitation_accepted_at', 'is_concurrent_employment'
         ]
+    
+    def get_department_name(self, obj):
+        """Get department name from tenant database"""
+        if not obj.department_id:
+            return None
+        
+        try:
+            from accounts.database_utils import get_tenant_database_alias
+            request = self.context.get('request')
+            if request and hasattr(request.user, 'employer_profile'):
+                tenant_db = get_tenant_database_alias(request.user.employer_profile)
+                department = Department.objects.using(tenant_db).get(id=obj.department_id)
+                return department.name
+        except Department.DoesNotExist:
+            pass
+        return None
+    
+    def get_branch_name(self, obj):
+        """Get branch name from tenant database"""
+        if not obj.branch_id:
+            return None
+        
+        try:
+            from accounts.database_utils import get_tenant_database_alias
+            request = self.context.get('request')
+            if request and hasattr(request.user, 'employer_profile'):
+                tenant_db = get_tenant_database_alias(request.user.employer_profile)
+                branch = Branch.objects.using(tenant_db).get(id=obj.branch_id)
+                return branch.name
+        except Branch.DoesNotExist:
+            pass
+        return None
+    
+    def get_manager_name(self, obj):
+        """Get manager name from tenant database"""
+        if not obj.manager_id:
+            return None
+        
+        try:
+            from accounts.database_utils import get_tenant_database_alias
+            request = self.context.get('request')
+            if request and hasattr(request.user, 'employer_profile'):
+                tenant_db = get_tenant_database_alias(request.user.employer_profile)
+                manager = Employee.objects.using(tenant_db).get(id=obj.manager_id)
+                return manager.full_name
+        except Employee.DoesNotExist:
+            pass
+        return None
     
     def get_has_user_account(self, obj):
         return obj.user_id is not None
