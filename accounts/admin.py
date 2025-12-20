@@ -1,6 +1,6 @@
 from django.contrib import admin
 from django.contrib.auth.admin import UserAdmin as BaseUserAdmin
-from .models import User, ActivationToken, EmployerProfile, EmployeeProfile
+from .models import User, ActivationToken, EmployerProfile, EmployeeRegistry
 
 
 @admin.register(User)
@@ -70,9 +70,9 @@ class EmployerProfileAdmin(admin.ModelAdmin):
     )
 
 
-@admin.register(EmployeeProfile)
-class EmployeeProfileAdmin(admin.ModelAdmin):
-    """Admin interface for EmployeeProfile model"""
+@admin.register(EmployeeRegistry)
+class EmployeeRegistryAdmin(admin.ModelAdmin):
+    """Admin interface for EmployeeRegistry model"""
     
     list_display = ('first_name', 'last_name', 'user', 'phone_number', 'national_id_number', 'created_at')
     list_filter = ('gender', 'marital_status', 'created_at')

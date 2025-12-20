@@ -187,8 +187,8 @@ class EmployerProfile(models.Model):
         return f"tenant_{self.id}" if self.database_name else 'default'
 
 
-class EmployeeProfile(models.Model):
-    """Model to store employee profile information"""
+class EmployeeRegistry(models.Model):
+    """Central registry for cross-institutional employee tracking"""
     
     GENDER_CHOICES = [
         ('MALE', 'Male'),
@@ -204,7 +204,7 @@ class EmployeeProfile(models.Model):
         ('WIDOWED', 'Widowed'),
     ]
 
-    user = models.OneToOneField(User, on_delete=models.CASCADE, related_name='employee_profile')
+    user = models.OneToOneField(User, on_delete=models.CASCADE, related_name='employee_registry')
     
     # Personal Information
     first_name = models.CharField(max_length=100)
@@ -248,9 +248,9 @@ class EmployeeProfile(models.Model):
     updated_at = models.DateTimeField(auto_now=True)
 
     class Meta:
-        db_table = 'employee_profiles'
-        verbose_name = 'Employee Profile'
-        verbose_name_plural = 'Employee Profiles'
+        db_table = 'employee_registry'
+        verbose_name = 'Employee Registry'
+        verbose_name_plural = 'Employee Registry'
 
     def __str__(self):
         return f"{self.first_name} {self.last_name} - {self.user.email}"

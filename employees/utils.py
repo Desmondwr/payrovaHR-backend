@@ -11,6 +11,7 @@ def detect_duplicate_employees(employer, national_id=None, email=None, phone=Non
                                config=None, exclude_employee_id=None):
     """
     Detect potential duplicate employees based on configuration settings
+    Uses central EmployeeProfile registry for cross-institutional detection
     
     Args:
         employer: EmployerProfile instance
@@ -26,16 +27,19 @@ def detect_duplicate_employees(employer, national_id=None, email=None, phone=Non
     Returns:
         dict: {
             'duplicates_found': bool,
-            'matches': list of Employee objects,
+            'matches': list of EmployeeRegistry objects from central registry,
             'match_reasons': list of strings explaining why each is a match
         }
     """
     from employees.models import Employee, EmployeeConfiguration
+    from accounts.models import EmployeeRegistry
+    from accounts.database_utils import get_tenant_database_alias
     
-    # Get configuration
+    # Get configuration from tenant database
     if config is None:
         try:
-            config = EmployeeConfiguration.objects.get(employer_id=employer.id)
+            tenant_db = get_tenant_database_alias(employer)
+            config = EmployeeConfiguration.objects.using(tenant_db).get(employer_id=employer.id)
         except EmployeeConfiguration.DoesNotExist:
             # No config, use default strict matching
             config = None
@@ -43,11 +47,18 @@ def detect_duplicate_employees(employer, national_id=None, email=None, phone=Non
     matches = []
     match_reasons = {}
     
-    # Base query - search across all employers for cross-institution detection
-    query = Employee.objects.all()
+    # Base query - search central EmployeeRegistry (default database)
+    query = EmployeeRegistry.objects.all()
     
     if exclude_employee_id:
-        query = query.exclude(id=exclude_employee_id)
+        # Exclude by user_id if we have the employee record
+        try:
+            tenant_db = get_tenant_database_alias(employer)
+            exclude_employee = Employee.objects.using(tenant_db).get(id=exclude_employee_id)
+            if exclude_employee.user_id:
+                query = query.exclude(user_id=exclude_employee.user_id)
+        except Employee.DoesNotExist:
+            pass
     
     # Build search criteria based on configuration
     search_queries = []
@@ -56,53 +67,65 @@ def detect_duplicate_employees(employer, national_id=None, email=None, phone=Non
         # Use configuration settings
         if config.duplicate_check_national_id and national_id:
             national_id_matches = query.filter(national_id_number=national_id)
-            for emp in national_id_matches:
-                if emp.id not in match_reasons:
-                    matches.append(emp)
-                    match_reasons[emp.id] = ['National ID match']
+            for profile in national_id_matches:
+                if profile.id not in match_reasons:
+                    matches.append(profile)
+                    match_reasons[profile.id] = ['National ID match']
                 else:
-                    match_reasons[emp.id].append('National ID match')
+                    match_reasons[profile.id].append('National ID match')
         
         if config.duplicate_check_email and email:
-            email_matches = query.filter(Q(email=email) | Q(personal_email=email))
-            for emp in email_matches:
-                if emp.id not in match_reasons:
-                    matches.append(emp)
-                    match_reasons[emp.id] = ['Email match']
+            # EmployeeProfile: email is via user relationship or personal_email field
+            email_matches = query.filter(Q(user__email=email) | Q(personal_email=email))
+            for profile in email_matches:
+                if profile.id not in match_reasons:
+                    matches.append(profile)
+                    match_reasons[profile.id] = ['Email match']
                 else:
-                    match_reasons[emp.id].append('Email match')
+                    match_reasons[profile.id].append('Email match')
         
         if config.duplicate_check_phone and phone:
             phone_matches = query.filter(Q(phone_number=phone) | Q(alternative_phone=phone))
-            for emp in phone_matches:
-                if emp.id not in match_reasons:
-                    matches.append(emp)
-                    match_reasons[emp.id] = ['Phone match']
+            for profile in phone_matches:
+                if profile.id not in match_reasons:
+                    matches.append(profile)
+                    match_reasons[profile.id] = ['Phone match']
                 else:
-                    match_reasons[emp.id].append('Phone match')
+                    match_reasons[profile.id].append('Phone match')
         
         if config.duplicate_check_name_dob and first_name and last_name and date_of_birth:
             # Fuzzy name matching
             name_dob_matches = query.filter(date_of_birth=date_of_birth)
-            for emp in name_dob_matches:
+            for profile in name_dob_matches:
                 similarity = similar(f"{first_name} {last_name}".lower(), 
-                                   f"{emp.first_name} {emp.last_name}".lower())
+                                   f"{profile.first_name} {profile.last_name}".lower())
                 if similarity > 0.8:  # 80% similarity threshold
-                    if emp.id not in match_reasons:
-                        matches.append(emp)
-                        match_reasons[emp.id] = [f'Name + DOB match ({int(similarity * 100)}% similar)']
+                    if profile.id not in match_reasons:
+                        matches.append(profile)
+                        match_reasons[profile.id] = [f'Name + DOB match ({int(similarity * 100)}% similar)']
                     else:
-                        match_reasons[emp.id].append(f'Name + DOB match ({int(similarity * 100)}% similar)')
+                        match_reasons[profile.id].append(f'Name + DOB match ({int(similarity * 100)}% similar)')
     else:
         # Default: strict national ID matching only
         if national_id:
             matches = list(query.filter(national_id_number=national_id))
-            for emp in matches:
-                match_reasons[emp.id] = ['National ID match']
+            for profile in matches:
+                match_reasons[profile.id] = ['National ID match']
     
-    # Separate same-institution vs cross-institution matches
-    same_institution_matches = [emp for emp in matches if emp.employer_id == employer.id]
-    cross_institution_matches = [emp for emp in matches if emp.employer_id != employer.id]
+    # Determine same-institution vs cross-institution by checking tenant database
+    tenant_db = get_tenant_database_alias(employer)
+    same_institution_matches = []
+    cross_institution_matches = []
+    
+    for profile in matches:
+        # Check if this person works at the requesting employer's institution
+        try:
+            # Query tenant database to see if employee exists with this user_id
+            Employee.objects.using(tenant_db).get(user_id=profile.user_id)
+            same_institution_matches.append(profile)
+        except Employee.DoesNotExist:
+            # Not in this employer's database = cross-institution
+            cross_institution_matches.append(profile)
     
     return {
         'duplicates_found': len(matches) > 0,
@@ -194,10 +217,14 @@ def generate_work_email(employee, config):
 def check_required_documents(employee):
     """Check if employee has uploaded all required documents"""
     from employees.models import EmployeeConfiguration, EmployeeDocument
+    from accounts.database_utils import get_tenant_database_alias
+    from accounts.models import EmployerProfile
     
     try:
-        config = EmployeeConfiguration.objects.get(employer_id=employee.employer_id)
-    except EmployeeConfiguration.DoesNotExist:
+        employer = EmployerProfile.objects.get(id=employee.employer_id)
+        tenant_db = get_tenant_database_alias(employer)
+        config = EmployeeConfiguration.objects.using(tenant_db).get(employer_id=employee.employer_id)
+    except (EmployeeConfiguration.DoesNotExist, EmployerProfile.DoesNotExist):
         return {'missing': [], 'all_uploaded': True}
     
     required_types = config.get_required_document_types()

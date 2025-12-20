@@ -6,11 +6,11 @@ from rest_framework_simplejwt.tokens import RefreshToken
 from django.contrib.auth import get_user_model
 from django_ratelimit.decorators import ratelimit
 from django.utils.decorators import method_decorator
-from .models import ActivationToken, EmployerProfile, EmployeeProfile
+from .models import ActivationToken, EmployerProfile, EmployeeRegistry
 from .serializers import (
     UserSerializer, CreateEmployerSerializer, ActivateAccountSerializer,
     LoginSerializer, EmployerProfileSerializer, Enable2FASerializer,
-    Disable2FASerializer, EmployeeRegistrationSerializer, EmployeeProfileSerializer,
+    Disable2FASerializer, EmployeeRegistrationSerializer, EmployeeRegistrySerializer,
     EmployerListSerializer
 )
 from .utils import (
@@ -61,11 +61,11 @@ from rest_framework_simplejwt.tokens import RefreshToken
 from django.contrib.auth import get_user_model
 from django_ratelimit.decorators import ratelimit
 from django.utils.decorators import method_decorator
-from .models import ActivationToken, EmployerProfile, EmployeeProfile
+from .models import ActivationToken, EmployerProfile, EmployeeRegistry
 from .serializers import (
     UserSerializer, CreateEmployerSerializer, ActivateAccountSerializer,
     LoginSerializer, EmployerProfileSerializer, Enable2FASerializer,
-    Disable2FASerializer, EmployeeRegistrationSerializer, EmployeeProfileSerializer,
+    Disable2FASerializer, EmployeeRegistrationSerializer, EmployeeRegistrySerializer,
     EmployerListSerializer
 )
 from .utils import (
@@ -98,11 +98,11 @@ from rest_framework_simplejwt.tokens import RefreshToken
 from django.contrib.auth import get_user_model
 from django_ratelimit.decorators import ratelimit
 from django.utils.decorators import method_decorator
-from .models import ActivationToken, EmployerProfile, EmployeeProfile
+from .models import ActivationToken, EmployerProfile, EmployeeRegistry
 from .serializers import (
     UserSerializer, CreateEmployerSerializer, ActivateAccountSerializer,
     LoginSerializer, EmployerProfileSerializer, Enable2FASerializer,
-    Disable2FASerializer, EmployeeRegistrationSerializer, EmployeeProfileSerializer
+    Disable2FASerializer, EmployeeRegistrationSerializer, EmployeeRegistrySerializer
 )
 from .utils import (
     api_response, send_activation_email, generate_totp_secret,
@@ -443,9 +443,9 @@ class UserProfileView(APIView):
         if user.is_employer and hasattr(user, 'employer_profile'):
             user_data['employer_profile'] = EmployerProfileSerializer(user.employer_profile).data
         
-        # Add employee profile if exists
-        if user.is_employee and hasattr(user, 'employee_profile'):
-            user_data['employee_profile'] = EmployeeProfileSerializer(user.employee_profile).data
+        # Add employee registry if exists
+        if user.is_employee and hasattr(user, 'employee_registry'):
+            user_data['employee_registry'] = EmployeeRegistrySerializer(user.employee_registry).data
         
         return api_response(
             success=True,
@@ -475,7 +475,7 @@ class EmployeeRegistrationView(APIView):
                 message='Employee account created successfully. You are now logged in.',
                 data={
                     'user': UserSerializer(user).data,
-                    'employee_profile': EmployeeProfileSerializer(employee_profile).data,
+                    'employee_registry': EmployeeRegistrySerializer(employee_registry).data,
                     'tokens': {
                         'refresh': str(refresh),
                         'access': str(refresh.access_token),
@@ -492,10 +492,10 @@ class EmployeeRegistrationView(APIView):
         )
 
 
-class EmployeeProfileDetailView(generics.RetrieveUpdateAPIView):
-    """View to retrieve and update employee profile"""
+class EmployeeRegistryDetailView(generics.RetrieveUpdateAPIView):
+    """View to retrieve and update employee central registry"""
     
-    serializer_class = EmployeeProfileSerializer
+    serializer_class = EmployeeRegistrySerializer
     permission_classes = [permissions.IsAuthenticated]
     
     def get_object(self):
@@ -505,10 +505,10 @@ class EmployeeProfileDetailView(generics.RetrieveUpdateAPIView):
             from rest_framework.exceptions import PermissionDenied
             raise PermissionDenied("Only employees can access this endpoint.")
         
-        # Get employee profile
+        # Get employee registry entry
         try:
-            return user.employee_profile
-        except EmployeeProfile.DoesNotExist:
+            return user.employee_registry
+        except EmployeeRegistry.DoesNotExist:
             from rest_framework.exceptions import NotFound
             raise NotFound("Employee profile not found.")
     
@@ -518,7 +518,7 @@ class EmployeeProfileDetailView(generics.RetrieveUpdateAPIView):
         
         return api_response(
             success=True,
-            message='Employee profile retrieved successfully.',
+            message='Employee registry retrieved successfully.',
             data=serializer.data,
             status=status.HTTP_200_OK
         )

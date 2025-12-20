@@ -330,7 +330,10 @@ class EmployeeViewSet(viewsets.ModelViewSet):
         
         # Revoke system access based on configuration
         try:
-            config = EmployeeConfiguration.objects.get(employer_id=employee.employer_id)
+            from accounts.database_utils import get_tenant_database_alias
+            employer = request.user.employer_profile
+            tenant_db = get_tenant_database_alias(employer)
+            config = EmployeeConfiguration.objects.using(tenant_db).get(employer_id=employee.employer_id)
             if config.termination_revoke_access_timing == 'IMMEDIATE' and employee.user_id:
                 # Update user in main database
                 from django.contrib.auth import get_user_model
@@ -360,7 +363,10 @@ class EmployeeViewSet(viewsets.ModelViewSet):
         
         # Check if reactivation is allowed
         try:
-            config = EmployeeConfiguration.objects.get(employer_id=employee.employer_id)
+            from accounts.database_utils import get_tenant_database_alias
+            employer = request.user.employer_profile
+            tenant_db = get_tenant_database_alias(employer)
+            config = EmployeeConfiguration.objects.using(tenant_db).get(employer_id=employee.employer_id)
             if not config.allow_employee_reactivation:
                 return Response(
                     {'error': 'Employee reactivation is not allowed by policy'},
@@ -423,7 +429,10 @@ class EmployeeViewSet(viewsets.ModelViewSet):
         employee = self.get_object()
         
         try:
-            config = EmployeeConfiguration.objects.get(employer_id=employee.employer_id)
+            from accounts.database_utils import get_tenant_database_alias
+            employer = request.user.employer_profile
+            tenant_db = get_tenant_database_alias(employer)
+            config = EmployeeConfiguration.objects.using(tenant_db).get(employer_id=employee.employer_id)
         except EmployeeConfiguration.DoesNotExist:
             config = None
         
@@ -446,7 +455,10 @@ class EmployeeViewSet(viewsets.ModelViewSet):
         serializer.is_valid(raise_exception=True)
         
         try:
-            config = EmployeeConfiguration.objects.get(employer_id=request.user.employer_profile.id)
+            from accounts.database_utils import get_tenant_database_alias
+            employer = request.user.employer_profile
+            tenant_db = get_tenant_database_alias(employer)
+            config = EmployeeConfiguration.objects.using(tenant_db).get(employer_id=employer.id)
         except EmployeeConfiguration.DoesNotExist:
             config = None
         
@@ -518,15 +530,22 @@ class EmployeeConfigurationViewSet(viewsets.ModelViewSet):
     http_method_names = ['get', 'post', 'patch', 'put']
     
     def get_queryset(self):
-        """Return configuration for the employer"""
-        return EmployeeConfiguration.objects.filter(
-            employer_id=self.request.user.employer_profile.id
+        """Return configuration for the employer from tenant database"""
+        from accounts.database_utils import get_tenant_database_alias
+        employer = self.request.user.employer_profile
+        tenant_db = get_tenant_database_alias(employer)
+        return EmployeeConfiguration.objects.using(tenant_db).filter(
+            employer_id=employer.id
         )
     
     def get_object(self):
-        """Get or create configuration for employer"""
-        config, created = EmployeeConfiguration.objects.get_or_create(
-            employer_id=self.request.user.employer_profile.id,
+        """Get or create configuration for employer in tenant database"""
+        from accounts.database_utils import get_tenant_database_alias
+        employer = self.request.user.employer_profile
+        tenant_db = get_tenant_database_alias(employer)
+        
+        config, created = EmployeeConfiguration.objects.using(tenant_db).get_or_create(
+            employer_id=employer.id,
             defaults={
                 'employee_id_prefix': 'EMP',
                 'required_documents': ['RESUME', 'ID_COPY', 'CERTIFICATE'],
@@ -542,16 +561,53 @@ class EmployeeConfigurationViewSet(viewsets.ModelViewSet):
         return Response(serializer.data)
     
     def create(self, request, *args, **kwargs):
-        """Create or update configuration"""
+        """Create or update configuration in tenant database"""
+        from accounts.database_utils import get_tenant_database_alias
+        employer = request.user.employer_profile
+        tenant_db = get_tenant_database_alias(employer)
+        
         instance = self.get_object()
         serializer = self.get_serializer(instance, data=request.data, partial=True)
         serializer.is_valid(raise_exception=True)
-        serializer.save()
+        
+        # Save to tenant database
+        for attr, value in serializer.validated_data.items():
+            setattr(instance, attr, value)
+        instance.save(using=tenant_db)
+        
         return Response(serializer.data)
     
+    def update(self, request, *args, **kwargs):
+        """Update configuration in tenant database"""
+        from accounts.database_utils import get_tenant_database_alias
+        employer = request.user.employer_profile
+        tenant_db = get_tenant_database_alias(employer)
+        
+        partial = kwargs.pop('partial', False)
+        instance = self.get_object()
+        serializer = self.get_serializer(instance, data=request.data, partial=partial)
+        serializer.is_valid(raise_exception=True)
+        
+        # Save to tenant database
+        for attr, value in serializer.validated_data.items():
+            setattr(instance, attr, value)
+        instance.save(using=tenant_db)
+        
+        return Response(serializer.data)
+    
+    def partial_update(self, request, *args, **kwargs):
+        """Partially update configuration in tenant database"""
+        kwargs['partial'] = True
+        return self.update(request, *args, **kwargs)
+    
     @action(detail=False, methods=['post'])
+
     def reset_to_defaults(self, request):
-        """Reset configuration to default values"""
+        """Reset configuration to default values in tenant database"""
+        from accounts.database_utils import get_tenant_database_alias
+        employer = request.user.employer_profile
+        tenant_db = get_tenant_database_alias(employer)
+        
         config = self.get_object()
         
         # Reset to defaults
@@ -563,7 +619,7 @@ class EmployeeConfigurationViewSet(viewsets.ModelViewSet):
         config.duplicate_action = 'WARN'
         config.required_documents = ['RESUME', 'ID_COPY', 'CERTIFICATE']
         config.document_allowed_formats = ['pdf', 'jpg', 'jpeg', 'png', 'docx']
-        config.save()
+        config.save(using=tenant_db)
         
         serializer = self.get_serializer(config)
         return Response(serializer.data)

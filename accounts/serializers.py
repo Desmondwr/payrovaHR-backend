@@ -4,7 +4,7 @@ from django.contrib.auth import authenticate
 from django.contrib.auth.password_validation import validate_password
 from django.utils import timezone
 
-from .models import User, ActivationToken, EmployerProfile, EmployeeProfile
+from .models import User, ActivationToken, EmployerProfile, EmployeeRegistry
 
 
 
@@ -303,15 +303,15 @@ class EmployeeRegistrationSerializer(serializers.Serializer):
         return value
     
     def validate_national_id_number(self, value):
-        from .models import EmployeeProfile
-        if EmployeeProfile.objects.filter(national_id_number=value).exists():
+        from .models import EmployeeRegistry
+        if EmployeeRegistry.objects.filter(national_id_number=value).exists():
             raise serializers.ValidationError("This national ID number is already registered.")
         return value
     
     def validate_passport_number(self, value):
         if value:
-            from .models import EmployeeProfile
-            if EmployeeProfile.objects.filter(passport_number=value).exists():
+            from .models import EmployeeRegistry
+            if EmployeeRegistry.objects.filter(passport_number=value).exists():
                 raise serializers.ValidationError("This passport number is already registered.")
         return value
     
@@ -323,7 +323,7 @@ class EmployeeRegistrationSerializer(serializers.Serializer):
         return data
     
     def create(self, validated_data):
-        from .models import EmployeeProfile
+        from .models import EmployeeRegistry
         
         # Remove confirm_password as it's not needed
         validated_data.pop('confirm_password')
@@ -341,19 +341,19 @@ class EmployeeRegistrationSerializer(serializers.Serializer):
             profile_completed=True  # Profile is completed during registration
         )
         
-        # Create employee profile
-        employee_profile = EmployeeProfile.objects.create(
+        # Create employee registry entry
+        employee_registry = EmployeeRegistry.objects.create(
             user=user,
             **validated_data
         )
-        return user, employee_profile
+        return user, employee_registry
 
 
-class EmployeeProfileSerializer(serializers.ModelSerializer):
-    """Serializer for EmployeeProfile model"""
+class EmployeeRegistrySerializer(serializers.ModelSerializer):
+    """Serializer for EmployeeRegistry model (central cross-institutional registry)"""
     
     class Meta:
-        model = EmployeeProfile
+        model = EmployeeRegistry
         fields = '__all__'
         read_only_fields = ('user', 'created_at', 'updated_at')
     

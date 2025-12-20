@@ -570,7 +570,7 @@ class CreateEmployeeWithDetectionSerializer(serializers.ModelSerializer):
             'state_region': {'required': False},
             'postal_code': {'required': False},
             'country': {'required': False},
-            'national_id_number': {'required': False},
+            'national_id_number': {'required': True},  # REQUIRED for cross-institutional tracking
             'passport_number': {'required': False},
             'cnps_number': {'required': False},
             'tax_number': {'required': False},
@@ -651,16 +651,47 @@ class CreateEmployeeWithDetectionSerializer(serializers.ModelSerializer):
             )
         return value
     
-    def validate(self, data):
-        """Validate employee data against configuration"""
-        from employees.utils import validate_employee_data, detect_duplicate_employees
+    def validate_national_id_number(self, value):
+        """Validate national ID number format and uniqueness within institution"""
+        if not value or value.strip() == '':
+            raise serializers.ValidationError("National ID number is required for cross-institutional tracking.")
         
+        # Check uniqueness within the employer's institution
         request = self.context['request']
         employer = request.user.employer_profile
         
-        # Get configuration
+        from accounts.database_utils import get_tenant_database_alias
+        tenant_db = get_tenant_database_alias(employer)
+        
+        # Check if another employee in this institution has the same national_id
+        existing_query = Employee.objects.using(tenant_db).filter(
+            employer_id=employer.id,
+            national_id_number=value
+        )
+        
+        # Exclude current instance if updating
+        if self.instance:
+            existing_query = existing_query.exclude(id=self.instance.id)
+        
+        if existing_query.exists():
+            raise serializers.ValidationError(
+                "An employee with this National ID already exists in your institution."
+            )
+        
+        return value
+    
+    def validate(self, data):
+        """Validate employee data against configuration"""
+        from employees.utils import validate_employee_data, detect_duplicate_employees
+        from accounts.database_utils import get_tenant_database_alias
+        
+        request = self.context['request']
+        employer = request.user.employer_profile
+        tenant_db = get_tenant_database_alias(employer)
+        
+        # Get configuration from tenant database
         try:
-            config = EmployeeConfiguration.objects.get(employer_id=employer.id)
+            config = EmployeeConfiguration.objects.using(tenant_db).get(employer_id=employer.id)
         except EmployeeConfiguration.DoesNotExist:
             config = None
         
@@ -770,6 +801,47 @@ class CreateEmployeeWithDetectionSerializer(serializers.ModelSerializer):
         # Create employee in tenant database
         employee = Employee.objects.using(tenant_db).create(**validated_data)
         
+        # Sync to central EmployeeRegistry for cross-institutional tracking
+        if employee.user_id:
+            from accounts.models import EmployeeRegistry
+            try:
+                user = User.objects.get(id=employee.user_id)
+                
+                # Create or update EmployeeRegistry in main database for cross-institutional tracking
+                EmployeeRegistry.objects.update_or_create(
+                    user=user,
+                    defaults={
+                        'first_name': employee.first_name,
+                        'last_name': employee.last_name,
+                        'middle_name': employee.middle_name or '',
+                        'date_of_birth': employee.date_of_birth if employee.date_of_birth else timezone.now().date(),
+                        'gender': employee.gender or 'PREFER_NOT_TO_SAY',
+                        'marital_status': employee.marital_status or 'SINGLE',
+                        'nationality': employee.nationality or 'Unknown',
+                        'phone_number': employee.phone_number or '0000000000',
+                        'alternative_phone': employee.alternative_phone or '',
+                        'personal_email': employee.personal_email or '',
+                        'address': employee.address or 'Not Provided',
+                        'city': employee.city or 'Unknown',
+                        'state_region': employee.state_region or 'Unknown',
+                        'postal_code': employee.postal_code or '',
+                        'country': employee.country or 'Unknown',
+                        'emergency_contact_name': employee.emergency_contact_name or 'Not Provided',
+                        'emergency_contact_relationship': employee.emergency_contact_relationship or 'Unknown',
+                        'emergency_contact_phone': employee.emergency_contact_phone or '0000000000',
+                        'national_id_number': employee.national_id_number or '',
+                        'passport_number': employee.passport_number or '',
+                        'years_of_experience': 0,
+                    }
+                )
+            except User.DoesNotExist:
+                pass  # User doesn't exist, skip sync
+            except Exception as e:
+                # Log error but don't fail employee creation
+                import logging
+                logger = logging.getLogger(__name__)
+                logger.error(f"Failed to sync EmployeeRegistry for employee {employee.id}: {str(e)}")
+        
         # Create audit log in tenant database
         create_employee_audit_log(
             employee=employee,
@@ -812,11 +884,13 @@ class EmployeeDocumentUploadSerializer(serializers.ModelSerializer):
     
     def validate_file(self, value):
         """Validate file size and format based on configuration"""
+        from accounts.database_utils import get_tenant_database_alias
         request = self.context['request']
         employer = request.user.employer_profile
+        tenant_db = get_tenant_database_alias(employer)
         
         try:
-            config = EmployeeConfiguration.objects.get(employer_id=employer.id)
+            config = EmployeeConfiguration.objects.using(tenant_db).get(employer_id=employer.id)
             
             # Check file size
             max_size_bytes = config.document_max_file_size_mb * 1024 * 1024
@@ -911,12 +985,16 @@ class EmployeeProfileCompletionSerializer(serializers.ModelSerializer):
     def validate(self, data):
         """Validate employee profile data against configuration requirements"""
         from employees.utils import validate_employee_data
+        from accounts.database_utils import get_tenant_database_alias
+        from accounts.models import EmployerProfile
         
         # Get the employee instance being updated
         if self.instance:
             try:
-                config = EmployeeConfiguration.objects.get(employer_id=self.instance.employer_id)
-            except EmployeeConfiguration.DoesNotExist:
+                employer = EmployerProfile.objects.get(id=self.instance.employer_id)
+                tenant_db = get_tenant_database_alias(employer)
+                config = EmployeeConfiguration.objects.using(tenant_db).get(employer_id=self.instance.employer_id)
+            except (EmployeeConfiguration.DoesNotExist, EmployerProfile.DoesNotExist):
                 config = None
             
             # Enforce configuration requirements when employee is completing profile
@@ -928,8 +1006,10 @@ class EmployeeProfileCompletionSerializer(serializers.ModelSerializer):
         return data
     
     def update(self, instance, validated_data):
-        """Update employee profile and mark as completed"""
+        """Update employee profile, mark as completed, and sync to central EmployeeProfile"""
         from django.utils import timezone
+        from django.contrib.auth import get_user_model
+        User = get_user_model()
         
         # Update all provided fields
         for attr, value in validated_data.items():
@@ -940,6 +1020,69 @@ class EmployeeProfileCompletionSerializer(serializers.ModelSerializer):
         instance.profile_completed_at = timezone.now()
         
         instance.save()
+        
+        # Sync to central EmployeeRegistry
+        if instance.user_id:
+            from accounts.models import EmployeeRegistry
+            try:
+                user = User.objects.get(id=instance.user_id)
+                
+                # Update EmployeeRegistry if it exists
+                if hasattr(user, 'employee_registry'):
+                    employee_registry = user.employee_registry
+                    
+                    # Define field mapping (only update fields that were provided)
+                    field_mapping = {
+                        'date_of_birth': 'date_of_birth',
+                        'gender': 'gender',
+                        'nationality': 'nationality',
+                        'marital_status': 'marital_status',
+                        'phone_number': 'phone_number',
+                        'alternative_phone': 'alternative_phone',
+                        'personal_email': 'personal_email',
+                        'address': 'address',
+                        'city': 'city',
+                        'state_region': 'state_region',
+                        'postal_code': 'postal_code',
+                        'country': 'country',
+                        'emergency_contact_name': 'emergency_contact_name',
+                        'emergency_contact_relationship': 'emergency_contact_relationship',
+                        'emergency_contact_phone': 'emergency_contact_phone',
+                        'national_id_number': 'national_id_number',
+                        'passport_number': 'passport_number',
+                    }
+                    
+                    # Sync only fields that were updated
+                    for employee_field, profile_field in field_mapping.items():
+                        if employee_field in validated_data:
+                            value = validated_data[employee_field]
+                            # Handle empty values for required fields in EmployeeProfile
+                            if value is None or value == '':
+                                if employee_field in ['date_of_birth']:
+                                    continue  # Skip empty dates
+                                elif employee_field == 'gender':
+                                    value = 'PREFER_NOT_TO_SAY'
+                                elif employee_field == 'marital_status':
+                                    value = 'SINGLE'
+                                elif employee_field in ['nationality', 'city', 'state_region', 'country', 
+                                                       'emergency_contact_relationship']:
+                                    value = 'Unknown'
+                                elif employee_field in ['phone_number', 'emergency_contact_phone']:
+                                    value = '0000000000'
+                                elif employee_field in ['address', 'emergency_contact_name']:
+                                    value = 'Not Provided'
+                            setattr(employee_registry, profile_field, value)
+                    
+                    # Save to central database
+                    employee_registry.save()
+            except User.DoesNotExist:
+                pass  # User doesn't exist, skip sync
+            except Exception as e:
+                # Log error but don't fail profile completion
+                import logging
+                logger = logging.getLogger(__name__)
+                logger.error(f"Failed to sync EmployeeRegistry for employee {instance.id}: {str(e)}")
+        
         return instance
 
 
