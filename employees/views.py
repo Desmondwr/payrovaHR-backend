@@ -271,17 +271,27 @@ class EmployeeViewSet(viewsets.ModelViewSet):
     @action(detail=True, methods=['post'])
     def send_invitation(self, request, pk=None):
         """Send or resend invitation to employee"""
+        from accounts.database_utils import get_tenant_database_alias
+        
         employee = self.get_object()
         
-        # Check if employee already has a user account
-        if employee.user:
+        # Get tenant database
+        employer = request.user.employer_profile
+        tenant_db = get_tenant_database_alias(employer)
+        
+        # Check if employee already has a user account (use user_id not user)
+        if employee.user_id:
             return Response(
                 {'error': 'Employee already has a user account'},
                 status=status.HTTP_400_BAD_REQUEST
             )
         
-        # Check if there's a pending invitation
-        pending_invitation = employee.invitations.filter(status='PENDING').first()
+        # Check if there's a pending invitation in tenant database
+        pending_invitation = EmployeeInvitation.objects.using(tenant_db).filter(
+            employee_id=employee.id,
+            status='PENDING'
+        ).first()
+        
         if pending_invitation and pending_invitation.is_valid():
             return Response(
                 {
@@ -292,7 +302,7 @@ class EmployeeViewSet(viewsets.ModelViewSet):
             )
         
         # Send new invitation
-        self._send_invitation(employee)
+        self._send_invitation(employee, tenant_db)
         
         return Response(
             {'message': 'Invitation sent successfully'},
