@@ -366,18 +366,35 @@ def create_employee_audit_log(employee, action, performed_by, changes=None, note
 def get_cross_institution_summary(employee, config):
     """Get summary of employee's presence in other institutions"""
     from employees.models import EmployeeCrossInstitutionRecord
+    from accounts.models import EmployerProfile
+    from accounts.database_utils import get_tenant_database_alias
     
     if not config:
         return {'has_other_institutions': False, 'records': []}
     
-    records = EmployeeCrossInstitutionRecord.objects.filter(
-        employee=employee
-    ).select_related('detected_employer')
+    # Get tenant database for the current employer
+    try:
+        current_employer = EmployerProfile.objects.get(id=employee.employer_id)
+        tenant_db = get_tenant_database_alias(current_employer)
+    except EmployerProfile.DoesNotExist:
+        tenant_db = 'default'
+    
+    # Query from tenant database - no select_related since detected_employer_id is IntegerField
+    records = EmployeeCrossInstitutionRecord.objects.using(tenant_db).filter(
+        employee_id=employee.id
+    )
     
     summary = []
     for record in records:
+        # Manually fetch employer info from main database using detected_employer_id
+        try:
+            detected_employer = EmployerProfile.objects.get(id=record.detected_employer_id)
+            employer_name = detected_employer.company_name
+        except EmployerProfile.DoesNotExist:
+            employer_name = 'Unknown'
+        
         info = {
-            'employer_id': str(record.detected_employer.id),
+            'employer_id': str(record.detected_employer_id),
             'employee_id': record.detected_employee_id,
             'status': record.status,
             'consent_status': record.consent_status,
@@ -385,7 +402,7 @@ def get_cross_institution_summary(employee, config):
         
         # Add information based on visibility level
         if config.cross_institution_visibility_level in ['BASIC', 'MODERATE', 'FULL']:
-            info['company_name'] = record.detected_employer.company_name
+            info['company_name'] = employer_name
         
         if config.cross_institution_visibility_level in ['MODERATE', 'FULL']:
             # Would need to fetch from detected employee record
