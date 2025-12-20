@@ -933,14 +933,32 @@ class AcceptInvitationSerializer(serializers.Serializer):
         return data
     
     def validate_token(self, value):
-        """Validate invitation token"""
-        try:
-            invitation = EmployeeInvitation.objects.get(token=value)
-            if not invitation.is_valid():
-                raise serializers.ValidationError("Invitation has expired or is no longer valid")
-            return invitation
-        except EmployeeInvitation.DoesNotExist:
-            raise serializers.ValidationError("Invalid invitation token")
+        """Validate invitation token - search across all tenant databases"""
+        from accounts.database_utils import get_tenant_database_alias
+        from accounts.models import EmployerProfile
+        
+        # Search across all tenant databases for the invitation
+        # Filter by user__is_active instead of is_active (which doesn't exist on EmployerProfile)
+        employers = EmployerProfile.objects.filter(user__is_active=True).select_related('user')
+        
+        for employer in employers:
+            try:
+                tenant_db = get_tenant_database_alias(employer)
+                invitation = EmployeeInvitation.objects.using(tenant_db).get(token=value)
+                
+                if not invitation.is_valid():
+                    raise serializers.ValidationError("Invitation has expired or is no longer valid")
+                
+                # Attach tenant database info to the invitation object for use in the view
+                invitation._tenant_db = tenant_db
+                invitation._employer_profile = employer
+                
+                return invitation
+            except EmployeeInvitation.DoesNotExist:
+                continue
+        
+        # If we reach here, invitation was not found in any database
+        raise serializers.ValidationError("Invalid invitation token")
 
 
 class EmployeeProfileCompletionSerializer(serializers.ModelSerializer):

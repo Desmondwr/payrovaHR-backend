@@ -649,33 +649,28 @@ class EmployeeInvitationViewSet(viewsets.ReadOnlyModelViewSet):
     @action(detail=False, methods=['post'], permission_classes=[permissions.AllowAny])
     def accept(self, request):
         """Accept an employee invitation and create user account"""
+        from django.contrib.auth import get_user_model
+        User = get_user_model()
+        
         serializer = AcceptInvitationSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         
         invitation = serializer.validated_data['token']
         password = serializer.validated_data['password']
         
-        # Get employee and determine tenant database
-        employee = invitation.employee
-        employer_id = employee.employer_id
+        # Get tenant database info that was attached in the serializer
+        tenant_db = getattr(invitation, '_tenant_db', None)
+        employer_profile = getattr(invitation, '_employer_profile', None)
         
-        # Get tenant database alias
-        from accounts.database_utils import get_tenant_database_alias
-        from accounts.models import EmployerProfile
-        
-        # Get employer profile from main database to determine tenant DB
-        try:
-            employer_profile = EmployerProfile.objects.get(id=employer_id)
-            tenant_db = get_tenant_database_alias(employer_profile)
-        except EmployerProfile.DoesNotExist:
+        if not tenant_db or not employer_profile:
             return Response(
-                {'error': 'Employer profile not found'},
+                {'error': 'Invalid invitation state'},
                 status=status.HTTP_400_BAD_REQUEST
             )
         
-        # Re-query employee from tenant database
+        # Query the employee from the correct tenant database using the employee_id from invitation
         try:
-            employee = Employee.objects.using(tenant_db).get(id=employee.id)
+            employee = Employee.objects.using(tenant_db).get(id=invitation.employee_id)
         except Employee.DoesNotExist:
             return Response(
                 {'error': 'Employee record not found'},
@@ -697,9 +692,6 @@ class EmployeeInvitationViewSet(viewsets.ReadOnlyModelViewSet):
             employee.save(using=tenant_db)
         except User.DoesNotExist:
             # Create new user account in main database
-            from django.contrib.auth import get_user_model
-            User = get_user_model()
-            
             user = User.objects.create_user(
                 email=invitation.email,
                 password=password,
