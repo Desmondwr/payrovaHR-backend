@@ -352,7 +352,7 @@ class EmployeeViewSet(viewsets.ModelViewSet):
         employee.employment_status = 'TERMINATED'
         employee.termination_date = serializer.validated_data['termination_date']
         employee.termination_reason = serializer.validated_data['termination_reason']
-        employee.save()
+        employee.save(using=tenant_db)
         
         # Create audit log
         create_employee_audit_log(
