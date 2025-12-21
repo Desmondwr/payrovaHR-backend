@@ -364,7 +364,8 @@ class EmployeeViewSet(viewsets.ModelViewSet):
                 'termination_reason': employee.termination_reason
             },
             notes='Employee terminated',
-            request=request
+            request=request,
+            tenant_db=tenant_db
         )
         
         # Revoke system access based on configuration
