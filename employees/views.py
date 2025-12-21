@@ -324,6 +324,30 @@ class EmployeeViewSet(viewsets.ModelViewSet):
         serializer = TerminateEmployeeSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         
+        # Get tenant database
+        from accounts.database_utils import get_tenant_database_alias
+        employer = request.user.employer_profile
+        tenant_db = get_tenant_database_alias(employer)
+        
+        # Validate foreign key references before saving
+        # If branch_id exists but the branch doesn't exist in the database, set it to None
+        if employee.branch_id:
+            branch_exists = Branch.objects.using(tenant_db).filter(id=employee.branch_id).exists()
+            if not branch_exists:
+                employee.branch_id = None
+        
+        # If department_id exists but the department doesn't exist in the database, set it to None
+        if employee.department_id:
+            dept_exists = Department.objects.using(tenant_db).filter(id=employee.department_id).exists()
+            if not dept_exists:
+                employee.department_id = None
+        
+        # If manager_id exists but the manager doesn't exist in the database, set it to None
+        if employee.manager_id:
+            manager_exists = Employee.objects.using(tenant_db).filter(id=employee.manager_id).exists()
+            if not manager_exists:
+                employee.manager_id = None
+        
         # Update employee
         employee.employment_status = 'TERMINATED'
         employee.termination_date = serializer.validated_data['termination_date']
