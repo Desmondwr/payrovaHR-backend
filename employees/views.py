@@ -433,13 +433,43 @@ class EmployeeViewSet(viewsets.ModelViewSet):
             performed_by=request.user,
             changes={'reactivated': True},
             notes='Employee reactivated',
-            request=request
+            request=request,
+            tenant_db=tenant_db
         )
         
         return Response(
             EmployeeDetailSerializer(employee).data,
             status=status.HTTP_200_OK
         )
+    
+    def perform_destroy(self, instance):
+        """Delete employee from tenant database ONLY (not from default database)"""
+        from accounts.database_utils import get_tenant_database_alias
+        
+        employer = self.request.user.employer_profile
+        tenant_db = get_tenant_database_alias(employer)
+        
+        employee_id = instance.id
+        employee_info = {
+            'employee_id': instance.employee_id,
+            'name': instance.full_name,
+            'email': instance.email
+        }
+        
+        # Create audit log before deletion
+        create_employee_audit_log(
+            employee=instance,
+            action='DELETED',
+            performed_by=self.request.user,
+            changes=employee_info,
+            notes='Employee record deleted from employer database',
+            request=self.request,
+            tenant_db=tenant_db
+        )
+        
+        # Delete ONLY from tenant database, not from default database
+        # Use direct database query to ensure we only delete from tenant DB
+        Employee.objects.using(tenant_db).filter(id=employee_id).delete()
     
     @action(detail=True, methods=['get'])
     def documents(self, request, pk=None):
