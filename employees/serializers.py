@@ -567,6 +567,42 @@ class EmployeeSearchSerializer(serializers.Serializer):
         return data
 
 
+class EmployeePrefillRequestSerializer(serializers.Serializer):
+    """Input serializer to verify an existing employee before creation"""
+    
+    national_id_number = serializers.CharField(required=False, allow_blank=True)
+    email = serializers.EmailField(required=False, allow_blank=True)
+    
+    def validate(self, data):
+        if not data.get('national_id_number') and not data.get('email'):
+            raise serializers.ValidationError(
+                "Provide either a national_id_number or an email to verify the employee."
+            )
+        return data
+
+
+class EmployeePrefillSerializer(serializers.Serializer):
+    """Serializer for data used to prefill the employer create form"""
+    
+    user_id = serializers.IntegerField(required=False, allow_null=True)
+    first_name = serializers.CharField()
+    last_name = serializers.CharField()
+    middle_name = serializers.CharField(required=False, allow_null=True, allow_blank=True)
+    email = serializers.EmailField()
+    personal_email = serializers.EmailField(required=False, allow_null=True, allow_blank=True)
+    national_id_number = serializers.CharField()
+    passport_number = serializers.CharField(required=False, allow_blank=True, allow_null=True)
+    phone_number = serializers.CharField(required=False, allow_blank=True, allow_null=True)
+    alternative_phone = serializers.CharField(required=False, allow_blank=True, allow_null=True)
+    address = serializers.CharField(required=False, allow_blank=True, allow_null=True)
+    city = serializers.CharField(required=False, allow_blank=True, allow_null=True)
+    state_region = serializers.CharField(required=False, allow_blank=True, allow_null=True)
+    country = serializers.CharField(required=False, allow_blank=True, allow_null=True)
+    nationality = serializers.CharField(required=False, allow_blank=True, allow_null=True)
+    gender = serializers.CharField(required=False, allow_blank=True, allow_null=True)
+    date_of_birth = serializers.DateField(required=False, allow_null=True)
+
+
 class EmployeeConfigurationSerializer(serializers.ModelSerializer):
     """Serializer for Employee Configuration"""
     
@@ -594,15 +630,15 @@ class CreateEmployeeWithDetectionSerializer(serializers.ModelSerializer):
     send_invitation = serializers.BooleanField(default=True, write_only=True)
     force_create = serializers.BooleanField(default=False, write_only=True, 
         help_text='Force create even if duplicates detected (with warn action)')
-    link_existing_user = serializers.UUIDField(required=False, allow_null=True, write_only=True,
-        help_text='UUID of existing user account to link')
+    link_existing_user = serializers.IntegerField(required=False, allow_null=True, write_only=True,
+        help_text='ID of existing user account to link (from main database)')
     acknowledge_cross_institution = serializers.BooleanField(default=False, write_only=True,
         help_text='Acknowledge concurrent employment in other institutions')
     
     # Define as explicit UUID fields to prevent auto ForeignKey handling
     department = serializers.UUIDField(
-        required=False, 
-        allow_null=True,
+        required=True, 
+        allow_null=False,
         write_only=True,
         help_text='UUID of the department'
     )
@@ -681,6 +717,13 @@ class CreateEmployeeWithDetectionSerializer(serializers.ModelSerializer):
             'emergency_contact_name': {'required': False},
             'emergency_contact_relationship': {'required': False},
             'emergency_contact_phone': {'required': False},
+            # Employer-supplied required fields
+            'first_name': {'required': True},
+            'last_name': {'required': True},
+            'email': {'required': True},
+            'job_title': {'required': True},
+            'employment_type': {'required': True},
+            'hire_date': {'required': True},
         }
 
     
@@ -849,6 +892,9 @@ class CreateEmployeeWithDetectionSerializer(serializers.ModelSerializer):
         
         request = self.context['request']
         employer = request.user.employer_profile
+        
+        # Ensure baseline employment fields for employer onboarding
+        validated_data.setdefault('employment_status', 'ACTIVE')
         
         # Get tenant database alias
         from accounts.database_utils import get_tenant_database_alias

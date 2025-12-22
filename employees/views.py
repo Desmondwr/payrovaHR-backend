@@ -23,7 +23,8 @@ from .serializers import (
     EmployeeConfigurationSerializer, DuplicateDetectionResultSerializer,
     CreateEmployeeWithDetectionSerializer, EmployeeDocumentUploadSerializer,
     AcceptInvitationSerializer, EmployeeProfileCompletionSerializer,
-    EmployeeSelfProfileSerializer
+    EmployeeSelfProfileSerializer, EmployeePrefillRequestSerializer,
+    EmployeePrefillSerializer
 )
 from .utils import (
     detect_duplicate_employees, generate_employee_invitation_token,
@@ -542,6 +543,66 @@ class EmployeeViewSet(viewsets.ModelViewSet):
         
         result_serializer = DuplicateDetectionResultSerializer(result)
         return Response(result_serializer.data)
+    
+    @action(detail=False, methods=['post'], url_path='prefill-existing')
+    def prefill_existing(self, request):
+        """Verify an existing employee and return prefill data for the creation form"""
+        from accounts.models import EmployeeRegistry
+        from accounts.database_utils import get_tenant_database_alias
+        
+        request_serializer = EmployeePrefillRequestSerializer(data=request.data)
+        request_serializer.is_valid(raise_exception=True)
+        
+        national_id = request_serializer.validated_data.get('national_id_number')
+        email = request_serializer.validated_data.get('email')
+        
+        query = EmployeeRegistry.objects.select_related('user')
+        match = None
+        
+        if national_id:
+            match = query.filter(national_id_number=national_id).first()
+        if not match and email:
+            match = query.filter(Q(user__email=email) | Q(personal_email=email)).first()
+        
+        if not match:
+            return Response(
+                {'error': 'No matching employee found in the system.'},
+                status=status.HTTP_404_NOT_FOUND
+            )
+        
+        tenant_db = get_tenant_database_alias(request.user.employer_profile)
+        existing_here = Employee.objects.using(tenant_db).filter(
+            Q(user_id=match.user_id) | Q(national_id_number=match.national_id_number)
+        ).first()
+        
+        prefill_data = {
+            'user_id': match.user_id,
+            'first_name': match.first_name,
+            'last_name': match.last_name,
+            'middle_name': match.middle_name,
+            'email': match.user.email if match.user_id else (match.personal_email or ''),
+            'personal_email': match.personal_email,
+            'national_id_number': match.national_id_number,
+            'passport_number': match.passport_number,
+            'phone_number': match.phone_number,
+            'alternative_phone': match.alternative_phone,
+            'address': match.address,
+            'city': match.city,
+            'state_region': match.state_region,
+            'country': match.country,
+            'nationality': match.nationality,
+            'gender': match.gender,
+            'date_of_birth': match.date_of_birth,
+        }
+        
+        prefill_serializer = EmployeePrefillSerializer(prefill_data)
+        
+        return Response({
+            'message': 'Existing employee verified. Prefill the form and choose hire details.',
+            'prefill': prefill_serializer.data,
+            'link_existing_user': match.user_id,
+            'already_employed_here': bool(existing_here),
+        })
 
 
 class EmployeeDocumentViewSet(viewsets.ModelViewSet):
@@ -757,6 +818,10 @@ class EmployeeInvitationViewSet(viewsets.ReadOnlyModelViewSet):
         # Check if a user account exists with this email in main database
         try:
             user = User.objects.get(email=invitation.email)
+            user.is_employee = True
+            user.is_active = True
+            user.profile_completed = False
+            user.save(update_fields=['is_employee', 'is_active', 'profile_completed'])
             # Link existing user to employee
             employee.user_id = user.id
             employee.save(using=tenant_db)
@@ -793,8 +858,24 @@ class EmployeeInvitationViewSet(viewsets.ReadOnlyModelViewSet):
             tenant_db=tenant_db
         )
         
+        prefill_profile = {
+            'employee_id': employee.employee_id,
+            'first_name': employee.first_name,
+            'last_name': employee.last_name,
+            'email': employee.email or employee.personal_email or invitation.email,
+            'job_title': employee.job_title,
+            'department': str(employee.department_id) if employee.department_id else None,
+            'branch': str(employee.branch_id) if employee.branch_id else None,
+            'employment_type': employee.employment_type,
+            'hire_date': employee.hire_date,
+            'national_id_number': employee.national_id_number,
+        }
+        
         return Response({
-            'message': 'Invitation accepted successfully',
+            'message': 'Invitation accepted successfully. Please complete your profile to continue.',
+            'requires_profile_completion': not employee.profile_completed,
+            'redirect_to': 'complete-profile',
+            'prefill_profile': prefill_profile,
             'employee': EmployeeDetailSerializer(employee).data
         }, status=status.HTTP_200_OK)
 
@@ -952,7 +1033,8 @@ class EmployeeProfileViewSet(viewsets.GenericViewSet):
                 updated_employee = Employee.objects.using(tenant_db).get(id=updated_employee.id)
                 from .serializers import EmployeeSelfProfileSerializer
                 return Response({
-                    'message': 'Profile updated successfully',
+                    'message': 'Profile completed successfully. You can now log in.',
+                    'redirect_to': 'login',
                     'profile': EmployeeSelfProfileSerializer(updated_employee).data
                 }, status=status.HTTP_200_OK)
             

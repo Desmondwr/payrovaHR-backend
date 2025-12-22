@@ -162,7 +162,7 @@ def send_employee_invitation_email(employee, invitation):
     from django.template.loader import render_to_string
     
     # Build invitation URL
-    invitation_url = f"{settings.FRONTEND_URL}/employee/accept-invitation/{invitation.token}"
+    invitation_url = f"{settings.FRONTEND_URL}/accept-invitation/{invitation.token}"
     
     # Prepare context - need to fetch employer from main DB
     from accounts.models import EmployerProfile
