@@ -33,6 +33,7 @@ class Command(BaseCommand):
             action='store_true',
             help='Show a list of all known migrations and which are applied.'
         )
+        
 
     def handle(self, *args, **options):
         app_label = options.get('app_label')
