@@ -803,10 +803,15 @@ class EmployeeInvitationViewSet(viewsets.ReadOnlyModelViewSet):
         # Note: invitation.employee might not be accessible due to cross-database ForeignKey
         # We need to re-fetch the invitation from the tenant database to get the employee
         try:
-            # Re-fetch the invitation to access the employee relationship properly
-            invitation_refresh = EmployeeInvitation.objects.using(tenant_db).select_related('employee').get(id=invitation.id)
+            # Re-fetch the invitation using token to access the employee relationship properly
+            invitation_refresh = EmployeeInvitation.objects.using(tenant_db).select_related('employee').get(token=invitation.token)
             employee = invitation_refresh.employee
-        except (Employee.DoesNotExist, EmployeeInvitation.DoesNotExist):
+        except EmployeeInvitation.DoesNotExist:
+            return Response(
+                {'error': 'Invitation not found in tenant database'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        except Employee.DoesNotExist:
             return Response(
                 {'error': 'Employee record not found'},
                 status=status.HTTP_400_BAD_REQUEST
@@ -821,7 +826,7 @@ class EmployeeInvitationViewSet(viewsets.ReadOnlyModelViewSet):
         
         # Check if a user account exists with this email in main database
         try:
-            user = User.objects.get(email=invitation.email)
+            user = User.objects.get(email=invitation_refresh.email)
             user.is_employee = True
             user.is_active = True
             user.profile_completed = False
@@ -832,7 +837,7 @@ class EmployeeInvitationViewSet(viewsets.ReadOnlyModelViewSet):
         except User.DoesNotExist:
             # Create new user account in main database
             user = User.objects.create_user(
-                email=invitation.email,
+                email=invitation_refresh.email,
                 password=password,
                 is_employee=True,
                 is_active=True
@@ -843,9 +848,9 @@ class EmployeeInvitationViewSet(viewsets.ReadOnlyModelViewSet):
             employee.save(using=tenant_db)
         
         # Update invitation status in tenant database
-        invitation.status = 'ACCEPTED'
-        invitation.accepted_at = timezone.now()
-        invitation.save(using=tenant_db)
+        invitation_refresh.status = 'ACCEPTED'
+        invitation_refresh.accepted_at = timezone.now()
+        invitation_refresh.save(using=tenant_db)
         
         # Update employee flags in tenant database
         employee.invitation_accepted = True
@@ -864,7 +869,7 @@ class EmployeeInvitationViewSet(viewsets.ReadOnlyModelViewSet):
         
         # Serialize the full form fields for profile completion
         from .serializers import EmployeeProfileCompletionSerializer
-        employee_data = EmployeeProfileCompletionSerializer(instance=invitation.employee).data
+        employee_data = EmployeeProfileCompletionSerializer(instance=employee).data
 
         return Response({
             'message': 'Invitation accepted successfully.',
