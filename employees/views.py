@@ -874,8 +874,9 @@ class EmployeeInvitationViewSet(viewsets.ReadOnlyModelViewSet):
         return Response({
             'message': 'Invitation accepted successfully.',
             'employee_data': employee_data,
-            'token': serializer.validated_data['token'],
-            'password': password
+            'token': invitation_refresh.token,
+            'user_id': user.id,
+            'email': user.email
         }, status=status.HTTP_200_OK)
         
 
