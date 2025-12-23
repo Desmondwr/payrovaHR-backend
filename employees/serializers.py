@@ -840,11 +840,16 @@ class CreateEmployeeWithDetectionSerializer(serializers.ModelSerializer):
         employer = request.user.employer_profile
         tenant_db = get_tenant_database_alias(employer)
         
-        # Get configuration from tenant database
-        try:
-            config = EmployeeConfiguration.objects.using(tenant_db).get(employer_id=employer.id)
-        except EmployeeConfiguration.DoesNotExist:
-            config = None
+        # Get or create configuration from tenant database
+        config, created = EmployeeConfiguration.objects.using(tenant_db).get_or_create(
+            employer_id=employer.id,
+            defaults={
+                'employee_id_prefix': 'EMP',
+                'employee_id_starting_number': 1,
+                'employee_id_padding': 3,
+                'last_employee_number': 0
+            }
+        )
         
         # Skip strict validation during employer-initiated creation
         # The configuration requirements apply when employees complete their own profiles,
@@ -1165,8 +1170,16 @@ class EmployeeProfileCompletionSerializer(serializers.ModelSerializer):
             try:
                 employer = EmployerProfile.objects.get(id=self.instance.employer_id)
                 tenant_db = get_tenant_database_alias(employer)
-                config = EmployeeConfiguration.objects.using(tenant_db).get(employer_id=self.instance.employer_id)
-            except (EmployeeConfiguration.DoesNotExist, EmployerProfile.DoesNotExist):
+                config, created = EmployeeConfiguration.objects.using(tenant_db).get_or_create(
+                    employer_id=self.instance.employer_id,
+                    defaults={
+                        'employee_id_prefix': 'EMP',
+                        'employee_id_starting_number': 1,
+                        'employee_id_padding': 3,
+                        'last_employee_number': 0
+                    }
+                )
+            except EmployerProfile.DoesNotExist:
                 config = None
             
             # Enforce configuration requirements when employee is completing profile
