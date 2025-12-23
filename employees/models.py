@@ -76,6 +76,7 @@ class EmployeeConfiguration(models.Model):
     employee_id_custom_template = models.CharField(max_length=100, blank=True, null=True, 
         help_text='Custom template: {prefix}-{year}-{branch}-{number}')
     employee_id_manual_override = models.BooleanField(default=False, help_text='Allow manual employee ID entry')
+    last_employee_number = models.IntegerField(default=0, help_text='Last used employee number (auto-incremented)')
     
     # ===== Required vs Optional Fields Configuration =====
     # Basic Information
@@ -201,40 +202,33 @@ class EmployeeConfiguration(models.Model):
         return f"Employee Config - Employer ID: {self.employer_id}"
     
     def get_next_employee_id(self, branch=None, department=None, using='default'):
-        """Generate next employee ID based on configuration
+        """Generate next employee ID based on configuration using atomic counter
         
         Args:
             branch: Branch object (optional)
             department: Department object (optional)
             using: Database alias to use for queries
         """
-        from employees.models import Employee
-        import re
+        from django.db.models import F
+        from django.db import transaction
         
-        # Get the highest employee number currently in use
-        # Extract numbers from existing employee IDs and find the max
-        existing_employees = Employee.objects.using(using).filter(
-            employer_id=self.employer_id
-        ).exclude(employee_id='').exclude(employee_id__isnull=True).values_list('employee_id', flat=True)
-        
-        max_number = 0
-        for emp_id in existing_employees:
-            # Extract all numbers from the employee ID
-            numbers = re.findall(r'\d+', str(emp_id))
-            if numbers:
-                # Get the last number (usually the sequence number)
-                try:
-                    num = int(numbers[-1])
-                    if num > max_number:
-                        max_number = num
-                except ValueError:
-                    continue
-        
-        # Next number is max + 1, or starting number if no employees exist
-        if max_number > 0:
-            next_number = max_number + 1
-        else:
-            next_number = self.employee_id_starting_number
+        # Use atomic transaction to increment counter safely
+        with transaction.atomic(using=using):
+            # Lock the row and increment the counter atomically
+            EmployeeConfiguration.objects.using(using).filter(id=self.id).update(
+                last_employee_number=F('last_employee_number') + 1
+            )
+            
+            # Refresh to get the new value
+            self.refresh_from_db(using=using)
+            next_number = self.last_employee_number
+            
+            # If this is the first employee and counter was 0, use starting number
+            if next_number < self.employee_id_starting_number:
+                next_number = self.employee_id_starting_number
+                EmployeeConfiguration.objects.using(using).filter(id=self.id).update(
+                    last_employee_number=next_number
+                )
         
         # Format number with padding
         formatted_number = str(next_number).zfill(self.employee_id_padding)
