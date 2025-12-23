@@ -48,6 +48,7 @@ INSTALLED_APPS = [
     # Local apps
     'accounts',
     'employees',
+    'contracts',
 ]
 
 MIDDLEWARE = [
@@ -219,6 +220,19 @@ ACTIVATION_TOKEN_EXPIRY_HOURS = 48
 
 # Multi-tenancy Settings
 CURRENT_TENANT_DB = None  # Thread-local storage for current tenant database
+
+
+# Cache Configuration (for password reset codes)
+CACHES = {
+    'default': {
+        'BACKEND': 'django.core.cache.backends.locmem.LocMemCache',
+        'LOCATION': 'unique-snowflake',
+        'TIMEOUT': 300,  # Default timeout 5 minutes
+        'OPTIONS': {
+            'MAX_ENTRIES': 1000
+        }
+    }
+}
 
 
 # Security Settings (for production)

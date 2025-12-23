@@ -799,10 +799,14 @@ class EmployeeInvitationViewSet(viewsets.ReadOnlyModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST
             )
         
-        # Query the employee from the correct tenant database using the employee_id from invitation
+        # Query the employee from the correct tenant database using the employee relation from invitation
+        # Note: invitation.employee might not be accessible due to cross-database ForeignKey
+        # We need to re-fetch the invitation from the tenant database to get the employee
         try:
-            employee = Employee.objects.using(tenant_db).get(id=invitation.employee_id)
-        except Employee.DoesNotExist:
+            # Re-fetch the invitation to access the employee relationship properly
+            invitation_refresh = EmployeeInvitation.objects.using(tenant_db).select_related('employee').get(id=invitation.id)
+            employee = invitation_refresh.employee
+        except (Employee.DoesNotExist, EmployeeInvitation.DoesNotExist):
             return Response(
                 {'error': 'Employee record not found'},
                 status=status.HTTP_400_BAD_REQUEST

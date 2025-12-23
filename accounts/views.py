@@ -455,3 +455,187 @@ class UserProfileView(APIView):
         )
 
 
+class RequestPasswordResetView(APIView):
+    """Request password reset - sends 6-digit code to email"""
+    permission_classes = [permissions.AllowAny]
+    
+    @method_decorator(ratelimit(key='ip', rate='5/h', method='POST'))
+    def post(self, request):
+        from .serializers import RequestPasswordResetSerializer
+        from .utils import generate_reset_code, send_password_reset_email, store_reset_code
+        
+        serializer = RequestPasswordResetSerializer(data=request.data)
+        
+        if not serializer.is_valid():
+            return api_response(
+                success=False,
+                message='Validation failed.',
+                errors=serializer.errors,
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        email = serializer.validated_data['email']
+        
+        # Generate 6-digit code
+        code = generate_reset_code()
+        
+        # Store code in cache with 5 minute expiry
+        store_reset_code(email, code)
+        
+        # Send email
+        email_sent = send_password_reset_email(email, code)
+        
+        if not email_sent:
+            return api_response(
+                success=False,
+                message='Failed to send reset code. Please try again later.',
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+        
+        return api_response(
+            success=True,
+            message='Password reset code sent to your email. Code expires in 5 minutes.',
+            data={'email': email},
+            status=status.HTTP_200_OK
+        )
+
+
+class VerifyResetCodeView(APIView):
+    """Verify code and reset password"""
+    permission_classes = [permissions.AllowAny]
+    
+    @method_decorator(ratelimit(key='ip', rate='5/h', method='POST'))
+    def post(self, request):
+        from .serializers import VerifyResetCodeSerializer
+        from .utils import verify_reset_code, delete_reset_code
+        
+        serializer = VerifyResetCodeSerializer(data=request.data)
+        
+        if not serializer.is_valid():
+            return api_response(
+                success=False,
+                message='Validation failed.',
+                errors=serializer.errors,
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        email = serializer.validated_data['email']
+        code = serializer.validated_data['code']
+        password = serializer.validated_data['password']
+        
+        # Verify code
+        is_valid, message = verify_reset_code(email, code)
+        
+        if not is_valid:
+            return api_response(
+                success=False,
+                message=message,
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        # Get user and update password
+        try:
+            user = User.objects.get(email=email)
+            user.set_password(password)
+            user.save()
+            
+            # Delete code from cache
+            delete_reset_code(email)
+            
+            return api_response(
+                success=True,
+                message='Password reset successfully. You can now login with your new password.',
+                status=status.HTTP_200_OK
+            )
+        except User.DoesNotExist:
+            return api_response(
+                success=False,
+                message='User not found.',
+                status=status.HTTP_404_NOT_FOUND
+            )
+
+
+class ResendResetCodeView(APIView):
+    """Resend password reset code"""
+    permission_classes = [permissions.AllowAny]
+    
+    @method_decorator(ratelimit(key='ip', rate='5/h', method='POST'))
+    def post(self, request):
+        from .serializers import ResendResetCodeSerializer
+        from .utils import generate_reset_code, send_password_reset_email, store_reset_code
+        
+        serializer = ResendResetCodeSerializer(data=request.data)
+        
+        if not serializer.is_valid():
+            return api_response(
+                success=False,
+                message='Validation failed.',
+                errors=serializer.errors,
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        email = serializer.validated_data['email']
+        
+        # Generate new 6-digit code
+        code = generate_reset_code()
+        
+        # Store code in cache with 5 minute expiry (overwrites old code if exists)
+        store_reset_code(email, code)
+        
+        # Send email
+        email_sent = send_password_reset_email(email, code)
+        
+        if not email_sent:
+            return api_response(
+                success=False,
+                message='Failed to send reset code. Please try again later.',
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+        
+        return api_response(
+            success=True,
+            message='New password reset code sent to your email. Code expires in 5 minutes.',
+            data={'email': email},
+            status=status.HTTP_200_OK
+        )
+
+
+class ChangePasswordView(APIView):
+    """Change password for authenticated users (admin, employer, employee)"""
+    permission_classes = [permissions.IsAuthenticated]
+    
+    @method_decorator(ratelimit(key='user', rate='10/h', method='POST'))
+    def post(self, request):
+        from .serializers import ChangePasswordSerializer
+        
+        serializer = ChangePasswordSerializer(
+            data=request.data,
+            context={'request': request}
+        )
+        
+        if not serializer.is_valid():
+            return api_response(
+                success=False,
+                message='Validation failed.',
+                errors=serializer.errors,
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        # Save new password
+        serializer.save()
+        
+        return api_response(
+            success=True,
+            message='Password changed successfully. Please login with your new password.',
+            data={
+                'user': {
+                    'email': request.user.email,
+                    'is_admin': request.user.is_admin,
+                    'is_employer': request.user.is_employer,
+                    'is_employee': request.user.is_employee
+                }
+            },
+            status=status.HTTP_200_OK
+        )
+
+

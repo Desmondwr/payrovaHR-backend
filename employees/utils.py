@@ -11,7 +11,8 @@ def detect_duplicate_employees(employer, national_id=None, email=None, phone=Non
                                config=None, exclude_employee_id=None):
     """
     Detect potential duplicate employees based on configuration settings
-    Uses central EmployeeProfile registry for cross-institutional detection
+    Searches both EmployeeRegistry (for employees with accounts) 
+    and all tenant databases (for employees without accounts)
     
     Args:
         employer: EmployerProfile instance
@@ -27,12 +28,12 @@ def detect_duplicate_employees(employer, national_id=None, email=None, phone=Non
     Returns:
         dict: {
             'duplicates_found': bool,
-            'matches': list of EmployeeRegistry objects from central registry,
-            'match_reasons': list of strings explaining why each is a match
+            'matches': list of match dictionaries,
+            'match_reasons': dict explaining why each is a match
         }
     """
     from employees.models import Employee, EmployeeConfiguration
-    from accounts.models import EmployeeRegistry
+    from accounts.models import EmployeeRegistry, EmployerProfile
     from accounts.database_utils import get_tenant_database_alias
     
     # Get configuration from tenant database
@@ -44,96 +45,171 @@ def detect_duplicate_employees(employer, national_id=None, email=None, phone=Non
             # No config, use default strict matching
             config = None
     
-    matches = []
+    all_matches = []
     match_reasons = {}
     
-    # Base query - search central EmployeeRegistry (default database)
-    query = EmployeeRegistry.objects.all()
+    # PART 1: Search central EmployeeRegistry (employees with user accounts)
+    registry_query = EmployeeRegistry.objects.all()
     
     if exclude_employee_id:
-        # Exclude by user_id if we have the employee record
         try:
             tenant_db = get_tenant_database_alias(employer)
             exclude_employee = Employee.objects.using(tenant_db).get(id=exclude_employee_id)
             if exclude_employee.user_id:
-                query = query.exclude(user_id=exclude_employee.user_id)
+                registry_query = registry_query.exclude(user_id=exclude_employee.user_id)
         except Employee.DoesNotExist:
             pass
     
-    # Build search criteria based on configuration
-    search_queries = []
+    registry_matches = []
     
     if config:
-        # Use configuration settings
         if config.duplicate_check_national_id and national_id:
-            national_id_matches = query.filter(national_id_number=national_id)
-            for profile in national_id_matches:
-                if profile.id not in match_reasons:
-                    matches.append(profile)
-                    match_reasons[profile.id] = ['National ID match']
-                else:
-                    match_reasons[profile.id].append('National ID match')
+            for profile in registry_query.filter(national_id_number=national_id):
+                registry_matches.append(profile)
+                match_reasons[f'registry_{profile.id}'] = ['National ID match']
         
         if config.duplicate_check_email and email:
-            # EmployeeProfile: email is via user relationship or personal_email field
-            email_matches = query.filter(Q(user__email=email) | Q(personal_email=email))
-            for profile in email_matches:
-                if profile.id not in match_reasons:
-                    matches.append(profile)
-                    match_reasons[profile.id] = ['Email match']
-                else:
-                    match_reasons[profile.id].append('Email match')
+            for profile in registry_query.filter(Q(user__email=email) | Q(personal_email=email)):
+                if profile not in registry_matches:
+                    registry_matches.append(profile)
+                    match_reasons[f'registry_{profile.id}'] = ['Email match']
+                elif f'registry_{profile.id}' in match_reasons:
+                    match_reasons[f'registry_{profile.id}'].append('Email match')
         
         if config.duplicate_check_phone and phone:
-            phone_matches = query.filter(Q(phone_number=phone) | Q(alternative_phone=phone))
-            for profile in phone_matches:
-                if profile.id not in match_reasons:
-                    matches.append(profile)
-                    match_reasons[profile.id] = ['Phone match']
-                else:
-                    match_reasons[profile.id].append('Phone match')
-        
-        if config.duplicate_check_name_dob and first_name and last_name and date_of_birth:
-            # Fuzzy name matching
-            name_dob_matches = query.filter(date_of_birth=date_of_birth)
-            for profile in name_dob_matches:
-                similarity = similar(f"{first_name} {last_name}".lower(), 
-                                   f"{profile.first_name} {profile.last_name}".lower())
-                if similarity > 0.8:  # 80% similarity threshold
-                    if profile.id not in match_reasons:
-                        matches.append(profile)
-                        match_reasons[profile.id] = [f'Name + DOB match ({int(similarity * 100)}% similar)']
-                    else:
-                        match_reasons[profile.id].append(f'Name + DOB match ({int(similarity * 100)}% similar)')
+            for profile in registry_query.filter(Q(phone_number=phone) | Q(alternative_phone=phone)):
+                if profile not in registry_matches:
+                    registry_matches.append(profile)
+                    match_reasons[f'registry_{profile.id}'] = ['Phone match']
+                elif f'registry_{profile.id}' in match_reasons:
+                    match_reasons[f'registry_{profile.id}'].append('Phone match')
     else:
-        # Default: strict national ID matching only
         if national_id:
-            matches = list(query.filter(national_id_number=national_id))
-            for profile in matches:
-                match_reasons[profile.id] = ['National ID match']
+            registry_matches = list(registry_query.filter(national_id_number=national_id))
+            for profile in registry_matches:
+                match_reasons[f'registry_{profile.id}'] = ['National ID match']
     
-    # Determine same-institution vs cross-institution by checking tenant database
-    tenant_db = get_tenant_database_alias(employer)
+    # PART 2: Search across all tenant databases (for employees without accounts)
+    tenant_matches = []
+    all_employers = EmployerProfile.objects.filter(is_active=True)
+    current_tenant_db = get_tenant_database_alias(employer)
+    
+    for emp_profile in all_employers:
+        try:
+            tenant_db = get_tenant_database_alias(emp_profile)
+            employee_query = Employee.objects.using(tenant_db).all()
+            
+            # Exclude the employee being updated
+            if exclude_employee_id and tenant_db == current_tenant_db:
+                employee_query = employee_query.exclude(id=exclude_employee_id)
+            
+            # Only search employees without user accounts (those with accounts are in registry)
+            employee_query = employee_query.filter(user_id__isnull=True)
+            
+            if config:
+                if config.duplicate_check_national_id and national_id:
+                    for emp in employee_query.filter(national_id_number=national_id):
+                        tenant_matches.append({
+                            'employee': emp,
+                            'employer_id': emp_profile.id,
+                            'employer_name': emp_profile.company_name,
+                            'tenant_db': tenant_db
+                        })
+                        match_reasons[f'tenant_{emp.id}'] = ['National ID match']
+                
+                if config.duplicate_check_email and email:
+                    for emp in employee_query.filter(Q(email=email) | Q(personal_email=email)):
+                        match_key = f'tenant_{emp.id}'
+                        if not any(m['employee'].id == emp.id for m in tenant_matches):
+                            tenant_matches.append({
+                                'employee': emp,
+                                'employer_id': emp_profile.id,
+                                'employer_name': emp_profile.company_name,
+                                'tenant_db': tenant_db
+                            })
+                            match_reasons[match_key] = ['Email match']
+                        elif match_key in match_reasons:
+                            match_reasons[match_key].append('Email match')
+                
+                if config.duplicate_check_phone and phone:
+                    for emp in employee_query.filter(Q(phone_number=phone) | Q(alternative_phone=phone)):
+                        match_key = f'tenant_{emp.id}'
+                        if not any(m['employee'].id == emp.id for m in tenant_matches):
+                            tenant_matches.append({
+                                'employee': emp,
+                                'employer_id': emp_profile.id,
+                                'employer_name': emp_profile.company_name,
+                                'tenant_db': tenant_db
+                            })
+                            match_reasons[match_key] = ['Phone match']
+                        elif match_key in match_reasons:
+                            match_reasons[match_key].append('Phone match')
+            else:
+                # Default: national ID only
+                if national_id:
+                    for emp in employee_query.filter(national_id_number=national_id):
+                        tenant_matches.append({
+                            'employee': emp,
+                            'employer_id': emp_profile.id,
+                            'employer_name': emp_profile.company_name,
+                            'tenant_db': tenant_db
+                        })
+                        match_reasons[f'tenant_{emp.id}'] = ['National ID match']
+        except Exception as e:
+            # Skip this tenant if there's an error
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.warning(f"Error searching tenant database for employer {emp_profile.id}: {str(e)}")
+            continue
+    
+    # Categorize matches as same-institution vs cross-institution
     same_institution_matches = []
     cross_institution_matches = []
     
-    for profile in matches:
-        # Check if this person works at the requesting employer's institution
+    # Process registry matches
+    for profile in registry_matches:
         try:
-            # Query tenant database to see if employee exists with this user_id
-            Employee.objects.using(tenant_db).get(user_id=profile.user_id)
-            same_institution_matches.append(profile)
+            Employee.objects.using(current_tenant_db).get(user_id=profile.user_id)
+            same_institution_matches.append({
+                'type': 'registry',
+                'data': profile,
+                'employer_id': employer.id,
+                'employer_name': employer.company_name
+            })
         except Employee.DoesNotExist:
-            # Not in this employer's database = cross-institution
-            cross_institution_matches.append(profile)
+            cross_institution_matches.append({
+                'type': 'registry',
+                'data': profile,
+                'employer_id': 'unknown',
+                'employer_name': 'Other Institution'
+            })
+    
+    # Process tenant matches
+    for match in tenant_matches:
+        if match['tenant_db'] == current_tenant_db:
+            same_institution_matches.append({
+                'type': 'employee',
+                'data': match['employee'],
+                'employer_id': match['employer_id'],
+                'employer_name': match['employer_name']
+            })
+        else:
+            cross_institution_matches.append({
+                'type': 'employee',
+                'data': match['employee'],
+                'employer_id': match['employer_id'],
+                'employer_name': match['employer_name']
+            })
+    
+    all_matches = same_institution_matches + cross_institution_matches
     
     return {
-        'duplicates_found': len(matches) > 0,
-        'total_matches': len(matches),
+        'duplicates_found': len(all_matches) > 0,
+        'total_matches': len(all_matches),
         'same_institution_matches': same_institution_matches,
         'cross_institution_matches': cross_institution_matches,
         'match_reasons': match_reasons,
-        'all_matches': matches
+        'all_matches': all_matches
     }
 
 

@@ -155,7 +155,208 @@ http://127.0.0.1:8000/api/auth/token/refresh/
 
 ---
 
-### 7. Register Employee (Self-Registration)
+### 7. Request Password Reset
+**Endpoint:** `POST`
+```
+http://127.0.0.1:8000/api/auth/password-reset/request/
+```
+
+**Headers:**
+```json
+{
+  "Content-Type": "application/json"
+}
+```
+
+**Body:**
+```json
+{
+  "email": "user@example.com"
+}
+```
+
+**Response (Success):**
+```json
+{
+  "success": true,
+  "message": "Password reset code sent to your email. Code expires in 5 minutes.",
+  "data": {
+    "email": "user@example.com"
+  },
+  "errors": []
+}
+```
+
+---
+
+### 8. Verify Reset Code and Reset Password
+**Endpoint:** `POST`
+```
+http://127.0.0.1:8000/api/auth/password-reset/verify/
+```
+
+**Headers:**
+```json
+{
+  "Content-Type": "application/json"
+}
+```
+
+**Body:**
+```json
+{
+  "email": "user@example.com",
+  "code": "123456",
+  "password": "NewPassword@123",
+  "confirm_password": "NewPassword@123"
+}
+```
+
+**Response (Success):**
+```json
+{
+  "success": true,
+  "message": "Password reset successfully. You can now login with your new password.",
+  "data": {},
+  "errors": []
+}
+```
+
+**Response (Invalid Code):**
+```json
+{
+  "success": false,
+  "message": "Invalid verification code.",
+  "data": {},
+  "errors": []
+}
+```
+
+**Response (Expired Code):**
+```json
+{
+  "success": false,
+  "message": "Code has expired. Please request a new one.",
+  "data": {},
+  "errors": []
+}
+```
+
+---
+
+### 9. Resend Password Reset Code
+**Endpoint:** `POST`
+```
+http://127.0.0.1:8000/api/auth/password-reset/resend/
+```
+
+**Headers:**
+```json
+{
+  "Content-Type": "application/json"
+}
+```
+
+**Body:**
+```json
+{
+  "email": "user@example.com"
+}
+```
+
+**Response (Success):**
+```json
+{
+  "success": true,
+  "message": "New password reset code sent to your email. Code expires in 5 minutes.",
+  "data": {
+    "email": "user@example.com"
+  },
+  "errors": []
+}
+```
+
+---
+
+### 10. Change Password (Authenticated Users)
+**Endpoint:** `POST`
+```
+http://127.0.0.1:8000/api/auth/change-password/
+```
+
+**Headers:**
+```json
+{
+  "Content-Type": "application/json",
+  "Authorization": "Bearer YOUR_ACCESS_TOKEN"
+}
+```
+
+**Body:**
+```json
+{
+  "old_password": "CurrentPassword@123",
+  "new_password": "NewPassword@456",
+  "confirm_new_password": "NewPassword@456"
+}
+```
+
+**Response (Success):**
+```json
+{
+  "success": true,
+  "message": "Password changed successfully. Please login with your new password.",
+  "data": {
+    "user": {
+      "email": "user@example.com",
+      "is_admin": false,
+      "is_employer": true,
+      "is_employee": false
+    }
+  },
+  "errors": []
+}
+```
+
+**Response (Incorrect Current Password):**
+```json
+{
+  "success": false,
+  "message": "Validation failed.",
+  "data": {},
+  "errors": {
+    "old_password": ["Current password is incorrect."]
+  }
+}
+```
+
+**Response (Passwords Don't Match):**
+```json
+{
+  "success": false,
+  "message": "Validation failed.",
+  "data": {},
+  "errors": {
+    "confirm_new_password": ["New passwords do not match."]
+  }
+}
+```
+
+**Response (Same as Current Password):**
+```json
+{
+  "success": false,
+  "message": "Validation failed.",
+  "data": {},
+  "errors": {
+    "new_password": ["New password must be different from current password."]
+  }
+}
+```
+
+---
+
+### 11. Register Employee (Self-Registration)
 **Endpoint:** `POST`
 ```
 http://127.0.0.1:8000/api/auth/register/employee/

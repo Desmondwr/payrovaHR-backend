@@ -4,7 +4,9 @@ from .views import (
     CreateEmployerView, ActivateAccountView, LoginView,
     Setup2FAView, Verify2FAView, Disable2FAView,
     EmployerProfileView, CompleteEmployerProfileView, UserProfileView,
-    ListEmployersView, EmployerStatusView
+    ListEmployersView, EmployerStatusView,
+    RequestPasswordResetView, VerifyResetCodeView, ResendResetCodeView,
+    ChangePasswordView
 )
 
 app_name = 'accounts'
@@ -19,6 +21,14 @@ urlpatterns = [
     path('auth/activate/', ActivateAccountView.as_view(), name='activate-account'),
     path('auth/login/', LoginView.as_view(), name='login'),
     path('auth/token/refresh/', TokenRefreshView.as_view(), name='token-refresh'),
+    
+    # Password reset endpoints
+    path('auth/password-reset/request/', RequestPasswordResetView.as_view(), name='request-password-reset'),
+    path('auth/password-reset/verify/', VerifyResetCodeView.as_view(), name='verify-reset-code'),
+    path('auth/password-reset/resend/', ResendResetCodeView.as_view(), name='resend-reset-code'),
+    
+    # Password change endpoint (authenticated users)
+    path('auth/change-password/', ChangePasswordView.as_view(), name='change-password'),
     
     # 2FA endpoints
     path('auth/2fa/setup/', Setup2FAView.as_view(), name='setup-2fa'),
