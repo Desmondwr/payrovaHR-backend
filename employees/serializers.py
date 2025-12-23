@@ -412,48 +412,66 @@ class CreateEmployeeSerializer(serializers.ModelSerializer):
             # Remove the None/empty value from validated_data
             validated_data.pop('employee_id', None)
             
-            try:
-                config = EmployeeConfiguration.objects.using(tenant_db).get(employer_id=validated_data['employer_id'])
+            # Try up to 5 times to generate a unique employee ID
+            max_attempts = 5
+            for attempt in range(max_attempts):
+                try:
+                    config = EmployeeConfiguration.objects.using(tenant_db).get(employer_id=validated_data['employer_id'])
+                    
+                    # Get the actual department and branch objects for ID generation
+                    department_obj = None
+                    branch_obj = None
+                    
+                    if department_uuid:
+                        try:
+                            department_obj = Department.objects.using(tenant_db).get(id=department_uuid)
+                        except Department.DoesNotExist:
+                            pass
+                    
+                    if branch_uuid:
+                        try:
+                            branch_obj = Branch.objects.using(tenant_db).get(id=branch_uuid)
+                        except Branch.DoesNotExist:
+                            pass
+                    
+                    generated_id = config.get_next_employee_id(
+                        branch=branch_obj, 
+                        department=department_obj,
+                        using=tenant_db
+                    )
+                except EmployeeConfiguration.DoesNotExist:
+                    # Fallback: Simple sequential numbering using max number + attempt offset
+                    import re
+                    existing_employees = Employee.objects.using(tenant_db).filter(
+                        employer_id=validated_data['employer_id']
+                    ).exclude(employee_id='').exclude(employee_id__isnull=True).values_list('employee_id', flat=True)
+                    
+                    max_number = 0
+                    for emp_id in existing_employees:
+                        numbers = re.findall(r'\d+', str(emp_id))
+                        if numbers:
+                            try:
+                                num = int(numbers[-1])
+                                if num > max_number:
+                                    max_number = num
+                            except ValueError:
+                                continue
+                    
+                    next_num = max_number + 1 + attempt
+                    generated_id = f"EMP-{next_num:03d}"
                 
-                # Get the actual department and branch objects for ID generation
-                department_obj = None
-                branch_obj = None
-                
-                if department_uuid:
-                    try:
-                        department_obj = Department.objects.using(tenant_db).get(id=department_uuid)
-                    except Department.DoesNotExist:
-                        pass
-                
-                if branch_uuid:
-                    try:
-                        branch_obj = Branch.objects.using(tenant_db).get(id=branch_uuid)
-                    except Branch.DoesNotExist:
-                        pass
-                
-                validated_data['employee_id'] = config.get_next_employee_id(
-                    branch=branch_obj, 
-                    department=department_obj,
-                    using=tenant_db
-                )
-            except EmployeeConfiguration.DoesNotExist:
-                # Fallback: Simple sequential numbering
-                last_employee = Employee.objects.using(tenant_db).filter(
-                    employer_id=validated_data['employer_id']
-                ).exclude(employee_id='').exclude(employee_id__isnull=True).order_by('-created_at').first()
-                if last_employee and last_employee.employee_id:
-                    # Try to extract number from employee_id
-                    try:
-                        parts = last_employee.employee_id.split('-')
-                        if len(parts) > 1 and parts[-1].isdigit():
-                            next_num = int(parts[-1]) + 1
-                            validated_data['employee_id'] = f"EMP-{next_num:03d}"
-                        else:
-                            validated_data['employee_id'] = "EMP-001"
-                    except:
-                        validated_data['employee_id'] = "EMP-001"
-                else:
-                    validated_data['employee_id'] = "EMP-001"
+                # Check if this ID already exists
+                if not Employee.objects.using(tenant_db).filter(
+                    employer_id=validated_data['employer_id'], 
+                    employee_id=generated_id
+                ).exists():
+                    validated_data['employee_id'] = generated_id
+                    break
+                # If it exists and this is the last attempt, raise an error
+                elif attempt == max_attempts - 1:
+                    raise serializers.ValidationError({
+                        'employee_id': 'Unable to generate unique employee ID. Please try again or provide a custom ID.'
+                    })
         
         # Create employee in tenant database
         employee = Employee.objects.using(tenant_db).create(**validated_data)
