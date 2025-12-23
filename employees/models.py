@@ -200,13 +200,41 @@ class EmployeeConfiguration(models.Model):
     def __str__(self):
         return f"Employee Config - Employer ID: {self.employer_id}"
     
-    def get_next_employee_id(self, branch=None, department=None):
-        """Generate next employee ID based on configuration"""
-        from employees.models import Employee
+    def get_next_employee_id(self, branch=None, department=None, using='default'):
+        """Generate next employee ID based on configuration
         
-        # Get current count for this employer
-        current_count = Employee.objects.filter(employer_id=self.employer_id).count()
-        next_number = current_count + self.employee_id_starting_number
+        Args:
+            branch: Branch object (optional)
+            department: Department object (optional)
+            using: Database alias to use for queries
+        """
+        from employees.models import Employee
+        import re
+        
+        # Get the highest employee number currently in use
+        # Extract numbers from existing employee IDs and find the max
+        existing_employees = Employee.objects.using(using).filter(
+            employer_id=self.employer_id
+        ).exclude(employee_id='').exclude(employee_id__isnull=True).values_list('employee_id', flat=True)
+        
+        max_number = 0
+        for emp_id in existing_employees:
+            # Extract all numbers from the employee ID
+            numbers = re.findall(r'\d+', str(emp_id))
+            if numbers:
+                # Get the last number (usually the sequence number)
+                try:
+                    num = int(numbers[-1])
+                    if num > max_number:
+                        max_number = num
+                except ValueError:
+                    continue
+        
+        # Next number is max + 1, or starting number if no employees exist
+        if max_number > 0:
+            next_number = max_number + 1
+        else:
+            next_number = self.employee_id_starting_number
         
         # Format number with padding
         formatted_number = str(next_number).zfill(self.employee_id_padding)

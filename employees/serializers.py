@@ -414,7 +414,28 @@ class CreateEmployeeSerializer(serializers.ModelSerializer):
             
             try:
                 config = EmployeeConfiguration.objects.using(tenant_db).get(employer_id=validated_data['employer_id'])
-                validated_data['employee_id'] = config.get_next_employee_id()
+                
+                # Get the actual department and branch objects for ID generation
+                department_obj = None
+                branch_obj = None
+                
+                if department_uuid:
+                    try:
+                        department_obj = Department.objects.using(tenant_db).get(id=department_uuid)
+                    except Department.DoesNotExist:
+                        pass
+                
+                if branch_uuid:
+                    try:
+                        branch_obj = Branch.objects.using(tenant_db).get(id=branch_uuid)
+                    except Branch.DoesNotExist:
+                        pass
+                
+                validated_data['employee_id'] = config.get_next_employee_id(
+                    branch=branch_obj, 
+                    department=department_obj,
+                    using=tenant_db
+                )
             except EmployeeConfiguration.DoesNotExist:
                 # Fallback: Simple sequential numbering
                 last_employee = Employee.objects.using(tenant_db).filter(
