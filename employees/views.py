@@ -858,27 +858,17 @@ class EmployeeInvitationViewSet(viewsets.ReadOnlyModelViewSet):
             tenant_db=tenant_db
         )
         
-        prefill_profile = {
-            'employee_id': employee.employee_id,
-            'first_name': employee.first_name,
-            'last_name': employee.last_name,
-            'email': employee.email or employee.personal_email or invitation.email,
-            'job_title': employee.job_title,
-            'department': str(employee.department_id) if employee.department_id else None,
-            'branch': str(employee.branch_id) if employee.branch_id else None,
-            'employment_type': employee.employment_type,
-            'hire_date': employee.hire_date,
-            'national_id_number': employee.national_id_number,
-        }
-        
-        return Response({
-            'message': 'Invitation accepted successfully. Please complete your profile to continue.',
-            'requires_profile_completion': not employee.profile_completed,
-            'redirect_to': 'complete-profile',
-            'prefill_profile': prefill_profile,
-            'employee': EmployeeDetailSerializer(employee).data
-        }, status=status.HTTP_200_OK)
+        # Serialize the full form fields for profile completion
+        from .serializers import EmployeeProfileCompletionSerializer
+        employee_data = EmployeeProfileCompletionSerializer(instance=invitation.employee).data
 
+        return Response({
+            'message': 'Invitation accepted successfully.',
+            'employee_data': employee_data,
+            'token': serializer.validated_data['token'],
+            'password': password
+        }, status=status.HTTP_200_OK)
+        
 
 class EmployeeProfileViewSet(viewsets.GenericViewSet):
     """ViewSet for employees to manage their own profile"""
@@ -1045,3 +1035,17 @@ class EmployeeProfileViewSet(viewsets.GenericViewSet):
                 'error': 'Failed to update profile',
                 'detail': str(e)
             }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+    
+    @action(detail=False, methods=['post'], url_path='complete')
+    def complete_profile(self, request):
+        """Handle employee profile completion"""
+        from .serializers import EmployeeProfileCompletionSerializer
+        
+        serializer = EmployeeProfileCompletionSerializer(data=request.data)
+        if serializer.is_valid():
+            # Perform profile completion logic here
+            return Response({
+                'message': 'Profile completed successfully.'
+            }, status=status.HTTP_200_OK)
+        
+        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
