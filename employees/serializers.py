@@ -412,41 +412,39 @@ class CreateEmployeeSerializer(serializers.ModelSerializer):
             # Remove the None/empty value from validated_data
             validated_data.pop('employee_id', None)
             
-            try:
-                config = EmployeeConfiguration.objects.using(tenant_db).get(employer_id=validated_data['employer_id'])
-                
-                # Get the actual department and branch objects for ID generation
-                department_obj = None
-                branch_obj = None
-                
-                if department_uuid:
-                    try:
-                        department_obj = Department.objects.using(tenant_db).get(id=department_uuid)
-                    except Department.DoesNotExist:
-                        pass
-                
-                if branch_uuid:
-                    try:
-                        branch_obj = Branch.objects.using(tenant_db).get(id=branch_uuid)
-                    except Branch.DoesNotExist:
-                        pass
-                
-                # Generate ID using atomic counter (thread-safe)
-                validated_data['employee_id'] = config.get_next_employee_id(
-                    branch=branch_obj, 
-                    department=department_obj,
-                    using=tenant_db
-                )
-            except EmployeeConfiguration.DoesNotExist:
-                # Fallback: Create a default configuration first
-                config = EmployeeConfiguration.objects.using(tenant_db).create(
-                    employer_id=validated_data['employer_id'],
-                    employee_id_prefix='EMP',
-                    employee_id_starting_number=1,
-                    employee_id_padding=3,
-                    last_employee_number=0
-                )
-                validated_data['employee_id'] = config.get_next_employee_id(using=tenant_db)
+            # Try to get or create configuration
+            config, created = EmployeeConfiguration.objects.using(tenant_db).get_or_create(
+                employer_id=validated_data['employer_id'],
+                defaults={
+                    'employee_id_prefix': 'EMP',
+                    'employee_id_starting_number': 1,
+                    'employee_id_padding': 3,
+                    'last_employee_number': 0
+                }
+            )
+            
+            # Get the actual department and branch objects for ID generation
+            department_obj = None
+            branch_obj = None
+            
+            if department_uuid:
+                try:
+                    department_obj = Department.objects.using(tenant_db).get(id=department_uuid)
+                except Department.DoesNotExist:
+                    pass
+            
+            if branch_uuid:
+                try:
+                    branch_obj = Branch.objects.using(tenant_db).get(id=branch_uuid)
+                except Branch.DoesNotExist:
+                    pass
+            
+            # Generate ID using atomic counter (thread-safe)
+            validated_data['employee_id'] = config.get_next_employee_id(
+                branch=branch_obj, 
+                department=department_obj,
+                using=tenant_db
+            )
         
         # Create employee in tenant database
         employee = Employee.objects.using(tenant_db).create(**validated_data)
