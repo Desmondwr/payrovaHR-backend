@@ -237,10 +237,8 @@ class EmployeeViewSet(viewsets.ModelViewSet):
                 tenant_db = 'default'
         
         # Get configuration from tenant database
-        try:
-            config = EmployeeConfiguration.objects.using(tenant_db).get(employer_id=employee.employer_id)
-        except EmployeeConfiguration.DoesNotExist:
-            config = None
+        from employees.utils import get_or_create_employee_config
+        config = get_or_create_employee_config(employee.employer_id, tenant_db)
         
         # Create invitation in tenant database
         invitation = EmployeeInvitation.objects.using(tenant_db).create(
@@ -374,7 +372,8 @@ class EmployeeViewSet(viewsets.ModelViewSet):
             from accounts.database_utils import get_tenant_database_alias
             employer = request.user.employer_profile
             tenant_db = get_tenant_database_alias(employer)
-            config = EmployeeConfiguration.objects.using(tenant_db).get(employer_id=employee.employer_id)
+            from employees.utils import get_or_create_employee_config
+            config = get_or_create_employee_config(employee.employer_id, tenant_db)
             if config.termination_revoke_access_timing == 'IMMEDIATE' and employee.user_id:
                 # Update user in main database
                 from django.contrib.auth import get_user_model
@@ -382,8 +381,11 @@ class EmployeeViewSet(viewsets.ModelViewSet):
                 user = User.objects.get(id=employee.user_id)
                 user.is_active = False
                 user.save()
-        except EmployeeConfiguration.DoesNotExist:
-            pass
+        except Exception as e:
+            # Log but don't fail the termination
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.error(f"Error revoking access during termination: {str(e)}")
         
         return Response(
             EmployeeDetailSerializer(employee).data,
@@ -403,18 +405,16 @@ class EmployeeViewSet(viewsets.ModelViewSet):
             )
         
         # Check if reactivation is allowed
-        try:
-            from accounts.database_utils import get_tenant_database_alias
-            employer = request.user.employer_profile
-            tenant_db = get_tenant_database_alias(employer)
-            config = EmployeeConfiguration.objects.using(tenant_db).get(employer_id=employee.employer_id)
-            if not config.allow_employee_reactivation:
-                return Response(
-                    {'error': 'Employee reactivation is not allowed by policy'},
-                    status=status.HTTP_403_FORBIDDEN
-                )
-        except EmployeeConfiguration.DoesNotExist:
-            pass
+        from accounts.database_utils import get_tenant_database_alias
+        from employees.utils import get_or_create_employee_config
+        employer = request.user.employer_profile
+        tenant_db = get_tenant_database_alias(employer)
+        config = get_or_create_employee_config(employee.employer_id, tenant_db)
+        if not config.allow_employee_reactivation:
+            return Response(
+                {'error': 'Employee reactivation is not allowed by policy'},
+                status=status.HTTP_403_FORBIDDEN
+            )
         
         # Reactivate employee
         employee.employment_status = 'ACTIVE'
@@ -499,13 +499,11 @@ class EmployeeViewSet(viewsets.ModelViewSet):
         """Get cross-institution information for an employee"""
         employee = self.get_object()
         
-        try:
-            from accounts.database_utils import get_tenant_database_alias
-            employer = request.user.employer_profile
-            tenant_db = get_tenant_database_alias(employer)
-            config = EmployeeConfiguration.objects.using(tenant_db).get(employer_id=employee.employer_id)
-        except EmployeeConfiguration.DoesNotExist:
-            config = None
+        from accounts.database_utils import get_tenant_database_alias
+        from employees.utils import get_or_create_employee_config
+        employer = request.user.employer_profile
+        tenant_db = get_tenant_database_alias(employer)
+        config = get_or_create_employee_config(employee.employer_id, tenant_db)
         
         summary = get_cross_institution_summary(employee, config)
         
@@ -525,13 +523,11 @@ class EmployeeViewSet(viewsets.ModelViewSet):
         serializer = EmployeeSearchSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         
-        try:
-            from accounts.database_utils import get_tenant_database_alias
-            employer = request.user.employer_profile
-            tenant_db = get_tenant_database_alias(employer)
-            config = EmployeeConfiguration.objects.using(tenant_db).get(employer_id=employer.id)
-        except EmployeeConfiguration.DoesNotExist:
-            config = None
+        from accounts.database_utils import get_tenant_database_alias
+        from employees.utils import get_or_create_employee_config
+        employer = request.user.employer_profile
+        tenant_db = get_tenant_database_alias(employer)
+        config = get_or_create_employee_config(employer.id, tenant_db)
         
         result = detect_duplicate_employees(
             employer=request.user.employer_profile,

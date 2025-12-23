@@ -391,7 +391,11 @@ class CreateEmployeeSerializer(serializers.ModelSerializer):
         
         # Get tenant database alias
         from accounts.database_utils import get_tenant_database_alias
+        from employees.utils import get_or_create_employee_config
         tenant_db = get_tenant_database_alias(request.user.employer_profile)
+        
+        # Ensure EmployeeConfiguration exists using helper function
+        config = get_or_create_employee_config(validated_data['employer_id'], tenant_db)
         
         # Extract UUID values and convert to _id fields
         department_uuid = validated_data.pop('department', None)
@@ -412,17 +416,6 @@ class CreateEmployeeSerializer(serializers.ModelSerializer):
             # Remove the None/empty value from validated_data
             validated_data.pop('employee_id', None)
             
-            # Try to get or create configuration
-            config, created = EmployeeConfiguration.objects.using(tenant_db).get_or_create(
-                employer_id=validated_data['employer_id'],
-                defaults={
-                    'employee_id_prefix': 'EMP',
-                    'employee_id_starting_number': 1,
-                    'employee_id_padding': 3,
-                    'last_employee_number': 0
-                }
-            )
-            
             # Get the actual department and branch objects for ID generation
             department_obj = None
             branch_obj = None
@@ -439,13 +432,12 @@ class CreateEmployeeSerializer(serializers.ModelSerializer):
                 except Branch.DoesNotExist:
                     pass
             
-            # Generate ID using atomic counter (thread-safe)
+            # Use the configuration's method to generate ID (atomic and thread-safe)
             validated_data['employee_id'] = config.get_next_employee_id(
-                branch=branch_obj, 
+                branch=branch_obj,
                 department=department_obj,
                 using=tenant_db
             )
-        
         # Create employee in tenant database
         employee = Employee.objects.using(tenant_db).create(**validated_data)
         
@@ -833,23 +825,15 @@ class CreateEmployeeWithDetectionSerializer(serializers.ModelSerializer):
     
     def validate(self, data):
         """Validate employee data against configuration"""
-        from employees.utils import validate_employee_data, detect_duplicate_employees
+        from employees.utils import validate_employee_data, detect_duplicate_employees, get_or_create_employee_config
         from accounts.database_utils import get_tenant_database_alias
         
         request = self.context['request']
         employer = request.user.employer_profile
         tenant_db = get_tenant_database_alias(employer)
         
-        # Get or create configuration from tenant database
-        config, created = EmployeeConfiguration.objects.using(tenant_db).get_or_create(
-            employer_id=employer.id,
-            defaults={
-                'employee_id_prefix': 'EMP',
-                'employee_id_starting_number': 1,
-                'employee_id_padding': 3,
-                'last_employee_number': 0
-            }
-        )
+        # Get or create configuration using helper function
+        config = get_or_create_employee_config(employer.id, tenant_db)
         
         # Skip strict validation during employer-initiated creation
         # The configuration requirements apply when employees complete their own profiles,
@@ -915,23 +899,22 @@ class CreateEmployeeWithDetectionSerializer(serializers.ModelSerializer):
         
         # Get tenant database alias
         from accounts.database_utils import get_tenant_database_alias
+        from employees.utils import get_or_create_employee_config
         tenant_db = get_tenant_database_alias(employer)
         
         # Get configuration
-        try:
-            config = EmployeeConfiguration.objects.using(tenant_db).get(employer_id=employer.id)
-        except EmployeeConfiguration.DoesNotExist:
-            config = None
+        config = get_or_create_employee_config(employer.id, tenant_db)
         
         # Auto-generate employee ID if not provided and configured
-        if not validated_data.get('employee_id') and config:
+        if not validated_data.get('employee_id'):
             validated_data['employee_id'] = config.get_next_employee_id(
                 branch=validated_data.get('branch'),
-                department=validated_data.get('department')
+                department=validated_data.get('department'),
+                using=tenant_db
             )
         
         # Auto-generate work email if configured
-        if config and config.auto_generate_work_email and not validated_data.get('email'):
+        if config.auto_generate_work_email and not validated_data.get('email'):
             from employees.utils import generate_work_email
             # Create temporary employee object for email generation
             temp_employee_data = validated_data.copy()
@@ -1044,32 +1027,29 @@ class EmployeeDocumentUploadSerializer(serializers.ModelSerializer):
     def validate_file(self, value):
         """Validate file size and format based on configuration"""
         from accounts.database_utils import get_tenant_database_alias
+        from employees.utils import get_or_create_employee_config
+        
         request = self.context['request']
         employer = request.user.employer_profile
         tenant_db = get_tenant_database_alias(employer)
         
-        try:
-            config = EmployeeConfiguration.objects.using(tenant_db).get(employer_id=employer.id)
+        # Get or create configuration using helper function
+        config = get_or_create_employee_config(employer.id, tenant_db)
             
-            # Check file size
-            max_size_bytes = config.document_max_file_size_mb * 1024 * 1024
-            if value.size > max_size_bytes:
-                raise serializers.ValidationError(
-                    f"File size exceeds maximum allowed size of {config.document_max_file_size_mb}MB"
-                )
+        # Check file size
+        max_size_bytes = config.document_max_file_size_mb * 1024 * 1024
+        if value.size > max_size_bytes:
+            raise serializers.ValidationError(
+                f"File size exceeds maximum allowed size of {config.document_max_file_size_mb}MB"
+            )
             
-            # Check file format
-            allowed_formats = config.get_allowed_document_formats()
-            file_ext = value.name.split('.')[-1].lower()
-            if allowed_formats and file_ext not in allowed_formats:
-                raise serializers.ValidationError(
-                    f"File format '.{file_ext}' is not allowed. Allowed formats: {', '.join(allowed_formats)}"
-                )
-        except EmployeeConfiguration.DoesNotExist:
-            # No config, apply default limits
-            max_size_bytes = 10 * 1024 * 1024  # 10MB default
-            if value.size > max_size_bytes:
-                raise serializers.ValidationError("File size exceeds 10MB limit")
+        # Check file format
+        allowed_formats = config.get_allowed_document_formats()
+        file_ext = value.name.split('.')[-1].lower()
+        if allowed_formats and file_ext not in allowed_formats:
+            raise serializers.ValidationError(
+                f"File format '.{file_ext}' is not allowed. Allowed formats: {', '.join(allowed_formats)}"
+            )
         
         return value
     

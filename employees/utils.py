@@ -6,6 +6,35 @@ import secrets
 from difflib import SequenceMatcher
 
 
+def get_or_create_employee_config(employer_id, tenant_db='default'):
+    """
+    Get or create EmployeeConfiguration for an employer.
+    This ensures the config ALWAYS exists and prevents DoesNotExist errors.
+    
+    Args:
+        employer_id: ID of the employer
+        tenant_db: Database alias to use
+        
+    Returns:
+        EmployeeConfiguration instance
+    """
+    from employees.models import EmployeeConfiguration
+    
+    config, created = EmployeeConfiguration.objects.using(tenant_db).get_or_create(
+        employer_id=employer_id,
+        defaults={
+            'employee_id_prefix': 'EMP',
+            'employee_id_starting_number': 1,
+            'employee_id_padding': 3,
+            'last_employee_number': 0,
+            'employee_id_format': 'SEQUENTIAL'
+        }
+    )
+    # Ensure the instance knows which database it's from
+    config._state.db = tenant_db
+    return config
+
+
 def detect_duplicate_employees(employer, national_id=None, email=None, phone=None, 
                                first_name=None, last_name=None, date_of_birth=None,
                                config=None, exclude_employee_id=None):
@@ -38,12 +67,10 @@ def detect_duplicate_employees(employer, national_id=None, email=None, phone=Non
     
     # Get configuration from tenant database
     if config is None:
-        try:
-            tenant_db = get_tenant_database_alias(employer)
-            config = EmployeeConfiguration.objects.using(tenant_db).get(employer_id=employer.id)
-        except EmployeeConfiguration.DoesNotExist:
-            # No config, use default strict matching
-            config = None
+        from employees.models import EmployeeConfiguration
+        from accounts.database_utils import get_tenant_database_alias
+        tenant_db = get_tenant_database_alias(employer)
+        config = get_or_create_employee_config(employer.id, tenant_db)
     
     all_matches = []
     match_reasons = {}
@@ -299,8 +326,8 @@ def check_required_documents(employee):
     try:
         employer = EmployerProfile.objects.get(id=employee.employer_id)
         tenant_db = get_tenant_database_alias(employer)
-        config = EmployeeConfiguration.objects.using(tenant_db).get(employer_id=employee.employer_id)
-    except (EmployeeConfiguration.DoesNotExist, EmployerProfile.DoesNotExist):
+        config = get_or_create_employee_config(employee.employer_id, tenant_db)
+    except EmployerProfile.DoesNotExist:
         return {'missing': [], 'all_uploaded': True}
     
     required_types = config.get_required_document_types()
