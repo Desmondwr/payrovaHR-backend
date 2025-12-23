@@ -339,8 +339,10 @@ class Employee(models.Model):
     """Employee master record managed by employer"""
     
     EMPLOYMENT_STATUS_CHOICES = [
-        ('ACTIVE', 'Active'),
+        ('PENDING', 'Pending'),
         ('PROBATION', 'Probation'),
+        ('ACTIVE', 'Active'),
+        ('ON_LEAVE', 'On Leave'),
         ('SUSPENDED', 'Suspended'),
         ('TERMINATED', 'Terminated'),
         ('RESIGNED', 'Resigned'),
@@ -410,7 +412,7 @@ class Employee(models.Model):
     branch = models.ForeignKey(Branch, on_delete=models.SET_NULL, null=True, blank=True, related_name='employees')
     manager = models.ForeignKey('self', on_delete=models.SET_NULL, null=True, blank=True, related_name='direct_reports')
     employment_type = models.CharField(max_length=20, choices=EMPLOYMENT_TYPE_CHOICES)  # Required by employer
-    employment_status = models.CharField(max_length=20, choices=EMPLOYMENT_STATUS_CHOICES, default='ACTIVE')
+    employment_status = models.CharField(max_length=20, choices=EMPLOYMENT_STATUS_CHOICES, default='PENDING')
     hire_date = models.DateField()  # Required by employer
     probation_end_date = models.DateField(blank=True, null=True)
     termination_date = models.DateField(blank=True, null=True)

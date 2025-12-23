@@ -91,7 +91,7 @@ def detect_duplicate_employees(employer, national_id=None, email=None, phone=Non
     
     # PART 2: Search across all tenant databases (for employees without accounts)
     tenant_matches = []
-    all_employers = EmployerProfile.objects.filter(is_active=True)
+    all_employers = EmployerProfile.objects.filter(user__is_active=True).select_related('user')
     current_tenant_db = get_tenant_database_alias(employer)
     
     for emp_profile in all_employers:

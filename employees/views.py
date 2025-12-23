@@ -922,7 +922,7 @@ class EmployeeProfileViewSet(viewsets.GenericViewSet):
                 from accounts.models import EmployerProfile
                 
                 # Get all employers
-                employers = EmployerProfile.objects.filter(is_active=True)
+                employers = EmployerProfile.objects.filter(user__is_active=True).select_related('user')
                 employee = None
                 
                 for employer in employers:
@@ -971,7 +971,7 @@ class EmployeeProfileViewSet(viewsets.GenericViewSet):
             else:
                 # Fallback: search all tenant databases
                 from accounts.models import EmployerProfile
-                employers = EmployerProfile.objects.filter(is_active=True)
+                employers = EmployerProfile.objects.filter(user__is_active=True).select_related('user')
                 employee = None
                 tenant_db = None
                 
@@ -1000,11 +1000,17 @@ class EmployeeProfileViewSet(viewsets.GenericViewSet):
                 # Save to tenant database
                 updated_employee = serializer.save()
                 
+                # Prepare update fields
+                update_fields = {field: getattr(updated_employee, field) 
+                                for field in serializer.validated_data.keys()}
+                
+                # Change employment status from PENDING to ACTIVE when profile is completed
+                if updated_employee.employment_status == 'PENDING':
+                    update_fields['employment_status'] = 'ACTIVE'
+                    updated_employee.employment_status = 'ACTIVE'
+                
                 # Update in tenant database
-                Employee.objects.using(tenant_db).filter(id=updated_employee.id).update(
-                    **{field: getattr(updated_employee, field) 
-                       for field in serializer.validated_data.keys()}
-                )
+                Employee.objects.using(tenant_db).filter(id=updated_employee.id).update(**update_fields)
                 
                 # Add profile_completed fields
                 if not partial or ('profile_completed' in dir(updated_employee) and updated_employee.profile_completed):

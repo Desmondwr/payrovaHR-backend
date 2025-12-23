@@ -46,12 +46,12 @@ class EmployerStatusView(APIView):
                 message='Missing is_active field.',
                 status=status.HTTP_400_BAD_REQUEST
             )
-        employer.is_active = bool(is_active)
-        employer.save()
+        employer.user.is_active = bool(is_active)
+        employer.user.save()
         return api_response(
             success=True,
-            message=f'Employer account {"enabled" if employer.is_active else "disabled"}.',
-            data={'id': employer.id, 'is_active': employer.is_active},
+            message=f'Employer account {"enabled" if employer.user.is_active else "disabled"}.',
+            data={'id': employer.id, 'is_active': employer.user.is_active},
             status=status.HTTP_200_OK
         )
 from rest_framework import status, generics, permissions

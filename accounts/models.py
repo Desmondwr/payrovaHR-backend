@@ -76,7 +76,7 @@ class User(AbstractUser):
         
         try:
             # Get all active employers
-            employers = EmployerProfile.objects.filter(is_active=True)
+            employers = EmployerProfile.objects.filter(user__is_active=True).select_related('user')
             
             for employer in employers:
                 tenant_db = get_tenant_database_alias(employer)
