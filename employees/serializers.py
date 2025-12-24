@@ -381,6 +381,43 @@ class CreateEmployeeSerializer(serializers.ModelSerializer):
             )
         return value
     
+    def validate(self, data):
+        """Validate that all required fields per employer configuration are provided"""
+        from employees.utils import validate_employee_data_strict
+        from employees.models import EmployeeConfiguration
+        from accounts.database_utils import get_tenant_database_alias
+        from django.core.exceptions import ValidationError as DjangoValidationError
+        
+        request = self.context['request']
+        employer_id = request.user.employer_profile.id
+        tenant_db = get_tenant_database_alias(request.user.employer_profile)
+        
+        # Get or create employer configuration
+        config, created = EmployeeConfiguration.objects.using(tenant_db).get_or_create(
+            employer_id=employer_id
+        )
+        
+        # Validate data against employer configuration
+        try:
+            validation_result = validate_employee_data_strict(data, config)
+            
+            # If validation fails, raise error with missing fields
+            if not validation_result['is_valid']:
+                error_msg = validation_result['error_message']
+                employer_name = request.user.employer_profile.company_name
+                
+                raise serializers.ValidationError({
+                    'non_field_errors': [error_msg],
+                    '_info': {
+                        'employer': employer_name,
+                        'missing_fields': validation_result.get('missing_fields', [])
+                    }
+                })
+        except DjangoValidationError as e:
+            raise serializers.ValidationError({'non_field_errors': [str(e)]})
+        
+        return data
+    
     def create(self, validated_data):
         send_invitation = validated_data.pop('send_invitation', False)
         request = self.context['request']
@@ -438,12 +475,49 @@ class CreateEmployeeSerializer(serializers.ModelSerializer):
                 department=department_obj,
                 using=tenant_db
             )
+        
+        # Check if this is linking an existing employee (user_id provided)
+        # If so, validate their existing data against config and set completion state
+        if 'user_id' in validated_data and validated_data['user_id']:
+            from accounts.models import EmployeeRegistry
+            from employees.utils import check_missing_fields_against_config
+            
+            try:
+                # Get existing employee registry data
+                employee_registry = EmployeeRegistry.objects.get(user_id=validated_data['user_id'])
+                
+                # Validate against new employer's config
+                validation_result = check_missing_fields_against_config(validated_data, config)
+                
+                # Set profile completion fields based on validation
+                validated_data['profile_completion_state'] = validation_result['completion_state']
+                validated_data['profile_completion_required'] = validation_result['requires_update']
+                validated_data['missing_required_fields'] = validation_result['missing_critical']
+                validated_data['missing_optional_fields'] = validation_result['missing_non_critical']
+                
+                # If profile is complete, mark it as such
+                if validation_result['completion_state'] == 'COMPLETE':
+                    validated_data['profile_completed'] = True
+                    validated_data['profile_completed_at'] = timezone.now()
+                else:
+                    validated_data['profile_completed'] = False
+                    validated_data['profile_completed_at'] = None
+                
+            except EmployeeRegistry.DoesNotExist:
+                # No registry exists, profile needs completion
+                validated_data['profile_completion_required'] = True
+                validated_data['profile_completion_state'] = 'INCOMPLETE_BLOCKING'
+        
         # Create employee in tenant database
         employee = Employee.objects.using(tenant_db).create(**validated_data)
         
         # Store invitation flag and tenant_db for view to handle
         employee._send_invitation = send_invitation
         employee._tenant_db = tenant_db
+        
+        # Store whether profile completion notification should be sent
+        if validated_data.get('profile_completion_required', False):
+            employee._send_completion_notification = True
         
         return employee
 
@@ -1140,8 +1214,8 @@ class EmployeeProfileCompletionSerializer(serializers.ModelSerializer):
         }
     
     def validate(self, data):
-        """Validate employee profile data against configuration requirements"""
-        from employees.utils import validate_employee_data
+        """Validate employee profile data against employer's specific configuration requirements"""
+        from employees.utils import validate_employee_data_strict
         from accounts.database_utils import get_tenant_database_alias
         from accounts.models import EmployerProfile
         
@@ -1162,27 +1236,94 @@ class EmployeeProfileCompletionSerializer(serializers.ModelSerializer):
             except EmployerProfile.DoesNotExist:
                 config = None
             
-            # Enforce configuration requirements when employee is completing profile
+            # Strictly enforce THIS employer's configuration requirements
+            # Fields marked as REQUIRED in config must be provided during profile completion
             if config:
-                validation_result = validate_employee_data(data, config)
+                # Merge existing instance data with update data for validation
+                merged_data = {
+                    'middle_name': data.get('middle_name', self.instance.middle_name),
+                    'profile_photo': data.get('profile_photo', self.instance.profile_photo),
+                    'gender': data.get('gender', self.instance.gender),
+                    'date_of_birth': data.get('date_of_birth', self.instance.date_of_birth),
+                    'marital_status': data.get('marital_status', self.instance.marital_status),
+                    'nationality': data.get('nationality', self.instance.nationality),
+                    'personal_email': data.get('personal_email', self.instance.personal_email),
+                    'alternative_phone': data.get('alternative_phone', self.instance.alternative_phone),
+                    'address': data.get('address', self.instance.address),
+                    'postal_code': data.get('postal_code', self.instance.postal_code),
+                    'national_id_number': data.get('national_id_number', self.instance.national_id_number),
+                    'passport': data.get('passport_number', self.instance.passport_number),
+                    'cnps_number': data.get('cnps_number', self.instance.cnps_number),
+                    'tax_number': data.get('tax_number', self.instance.tax_number),
+                    'phone_number': data.get('phone_number', self.instance.phone_number),
+                    'city': data.get('city', self.instance.city),
+                    'state_region': data.get('state_region', self.instance.state_region),
+                    'country': data.get('country', self.instance.country),
+                    'department': self.instance.department_id,
+                    'branch': self.instance.branch_id,
+                    'manager': self.instance.manager_id,
+                    'probation_end_date': self.instance.probation_end_date,
+                    'bank_account_number': data.get('bank_account_number', self.instance.bank_account_number),
+                    'bank_name': data.get('bank_name', self.instance.bank_name),
+                    'bank_account_name': data.get('bank_account_name', self.instance.bank_account_name),
+                    'emergency_contact_name': data.get('emergency_contact_name', self.instance.emergency_contact_name),
+                    'emergency_contact_phone': data.get('emergency_contact_phone', self.instance.emergency_contact_phone),
+                    'emergency_contact_relationship': data.get('emergency_contact_relationship', self.instance.emergency_contact_relationship),
+                    'employment_status': self.instance.employment_status,
+                }
+                
+                # Validate against this employer's specific requirements
+                validation_result = validate_employee_data_strict(merged_data, config)
                 if not validation_result['valid']:
-                    raise serializers.ValidationError(validation_result['errors'])
+                    # Raise validation error with employer-specific field requirements
+                    raise serializers.ValidationError({
+                        **validation_result['errors'],
+                        '_info': f'These fields are required by {employer.company_name}'
+                    })
         
         return data
     
     def update(self, instance, validated_data):
-        """Update employee profile, mark as completed, and sync to central EmployeeProfile"""
+        """Update employee profile, check completion state, and sync to central EmployeeRegistry"""
         from django.utils import timezone
         from django.contrib.auth import get_user_model
+        from employees.utils import check_missing_fields_against_config, get_or_create_employee_config
+        from accounts.database_utils import get_tenant_database_alias
+        from accounts.models import EmployerProfile
+        
         User = get_user_model()
         
         # Update all provided fields
         for attr, value in validated_data.items():
             setattr(instance, attr, value)
         
-        # Mark profile as completed
-        instance.profile_completed = True
-        instance.profile_completed_at = timezone.now()
+        # Re-validate profile completion state after update
+        try:
+            employer = EmployerProfile.objects.get(id=instance.employer_id)
+            tenant_db = get_tenant_database_alias(employer)
+            config = get_or_create_employee_config(instance.employer_id, tenant_db)
+            
+            # Check what fields are still missing after this update
+            validation_result = check_missing_fields_against_config(instance, config)
+            
+            # Update completion state
+            instance.profile_completion_state = validation_result['completion_state']
+            instance.profile_completion_required = validation_result['requires_update']
+            instance.missing_required_fields = validation_result['missing_critical']
+            instance.missing_optional_fields = validation_result['missing_non_critical']
+            
+            # Mark as completed if all requirements met
+            if validation_result['completion_state'] == 'COMPLETE':
+                instance.profile_completed = True
+                instance.profile_completed_at = timezone.now()
+            else:
+                instance.profile_completed = False
+                instance.profile_completed_at = None
+                
+        except EmployerProfile.DoesNotExist:
+            # Fallback: mark as completed if we can't validate
+            instance.profile_completed = True
+            instance.profile_completed_at = timezone.now()
         
         instance.save()
         
@@ -1192,12 +1333,36 @@ class EmployeeProfileCompletionSerializer(serializers.ModelSerializer):
             try:
                 user = User.objects.get(id=instance.user_id)
                 
-                # Update EmployeeRegistry if it exists
-                if hasattr(user, 'employee_registry'):
-                    employee_registry = user.employee_registry
-                    
+                # Update EmployeeRegistry if it exists, create if it doesn't
+                employee_registry, created = EmployeeRegistry.objects.get_or_create(
+                    user=user,
+                    defaults={
+                        'first_name': instance.first_name,
+                        'last_name': instance.last_name,
+                        'middle_name': instance.middle_name or '',
+                        'date_of_birth': instance.date_of_birth or timezone.now().date(),
+                        'gender': instance.gender or 'PREFER_NOT_TO_SAY',
+                        'marital_status': instance.marital_status or 'SINGLE',
+                        'nationality': instance.nationality or 'Unknown',
+                        'phone_number': instance.phone_number or '0000000000',
+                        'address': instance.address or 'Not Provided',
+                        'city': instance.city or 'Unknown',
+                        'state_region': instance.state_region or 'Unknown',
+                        'country': instance.country or 'Unknown',
+                        'emergency_contact_name': instance.emergency_contact_name or 'Not Provided',
+                        'emergency_contact_relationship': instance.emergency_contact_relationship or 'Unknown',
+                        'emergency_contact_phone': instance.emergency_contact_phone or '0000000000',
+                        'national_id_number': instance.national_id_number or '',
+                    }
+                )
+                
+                if not created:
+                    # Update existing registry
                     # Define field mapping (only update fields that were provided)
                     field_mapping = {
+                        'first_name': 'first_name',
+                        'last_name': 'last_name',
+                        'middle_name': 'middle_name',
                         'date_of_birth': 'date_of_birth',
                         'gender': 'gender',
                         'nationality': 'nationality',
@@ -1221,7 +1386,7 @@ class EmployeeProfileCompletionSerializer(serializers.ModelSerializer):
                     for employee_field, profile_field in field_mapping.items():
                         if employee_field in validated_data:
                             value = validated_data[employee_field]
-                            # Handle empty values for required fields in EmployeeProfile
+                            # Handle empty values for required fields in EmployeeRegistry
                             if value is None or value == '':
                                 if employee_field in ['date_of_birth']:
                                     continue  # Skip empty dates
@@ -1238,6 +1403,10 @@ class EmployeeProfileCompletionSerializer(serializers.ModelSerializer):
                                     value = 'Not Provided'
                             setattr(employee_registry, profile_field, value)
                     
+                    # Sync profile photo if updated
+                    if 'profile_photo' in validated_data and validated_data['profile_photo']:
+                        employee_registry.profile_picture = validated_data['profile_photo']
+                    
                     # Save to central database
                     employee_registry.save()
             except User.DoesNotExist:
@@ -1247,6 +1416,7 @@ class EmployeeProfileCompletionSerializer(serializers.ModelSerializer):
                 import logging
                 logger = logging.getLogger(__name__)
                 logger.error(f"Failed to sync EmployeeRegistry for employee {instance.id}: {str(e)}")
+        
         
         return instance
 

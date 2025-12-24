@@ -1,0 +1,44 @@
+Profile Completion Required - {{ company_name }}
+
+Dear {{ employee_name }},
+
+Welcome to {{ company_name }}! We're excited to have you on board.
+
+{% if is_blocking %}
+⚠️ ACTION REQUIRED - CRITICAL FIELDS MISSING
+Your profile is missing some critical required information. Please complete these fields as soon as possible to gain full access to the system.
+{% else %}
+📋 PROFILE UPDATE NEEDED
+To ensure your employee record is complete, please update your profile with the following information.
+{% endif %}
+
+{% if missing_critical %}
+🔴 CRITICAL REQUIRED FIELDS:
+{% for field in missing_critical_formatted %}
+  - {{ field }}
+{% endfor %}
+
+NOTE: These fields must be completed to gain full system access.
+{% endif %}
+
+{% if missing_non_critical %}
+🟡 ADDITIONAL REQUIRED FIELDS:
+{% for field in missing_non_critical_formatted %}
+  - {{ field }}
+{% endfor %}
+
+NOTE: While these fields are required for your profile to be complete, you can continue working while updating them.
+{% endif %}
+
+Completing your profile helps ensure accurate records and smooth operations within {{ company_name }}.
+
+To complete your profile, please visit:
+{{ completion_url }}
+
+If you have any questions or need assistance, please contact your HR department.
+
+Best regards,
+{{ company_name }} HR Team
+
+---
+This is an automated message from {{ company_name }}. Please do not reply to this email.

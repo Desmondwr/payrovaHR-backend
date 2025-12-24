@@ -430,6 +430,96 @@ def validate_employee_data(data, config):
     }
 
 
+def validate_employee_data_strict(data, config):
+    """
+    Strictly validate employee data against employer's specific configuration requirements.
+    Used during employee profile completion to enforce that employer's REQUIRED fields.
+    
+    This function ensures that fields marked as REQUIRED in the employer's configuration
+    are present and valid when an employee is completing their profile for that specific employer.
+    
+    Args:
+        data: Dictionary of employee data (merged current + update data)
+        config: EmployeeConfiguration instance for the specific employer
+    
+    Returns:
+        dict: {'valid': bool, 'errors': dict, 'employer_specific': True}
+    """
+    errors = {}
+    
+    # Map field names to their config attributes
+    field_config_map = {
+        'middle_name': 'require_middle_name',
+        'profile_photo': 'require_profile_photo',
+        'gender': 'require_gender',
+        'date_of_birth': 'require_date_of_birth',
+        'marital_status': 'require_marital_status',
+        'nationality': 'require_nationality',
+        'personal_email': 'require_personal_email',
+        'alternative_phone': 'require_alternative_phone',
+        'address': 'require_address',
+        'postal_code': 'require_postal_code',
+        'national_id_number': 'require_national_id',
+        'passport': 'require_passport',
+        'cnps_number': 'require_cnps_number',
+        'tax_number': 'require_tax_number',
+    }
+    
+    # Check each field against employer's configuration
+    for field_name, config_attr in field_config_map.items():
+        # Get the requirement level from config
+        requirement = getattr(config, config_attr, 'OPTIONAL')
+        
+        # If field is marked as REQUIRED, validate it's present
+        if requirement == config.FIELD_REQUIRED:
+            value = data.get(field_name)
+            
+            # Check if value is missing or empty
+            is_missing = (
+                value is None or 
+                value == '' or 
+                (isinstance(value, str) and value.strip() == '')
+            )
+            
+            if is_missing:
+                # Format field name for user-friendly error message
+                field_display = field_name.replace('_', ' ').title()
+                errors[field_name] = f"{field_display} is required by your employer"
+    
+    # Validate bank details if required by this employer
+    if config.require_bank_details == config.FIELD_REQUIRED:
+        if config.require_bank_details_active_only:
+            # Only require for active employees
+            if data.get('employment_status') == 'ACTIVE':
+                if not data.get('bank_account_number') or not data.get('bank_name'):
+                    if not data.get('bank_account_number'):
+                        errors['bank_account_number'] = "Bank account number is required for active employees"
+                    if not data.get('bank_name'):
+                        errors['bank_name'] = "Bank name is required for active employees"
+        else:
+            # Required for all employees
+            if not data.get('bank_account_number') or not data.get('bank_name'):
+                if not data.get('bank_account_number'):
+                    errors['bank_account_number'] = "Bank account number is required by your employer"
+                if not data.get('bank_name'):
+                    errors['bank_name'] = "Bank name is required by your employer"
+    
+    # Validate emergency contact if required by this employer
+    if config.require_emergency_contact == config.FIELD_REQUIRED:
+        if not data.get('emergency_contact_name'):
+            errors['emergency_contact_name'] = "Emergency contact name is required by your employer"
+        if not data.get('emergency_contact_phone'):
+            errors['emergency_contact_phone'] = "Emergency contact phone is required by your employer"
+        if not data.get('emergency_contact_relationship'):
+            errors['emergency_contact_relationship'] = "Emergency contact relationship is required by your employer"
+    
+    return {
+        'valid': len(errors) == 0,
+        'errors': errors,
+        'employer_specific': True  # Flag to indicate this is employer-specific validation
+    }
+
+
 def create_employee_audit_log(employee, action, performed_by, changes=None, notes=None, request=None, tenant_db=None):
     """Create an audit log entry for employee actions"""
     from employees.models import EmployeeAuditLog
@@ -525,3 +615,256 @@ def get_cross_institution_summary(employee, config):
         'count': records.count(),
         'records': summary
     }
+
+
+def check_missing_fields_against_config(employee_data, config):
+    """
+    Check which fields are missing from employee data based on employer configuration.
+    Distinguishes between critical (blocking) and non-critical (non-blocking) missing fields.
+    
+    Args:
+        employee_data: dict or Employee instance with employee data
+        config: EmployeeConfiguration instance
+    
+    Returns:
+        dict: {
+            'missing_critical': list of critical missing field names,
+            'missing_non_critical': list of non-critical missing field names,
+            'is_blocking': bool - whether critical fields are missing,
+            'completion_state': str - COMPLETE, INCOMPLETE_BLOCKING, or INCOMPLETE_NON_BLOCKING
+        }
+    """
+    from employees.models import Employee
+    
+    # Convert Employee instance to dict if needed
+    if isinstance(employee_data, Employee):
+        data = {
+            'middle_name': employee_data.middle_name,
+            'profile_photo': employee_data.profile_photo,
+            'gender': employee_data.gender,
+            'date_of_birth': employee_data.date_of_birth,
+            'marital_status': employee_data.marital_status,
+            'nationality': employee_data.nationality,
+            'personal_email': employee_data.personal_email,
+            'alternative_phone': employee_data.alternative_phone,
+            'address': employee_data.address,
+            'postal_code': employee_data.postal_code,
+            'national_id_number': employee_data.national_id_number,
+            'passport': employee_data.passport_number,
+            'cnps_number': employee_data.cnps_number,
+            'tax_number': employee_data.tax_number,
+            'phone_number': employee_data.phone_number,
+            'city': employee_data.city,
+            'state_region': employee_data.state_region,
+            'country': employee_data.country,
+            'department': employee_data.department_id,
+            'branch': employee_data.branch_id,
+            'manager': employee_data.manager_id,
+            'probation_end_date': employee_data.probation_end_date,
+            'bank_account_number': employee_data.bank_account_number,
+            'bank_name': employee_data.bank_name,
+            'bank_account_name': employee_data.bank_account_name,
+            'emergency_contact_name': employee_data.emergency_contact_name,
+            'emergency_contact_phone': employee_data.emergency_contact_phone,
+            'emergency_contact_relationship': employee_data.emergency_contact_relationship,
+            'employment_status': employee_data.employment_status,
+        }
+    else:
+        data = employee_data
+    
+    # Get critical fields from config (default to core identity fields if not set)
+    critical_fields_list = config.critical_fields if config.critical_fields else [
+        'national_id_number',
+        'date_of_birth',
+        'gender',
+        'nationality'
+    ]
+    
+    # Field mapping: field_name -> config attribute
+    field_config_map = {
+        'middle_name': 'require_middle_name',
+        'profile_photo': 'require_profile_photo',
+        'gender': 'require_gender',
+        'date_of_birth': 'require_date_of_birth',
+        'marital_status': 'require_marital_status',
+        'nationality': 'require_nationality',
+        'personal_email': 'require_personal_email',
+        'alternative_phone': 'require_alternative_phone',
+        'address': 'require_address',
+        'postal_code': 'require_postal_code',
+        'national_id_number': 'require_national_id',
+        'passport': 'require_passport',
+        'cnps_number': 'require_cnps_number',
+        'tax_number': 'require_tax_number',
+        'department': 'require_department',
+        'branch': 'require_branch',
+        'manager': 'require_manager',
+        'probation_end_date': 'require_probation_period',
+        'bank_details': 'require_bank_details',
+        'emergency_contact': 'require_emergency_contact',
+    }
+    
+    missing_critical = []
+    missing_non_critical = []
+    
+    for field_name, config_attr in field_config_map.items():
+        requirement = getattr(config, config_attr, 'OPTIONAL')
+        
+        # Skip if field is not required or is hidden
+        if requirement != config.FIELD_REQUIRED:
+            continue
+        
+        # Check if field has value
+        is_missing = False
+        
+        # Special handling for complex fields
+        if field_name == 'bank_details':
+            # Check if bank details are required
+            if config.require_bank_details_active_only and data.get('employment_status') != 'ACTIVE':
+                continue  # Not required for non-active employees
+            is_missing = not (data.get('bank_account_number') and data.get('bank_name'))
+        elif field_name == 'emergency_contact':
+            is_missing = not (data.get('emergency_contact_name') and data.get('emergency_contact_phone'))
+        else:
+            # Regular field check
+            value = data.get(field_name)
+            is_missing = value is None or value == '' or (isinstance(value, str) and value.strip() == '')
+        
+        if is_missing:
+            # Determine if this is a critical field
+            if field_name in critical_fields_list:
+                missing_critical.append(field_name)
+            else:
+                missing_non_critical.append(field_name)
+    
+    # Determine completion state
+    if missing_critical:
+        completion_state = 'INCOMPLETE_BLOCKING'
+        is_blocking = True
+    elif missing_non_critical:
+        completion_state = 'INCOMPLETE_NON_BLOCKING'
+        is_blocking = False
+    else:
+        completion_state = 'COMPLETE'
+        is_blocking = False
+    
+    return {
+        'missing_critical': missing_critical,
+        'missing_non_critical': missing_non_critical,
+        'is_blocking': is_blocking,
+        'completion_state': completion_state,
+        'requires_update': len(missing_critical) > 0 or len(missing_non_critical) > 0
+    }
+
+
+def validate_existing_employee_against_new_config(employee_registry, config):
+    """
+    Validate if an existing employee's data from EmployeeRegistry meets
+    a new employer's configuration requirements.
+    
+    Args:
+        employee_registry: EmployeeRegistry instance
+        config: EmployeeConfiguration instance for the new employer
+    
+    Returns:
+        dict: Same as check_missing_fields_against_config
+    """
+    # Convert EmployeeRegistry to data dict matching Employee field names
+    data = {
+        'middle_name': employee_registry.middle_name,
+        'profile_photo': employee_registry.profile_picture,  # Note: different field name
+        'gender': employee_registry.gender,
+        'date_of_birth': employee_registry.date_of_birth,
+        'marital_status': employee_registry.marital_status,
+        'nationality': employee_registry.nationality,
+        'personal_email': employee_registry.personal_email,
+        'alternative_phone': employee_registry.alternative_phone,
+        'address': employee_registry.address,
+        'postal_code': employee_registry.postal_code,
+        'national_id_number': employee_registry.national_id_number,
+        'passport': employee_registry.passport_number,
+        'phone_number': employee_registry.phone_number,
+        'city': employee_registry.city,
+        'state_region': employee_registry.state_region,
+        'country': employee_registry.country,
+        'emergency_contact_name': employee_registry.emergency_contact_name,
+        'emergency_contact_phone': employee_registry.emergency_contact_phone,
+        'emergency_contact_relationship': employee_registry.emergency_contact_relationship,
+        # These fields won't exist in registry, will be set by employer
+        'cnps_number': None,
+        'tax_number': None,
+        'department': None,
+        'branch': None,
+        'manager': None,
+        'probation_end_date': None,
+        'bank_account_number': None,
+        'bank_name': None,
+        'bank_account_name': None,
+        'employment_status': 'PENDING',  # Default for new hire
+    }
+    
+    return check_missing_fields_against_config(data, config)
+
+
+def send_profile_completion_notification(employee, missing_fields_info, employer, tenant_db=None):
+    """
+    Send email notification to employee about required profile completion.
+    
+    Args:
+        employee: Employee instance
+        missing_fields_info: dict from check_missing_fields_against_config
+        employer: EmployerProfile instance
+        tenant_db: tenant database alias
+    """
+    from django.core.mail import send_mail
+    from django.template.loader import render_to_string
+    from django.conf import settings
+    
+    if not employee.user_id:
+        return  # Can't send email if no user account exists
+    
+    from django.contrib.auth import get_user_model
+    User = get_user_model()
+    
+    try:
+        user = User.objects.get(id=employee.user_id)
+        email = user.email
+    except User.DoesNotExist:
+        return
+    
+    # Prepare context for email template
+    context = {
+        'employee_name': employee.full_name,
+        'company_name': employer.company_name,
+        'missing_critical': missing_fields_info.get('missing_critical', []),
+        'missing_non_critical': missing_fields_info.get('missing_non_critical', []),
+        'is_blocking': missing_fields_info.get('is_blocking', False),
+        'completion_url': f"{settings.FRONTEND_URL}/employee/profile/complete",
+    }
+    
+    # Format field names for display
+    def format_field_name(field):
+        return field.replace('_', ' ').title()
+    
+    context['missing_critical_formatted'] = [format_field_name(f) for f in context['missing_critical']]
+    context['missing_non_critical_formatted'] = [format_field_name(f) for f in context['missing_non_critical']]
+    
+    # Render email templates
+    subject = f"Profile Completion Required - {employer.company_name}"
+    html_message = render_to_string('emails/profile_completion_required.html', context)
+    plain_message = render_to_string('emails/profile_completion_required.txt', context)
+    
+    # Send email
+    try:
+        send_mail(
+            subject=subject,
+            message=plain_message,
+            from_email=settings.DEFAULT_FROM_EMAIL,
+            recipient_list=[email],
+            html_message=html_message,
+            fail_silently=False,
+        )
+    except Exception as e:
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.error(f"Failed to send profile completion email to {email}: {str(e)}")

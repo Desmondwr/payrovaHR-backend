@@ -87,6 +87,15 @@ class EmployeeConfiguration(models.Model):
     require_marital_status = models.CharField(max_length=20, choices=FIELD_REQUIREMENT_CHOICES, default=FIELD_OPTIONAL)
     require_nationality = models.CharField(max_length=20, choices=FIELD_REQUIREMENT_CHOICES, default=FIELD_REQUIRED)
     
+    # ===== Field Priority Configuration =====
+    # Define which required fields are CRITICAL (blocking) vs NON-CRITICAL (non-blocking)
+    # Critical fields will block access if missing, non-critical won't
+    critical_fields = models.JSONField(
+        default=list,
+        blank=True,
+        help_text='List of field names that are critical/blocking: ["national_id_number", "date_of_birth"]'
+    )
+    
     # Contact Information
     require_personal_email = models.CharField(max_length=20, choices=FIELD_REQUIREMENT_CHOICES, default=FIELD_OPTIONAL)
     require_alternative_phone = models.CharField(max_length=20, choices=FIELD_REQUIREMENT_CHOICES, default=FIELD_OPTIONAL)
@@ -460,8 +469,18 @@ class Employee(models.Model):
     is_concurrent_employment = models.BooleanField(default=False, help_text='Employee works for multiple institutions')
     
     # Profile Completion Tracking
+    PROFILE_COMPLETION_STATES = [
+        ('COMPLETE', 'Complete - All requirements met'),
+        ('INCOMPLETE_BLOCKING', 'Incomplete - Missing critical fields, limited access'),
+        ('INCOMPLETE_NON_BLOCKING', 'Incomplete - Missing optional fields, full access'),
+    ]
+    
     profile_completed = models.BooleanField(default=False, help_text='Whether employee has completed their profile')
     profile_completed_at = models.DateTimeField(null=True, blank=True, help_text='When employee completed their profile')
+    profile_completion_required = models.BooleanField(default=False, help_text='Whether employee needs to complete profile based on employer config')
+    profile_completion_state = models.CharField(max_length=30, choices=PROFILE_COMPLETION_STATES, default='INCOMPLETE_NON_BLOCKING', help_text='Current profile completion state')
+    missing_required_fields = models.JSONField(default=list, blank=True, help_text='List of missing required fields per employer config')
+    missing_optional_fields = models.JSONField(default=list, blank=True, help_text='List of missing optional fields per employer config')
     
     # Timestamps
     created_at = models.DateTimeField(auto_now_add=True)

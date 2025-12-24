@@ -209,6 +209,26 @@ class EmployeeViewSet(viewsets.ModelViewSet):
             tenant_db = getattr(employee, '_tenant_db', None)
             self._send_invitation(employee, tenant_db)
         
+        # Send profile completion notification if required
+        if getattr(employee, '_send_completion_notification', False):
+            from employees.utils import send_profile_completion_notification, check_missing_fields_against_config
+            from accounts.database_utils import get_tenant_database_alias
+            from employees.utils import get_or_create_employee_config
+            
+            tenant_db = getattr(employee, '_tenant_db', None)
+            if not tenant_db:
+                tenant_db = get_tenant_database_alias(request.user.employer_profile)
+            
+            config = get_or_create_employee_config(employee.employer_id, tenant_db)
+            missing_fields_info = check_missing_fields_against_config(employee, config)
+            
+            send_profile_completion_notification(
+                employee,
+                missing_fields_info,
+                request.user.employer_profile,
+                tenant_db
+            )
+        
         # Prepare response with duplicate info if available
         response_data = EmployeeDetailSerializer(employee).data
         
@@ -545,6 +565,10 @@ class EmployeeViewSet(viewsets.ModelViewSet):
         """Verify an existing employee and return prefill data for the creation form"""
         from accounts.models import EmployeeRegistry
         from accounts.database_utils import get_tenant_database_alias
+        from employees.utils import (
+            get_or_create_employee_config,
+            validate_existing_employee_against_new_config
+        )
         
         request_serializer = EmployeePrefillRequestSerializer(data=request.data)
         request_serializer.is_valid(raise_exception=True)
@@ -571,6 +595,12 @@ class EmployeeViewSet(viewsets.ModelViewSet):
             Q(user_id=match.user_id) | Q(national_id_number=match.national_id_number)
         ).first()
         
+        # Get employer configuration to validate existing data
+        config = get_or_create_employee_config(request.user.employer_profile.id, tenant_db)
+        
+        # Validate existing employee data against new employer's requirements
+        validation_result = validate_existing_employee_against_new_config(match, config)
+        
         prefill_data = {
             'user_id': match.user_id,
             'first_name': match.first_name,
@@ -593,12 +623,34 @@ class EmployeeViewSet(viewsets.ModelViewSet):
         
         prefill_serializer = EmployeePrefillSerializer(prefill_data)
         
-        return Response({
+        response_data = {
             'message': 'Existing employee verified. Prefill the form and choose hire details.',
             'prefill': prefill_serializer.data,
             'link_existing_user': match.user_id,
             'already_employed_here': bool(existing_here),
-        })
+            'profile_validation': {
+                'completion_state': validation_result['completion_state'],
+                'requires_update': validation_result['requires_update'],
+                'is_blocking': validation_result['is_blocking'],
+                'missing_critical_fields': validation_result['missing_critical'],
+                'missing_non_critical_fields': validation_result['missing_non_critical'],
+            }
+        }
+        
+        # Add warning message if fields are missing
+        if validation_result['requires_update']:
+            if validation_result['is_blocking']:
+                response_data['warning'] = (
+                    f"This employee is missing {len(validation_result['missing_critical'])} critical required field(s). "
+                    "They will have limited access until their profile is completed."
+                )
+            else:
+                response_data['info'] = (
+                    f"This employee is missing {len(validation_result['missing_non_critical'])} optional field(s). "
+                    "They will be notified to complete their profile."
+                )
+        
+        return Response(response_data)
 
 
 class EmployeeDocumentViewSet(viewsets.ModelViewSet):
@@ -853,6 +905,41 @@ class EmployeeInvitationViewSet(viewsets.ReadOnlyModelViewSet):
         employee.invitation_accepted_at = timezone.now()
         employee.save(using=tenant_db)
         
+        # Check and update profile completion state
+        from employees.utils import (
+            check_missing_fields_against_config,
+            get_or_create_employee_config,
+            send_profile_completion_notification
+        )
+        
+        config = get_or_create_employee_config(employee.employer_id, tenant_db)
+        validation_result = check_missing_fields_against_config(employee, config)
+        
+        # Update profile completion fields
+        employee.profile_completion_state = validation_result['completion_state']
+        employee.profile_completion_required = validation_result['requires_update']
+        employee.missing_required_fields = validation_result['missing_critical']
+        employee.missing_optional_fields = validation_result['missing_non_critical']
+        
+        if validation_result['completion_state'] == 'COMPLETE':
+            employee.profile_completed = True
+            employee.profile_completed_at = timezone.now()
+        
+        employee.save(using=tenant_db, update_fields=[
+            'profile_completion_state', 'profile_completion_required',
+            'missing_required_fields', 'missing_optional_fields',
+            'profile_completed', 'profile_completed_at'
+        ])
+        
+        # Send profile completion notification if needed
+        if validation_result['requires_update']:
+            send_profile_completion_notification(
+                employee,
+                validation_result,
+                employer_profile,
+                tenant_db
+            )
+        
         # Create audit log in tenant database
         create_employee_audit_log(
             employee=employee,
@@ -872,7 +959,14 @@ class EmployeeInvitationViewSet(viewsets.ReadOnlyModelViewSet):
             'employee_data': employee_data,
             'token': invitation_refresh.token,
             'user_id': user.id,
-            'email': user.email
+            'email': user.email,
+            'profile_completion': {
+                'required': validation_result['requires_update'],
+                'state': validation_result['completion_state'],
+                'is_blocking': validation_result['is_blocking'],
+                'missing_critical_fields': validation_result['missing_critical'],
+                'missing_non_critical_fields': validation_result['missing_non_critical'],
+            }
         }, status=status.HTTP_200_OK)
         
 
