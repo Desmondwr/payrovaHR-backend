@@ -1282,6 +1282,7 @@ class EmployeeProfileCompletionSerializer(serializers.ModelSerializer):
                     })
         
         return data
+        
     
     def update(self, instance, validated_data):
         """Update employee profile, check completion state, and sync to central EmployeeRegistry"""
