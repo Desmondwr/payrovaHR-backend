@@ -1,0 +1,27 @@
+Document Expiring Soon
+
+Hello {{ employee.first_name }},
+
+⚠️ IMPORTANT NOTICE
+One of your documents on file is expiring soon and needs to be renewed.
+
+Document Details:
+- Document: {{ document.title }}
+- Type: {{ document.document_type }}
+- Expiry Date: {{ expiry_date|date:"F d, Y" }}
+- Days Until Expiry: {{ days_until_expiry }}
+
+Please ensure you renew this document and upload the updated version to your profile as soon as possible.
+
+To upload the renewed document:
+1. Log in to the employee portal
+2. Navigate to Documents section
+3. Upload the new version of the document
+
+If you have any questions, please contact HR.
+
+Best regards,
+{{ employer.company_name }} HR Team
+
+---
+This is an automated reminder. Please do not reply to this message.

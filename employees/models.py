@@ -464,6 +464,7 @@ class Employee(models.Model):
     invitation_sent_at = models.DateTimeField(null=True, blank=True)
     invitation_accepted = models.BooleanField(default=False)
     invitation_accepted_at = models.DateTimeField(null=True, blank=True)
+    last_reminder_sent_at = models.DateTimeField(null=True, blank=True, help_text='Last time a reminder email was sent')
     
     # Flags
     is_concurrent_employment = models.BooleanField(default=False, help_text='Employee works for multiple institutions')
@@ -636,6 +637,9 @@ class EmployeeAuditLog(models.Model):
         ('INVITED', 'Invitation Sent'),
         ('LINKED', 'Linked to User Account'),
         ('CROSS_INSTITUTION_DETECTED', 'Cross-Institution Detected'),
+        ('TERMINATION_REQUESTED', 'Termination Requested'),
+        ('TERMINATION_APPROVED', 'Termination Approved'),
+        ('TERMINATION_REJECTED', 'Termination Rejected'),
     ]
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
@@ -686,6 +690,95 @@ class EmployeeInvitation(models.Model):
 
     def __str__(self):
         return f"Invitation for {self.employee.full_name} ({self.status})"
+    
+    def is_valid(self):
+        from django.utils import timezone
+        return self.status == 'PENDING' and timezone.now() < self.expires_at
+
+
+class TerminationApproval(models.Model):
+    """Track termination approval workflow"""
+    
+    STATUS_CHOICES = [
+        ('PENDING', 'Pending Approval'),
+        ('APPROVED', 'Approved'),
+        ('REJECTED', 'Rejected'),
+        ('CANCELLED', 'Cancelled'),
+    ]
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    employee = models.ForeignKey(Employee, on_delete=models.CASCADE, related_name='termination_approvals')
+    requested_by_id = models.IntegerField(db_index=True, help_text='ID of the user who requested termination')
+    termination_date = models.DateField()
+    termination_reason = models.TextField()
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='PENDING')
+    
+    # Approval tracking
+    requires_manager_approval = models.BooleanField(default=False)
+    manager_approved = models.BooleanField(default=False)
+    manager_approved_by_id = models.IntegerField(null=True, blank=True, db_index=True)
+    manager_approved_at = models.DateTimeField(null=True, blank=True)
+    
+    requires_hr_approval = models.BooleanField(default=False)
+    hr_approved = models.BooleanField(default=False)
+    hr_approved_by_id = models.IntegerField(null=True, blank=True, db_index=True)
+    hr_approved_at = models.DateTimeField(null=True, blank=True)
+    
+    rejection_reason = models.TextField(blank=True, null=True)
+    rejected_by_id = models.IntegerField(null=True, blank=True, db_index=True)
+    rejected_at = models.DateTimeField(null=True, blank=True)
+    
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    
+    class Meta:
+        db_table = 'termination_approvals'
+        verbose_name = 'Termination Approval'
+        verbose_name_plural = 'Termination Approvals'
+        ordering = ['-created_at']
+
+    def __str__(self):
+        return f"Termination Request for {self.employee.full_name} ({self.status})"
+    
+    def is_fully_approved(self):
+        """Check if all required approvals are obtained"""
+        if self.requires_manager_approval and not self.manager_approved:
+            return False
+        if self.requires_hr_approval and not self.hr_approved:
+            return False
+        return True
+
+
+class CrossInstitutionConsent(models.Model):
+    """Track employee consent for cross-institution employment"""
+    
+    STATUS_CHOICES = [
+        ('PENDING', 'Pending Consent'),
+        ('APPROVED', 'Approved'),
+        ('REJECTED', 'Rejected'),
+    ]
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    employee_registry_id = models.IntegerField(db_index=True, help_text='EmployeeRegistry ID from main database')
+    source_employer_id = models.IntegerField(db_index=True, help_text='Current employer ID')
+    target_employer_id = models.IntegerField(db_index=True, help_text='New employer requesting to link')
+    target_employer_name = models.CharField(max_length=255)
+    
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='PENDING')
+    consent_token = models.CharField(max_length=100, unique=True, db_index=True)
+    requested_at = models.DateTimeField(auto_now_add=True)
+    expires_at = models.DateTimeField()
+    responded_at = models.DateTimeField(null=True, blank=True)
+    notes = models.TextField(blank=True, null=True)
+    
+    class Meta:
+        db_table = 'cross_institution_consents'
+        verbose_name = 'Cross-Institution Consent'
+        verbose_name_plural = 'Cross-Institution Consents'
+        ordering = ['-requested_at']
+
+    def __str__(self):
+        return f"Consent Request: {self.target_employer_name} ({self.status})"
     
     def is_valid(self):
         from django.utils import timezone

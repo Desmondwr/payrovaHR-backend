@@ -1,0 +1,28 @@
+Welcome to {{ employer.company_name }}!
+
+Hello {{ employee.first_name }},
+
+Welcome aboard! We're excited to have you join our team at {{ employer.company_name }}.
+
+Your account has been successfully created and you now have access to our employee portal.
+
+Your Details:
+- Employee ID: {{ employee.employee_id }}
+- Position: {{ employee.job_title }}
+- Email: {{ employee.email }}
+
+You can log in to the employee portal to:
+- Complete your profile information
+- View your employment details
+- Upload required documents
+- Update your personal information
+
+Login URL: {{ login_url }}
+
+If you have any questions, please don't hesitate to reach out to HR.
+
+Best regards,
+{{ employer.company_name }} HR Team
+
+---
+This is an automated email. Please do not reply to this message.

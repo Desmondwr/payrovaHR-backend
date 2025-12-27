@@ -2,7 +2,7 @@ from django.contrib import admin
 from .models import (
     Department, Branch, Employee, EmployeeDocument,
     EmployeeCrossInstitutionRecord, EmployeeAuditLog, EmployeeInvitation,
-    EmployeeConfiguration
+    EmployeeConfiguration, TerminationApproval, CrossInstitutionConsent
 )
 
 
@@ -173,3 +173,40 @@ class EmployeeInvitationAdmin(admin.ModelAdmin):
     search_fields = ['employee__first_name', 'employee__last_name', 'email']
     readonly_fields = ['id', 'token', 'sent_at', 'accepted_at']
     ordering = ['-sent_at']
+
+
+@admin.register(TerminationApproval)
+class TerminationApprovalAdmin(admin.ModelAdmin):
+    list_display = ['employee', 'status', 'termination_date', 'requires_manager_approval', 'requires_hr_approval', 'created_at']
+    list_filter = ['status', 'requires_manager_approval', 'requires_hr_approval', 'created_at']
+    search_fields = ['employee__first_name', 'employee__last_name', 'termination_reason']
+    readonly_fields = ['id', 'created_at', 'updated_at']
+    ordering = ['-created_at']
+    
+    fieldsets = (
+        ('Request Details', {
+            'fields': ('id', 'employee', 'requested_by_id', 'termination_date', 'termination_reason', 'status')
+        }),
+        ('Manager Approval', {
+            'fields': ('requires_manager_approval', 'manager_approved', 'manager_approved_by_id', 'manager_approved_at')
+        }),
+        ('HR Approval', {
+            'fields': ('requires_hr_approval', 'hr_approved', 'hr_approved_by_id', 'hr_approved_at')
+        }),
+        ('Rejection', {
+            'fields': ('rejection_reason', 'rejected_by_id', 'rejected_at')
+        }),
+        ('Timestamps', {
+            'fields': ('created_at', 'updated_at')
+        }),
+    )
+
+
+@admin.register(CrossInstitutionConsent)
+class CrossInstitutionConsentAdmin(admin.ModelAdmin):
+    list_display = ['employee_registry_id', 'target_employer_name', 'status', 'requested_at', 'responded_at']
+    list_filter = ['status', 'requested_at']
+    search_fields = ['target_employer_name', 'consent_token']
+    readonly_fields = ['id', 'consent_token', 'requested_at']
+    ordering = ['-requested_at']
+

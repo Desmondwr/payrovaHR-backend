@@ -1,0 +1,81 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            line-height: 1.6;
+            color: #333;
+        }
+        .container {
+            max-width: 600px;
+            margin: 0 auto;
+            padding: 20px;
+        }
+        .header {
+            background-color: #2196F3;
+            color: white;
+            padding: 20px;
+            text-align: center;
+        }
+        .content {
+            padding: 20px;
+            background-color: #f9f9f9;
+        }
+        .info-box {
+            background-color: #e3f2fd;
+            border-left: 4px solid #2196F3;
+            padding: 15px;
+            margin: 20px 0;
+        }
+        .footer {
+            margin-top: 20px;
+            padding: 20px;
+            text-align: center;
+            font-size: 12px;
+            color: #666;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>Probation Period Ending Soon</h1>
+        </div>
+        <div class="content">
+            <p>Hello {{ employee.first_name }},</p>
+            
+            <div class="info-box">
+                <p><strong>📋 Important Milestone</strong></p>
+                <p>Your probation period is coming to an end soon.</p>
+            </div>
+            
+            <p><strong>Probation Details:</strong></p>
+            <ul>
+                <li>Probation End Date: {{ probation_end_date|date:"F d, Y" }}</li>
+                <li>Days Remaining: {{ days_until_end }}</li>
+                <li>Position: {{ employee.job_title }}</li>
+            </ul>
+            
+            <p>As your probation period concludes, your manager will be conducting a performance review to discuss:</p>
+            <ul>
+                <li>Your achievements and contributions</li>
+                <li>Areas of strength</li>
+                <li>Future development opportunities</li>
+                <li>Confirmation of your permanent employment</li>
+            </ul>
+            
+            <p>Please prepare for this review by reflecting on your experiences and any questions you may have about your role or the company.</p>
+            
+            <p>If you have any questions about the probation review process, please contact your manager or HR.</p>
+            
+            <p>Best regards,<br>
+            {{ employer.company_name }} HR Team</p>
+        </div>
+        <div class="footer">
+            <p>This is an automated reminder. Please do not reply to this message.</p>
+        </div>
+    </div>
+</body>
+</html>

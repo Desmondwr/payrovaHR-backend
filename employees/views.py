@@ -330,7 +330,7 @@ class EmployeeViewSet(viewsets.ModelViewSet):
     
     @action(detail=True, methods=['post'])
     def terminate(self, request, pk=None):
-        """Terminate an employee"""
+        """Request or execute employee termination (with approval workflow if required)"""
         employee = self.get_object()
         
         # Check if already terminated
@@ -343,25 +343,59 @@ class EmployeeViewSet(viewsets.ModelViewSet):
         serializer = TerminateEmployeeSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         
-        # Get tenant database
+        # Get tenant database and config
         from accounts.database_utils import get_tenant_database_alias
+        from employees.utils import get_or_create_employee_config, create_termination_approval_request, revoke_employee_access
+        
         employer = request.user.employer_profile
         tenant_db = get_tenant_database_alias(employer)
+        config = get_or_create_employee_config(employer.id, tenant_db)
         
+        # Check if approval is required
+        if config.termination_approval_required:
+            # Create approval request instead of terminating directly
+            approval = create_termination_approval_request(
+                employee=employee,
+                requested_by=request.user,
+                termination_date=serializer.validated_data['termination_date'],
+                termination_reason=serializer.validated_data['termination_reason'],
+                config=config,
+                tenant_db=tenant_db
+            )
+            
+            # Create audit log
+            create_employee_audit_log(
+                employee=employee,
+                action='TERMINATION_REQUESTED',
+                performed_by=request.user,
+                changes={
+                    'termination_date': str(serializer.validated_data['termination_date']),
+                    'termination_reason': serializer.validated_data['termination_reason']
+                },
+                notes='Termination approval requested',
+                request=request,
+                tenant_db=tenant_db
+            )
+            
+            from .serializers import TerminationApprovalSerializer
+            return Response({
+                'message': 'Termination request submitted for approval',
+                'approval_required': True,
+                'approval': TerminationApprovalSerializer(approval).data
+            }, status=status.HTTP_201_CREATED)
+        
+        # No approval required - terminate immediately
         # Validate foreign key references before saving
-        # If branch_id exists but the branch doesn't exist in the database, set it to None
         if employee.branch_id:
             branch_exists = Branch.objects.using(tenant_db).filter(id=employee.branch_id).exists()
             if not branch_exists:
                 employee.branch_id = None
         
-        # If department_id exists but the department doesn't exist in the database, set it to None
         if employee.department_id:
             dept_exists = Department.objects.using(tenant_db).filter(id=employee.department_id).exists()
             if not dept_exists:
                 employee.department_id = None
         
-        # If manager_id exists but the manager doesn't exist in the database, set it to None
         if employee.manager_id:
             manager_exists = Employee.objects.using(tenant_db).filter(id=employee.manager_id).exists()
             if not manager_exists:
@@ -382,30 +416,13 @@ class EmployeeViewSet(viewsets.ModelViewSet):
                 'termination_date': str(employee.termination_date),
                 'termination_reason': employee.termination_reason
             },
-            notes='Employee terminated',
+            notes='Employee terminated (no approval required)',
             request=request,
             tenant_db=tenant_db
         )
         
         # Revoke system access based on configuration
-        try:
-            from accounts.database_utils import get_tenant_database_alias
-            employer = request.user.employer_profile
-            tenant_db = get_tenant_database_alias(employer)
-            from employees.utils import get_or_create_employee_config
-            config = get_or_create_employee_config(employee.employer_id, tenant_db)
-            if config.termination_revoke_access_timing == 'IMMEDIATE' and employee.user_id:
-                # Update user in main database
-                from django.contrib.auth import get_user_model
-                User = get_user_model()
-                user = User.objects.get(id=employee.user_id)
-                user.is_active = False
-                user.save()
-        except Exception as e:
-            # Log but don't fail the termination
-            import logging
-            logger = logging.getLogger(__name__)
-            logger.error(f"Error revoking access during termination: {str(e)}")
+        revoke_employee_access(employee, config, tenant_db)
         
         return Response(
             EmployeeDetailSerializer(employee).data,
@@ -536,6 +553,144 @@ class EmployeeViewSet(viewsets.ModelViewSet):
         logs = employee.audit_logs.all()[:50]  # Last 50 entries
         serializer = EmployeeAuditLogSerializer(logs, many=True)
         return Response(serializer.data)
+    
+    @action(detail=True, methods=['get'])
+    def termination_approvals(self, request, pk=None):
+        """Get termination approval requests for an employee"""
+        from employees.models import TerminationApproval
+        from employees.serializers import TerminationApprovalSerializer
+        from accounts.database_utils import get_tenant_database_alias
+        
+        employee = self.get_object()
+        employer = request.user.employer_profile
+        tenant_db = get_tenant_database_alias(employer)
+        
+        approvals = TerminationApproval.objects.using(tenant_db).filter(
+            employee=employee
+        ).order_by('-created_at')
+        
+        serializer = TerminationApprovalSerializer(approvals, many=True)
+        return Response(serializer.data)
+    
+    @action(detail=False, methods=['get', 'post'], url_path='pending-approvals')
+    def pending_approvals(self, request):
+        """Get or approve pending termination requests"""
+        from employees.models import TerminationApproval
+        from employees.serializers import TerminationApprovalSerializer, ApproveTerminationSerializer, RejectTerminationSerializer
+        from accounts.database_utils import get_tenant_database_alias
+        from django.utils import timezone
+        
+        employer = request.user.employer_profile
+        tenant_db = get_tenant_database_alias(employer)
+        
+        if request.method == 'GET':
+            # Get all pending approvals for this employer
+            approvals = TerminationApproval.objects.using(tenant_db).filter(
+                status='PENDING'
+            ).select_related('employee')
+            
+            serializer = TerminationApprovalSerializer(approvals, many=True)
+            return Response(serializer.data)
+        
+        # POST - approve a specific request
+        approval_id = request.data.get('approval_id')
+        if not approval_id:
+            return Response({'error': 'approval_id is required'}, status=status.HTTP_400_BAD_REQUEST)
+        
+        try:
+            approval = TerminationApproval.objects.using(tenant_db).get(id=approval_id)
+        except TerminationApproval.DoesNotExist:
+            return Response({'error': 'Approval request not found'}, status=status.HTTP_404_NOT_FOUND)
+        
+        # Check if already processed
+        if approval.status != 'PENDING':
+            return Response({'error': f'Request already {approval.status.lower()}'}, status=status.HTTP_400_BAD_REQUEST)
+        
+        # Determine action
+        action = request.data.get('action')  # 'approve' or 'reject'
+        
+        if action == 'approve':
+            serializer = ApproveTerminationSerializer(data=request.data)
+            serializer.is_valid(raise_exception=True)
+            
+            approval_type = serializer.validated_data['approval_type']
+            
+            # Update approval based on type
+            if approval_type == 'manager' and approval.requires_manager_approval:
+                approval.manager_approved = True
+                approval.manager_approved_by_id = request.user.id
+                approval.manager_approved_at = timezone.now()
+            elif approval_type == 'hr' and approval.requires_hr_approval:
+                approval.hr_approved = True
+                approval.hr_approved_by_id = request.user.id
+                approval.hr_approved_at = timezone.now()
+            else:
+                return Response({'error': 'Invalid approval type for this request'}, status=status.HTTP_400_BAD_REQUEST)
+            
+            # Check if fully approved
+            if approval.is_fully_approved():
+                approval.status = 'APPROVED'
+                
+                # Execute termination
+                employee = approval.employee
+                employee.employment_status = 'TERMINATED'
+                employee.termination_date = approval.termination_date
+                employee.termination_reason = approval.termination_reason
+                employee.save(using=tenant_db)
+                
+                # Revoke access
+                from employees.utils import get_or_create_employee_config, revoke_employee_access
+                config = get_or_create_employee_config(employer.id, tenant_db)
+                revoke_employee_access(employee, config, tenant_db)
+                
+                # Create audit log
+                create_employee_audit_log(
+                    employee=employee,
+                    action='TERMINATED',
+                    performed_by=request.user,
+                    changes={
+                        'termination_date': str(employee.termination_date),
+                        'termination_reason': employee.termination_reason
+                    },
+                    notes='Employee terminated (approved)',
+                    request=request,
+                    tenant_db=tenant_db
+                )
+            
+            approval.save(using=tenant_db)
+            
+            return Response({
+                'message': 'Approval recorded',
+                'fully_approved': approval.is_fully_approved(),
+                'approval': TerminationApprovalSerializer(approval).data
+            })
+        
+        elif action == 'reject':
+            serializer = RejectTerminationSerializer(data=request.data)
+            serializer.is_valid(raise_exception=True)
+            
+            approval.status = 'REJECTED'
+            approval.rejection_reason = serializer.validated_data['rejection_reason']
+            approval.rejected_by_id = request.user.id
+            approval.rejected_at = timezone.now()
+            approval.save(using=tenant_db)
+            
+            # Create audit log
+            create_employee_audit_log(
+                employee=approval.employee,
+                action='TERMINATION_REJECTED',
+                performed_by=request.user,
+                notes=f'Termination request rejected: {approval.rejection_reason}',
+                request=request,
+                tenant_db=tenant_db
+            )
+            
+            return Response({
+                'message': 'Termination request rejected',
+                'approval': TerminationApprovalSerializer(approval).data
+            })
+        
+        return Response({'error': 'Invalid action'}, status=status.HTTP_400_BAD_REQUEST)
     
     @action(detail=False, methods=['post'])
     def detect_duplicates(self, request):
@@ -939,6 +1094,11 @@ class EmployeeInvitationViewSet(viewsets.ReadOnlyModelViewSet):
                 employer_profile,
                 tenant_db
             )
+        
+        # Send welcome email if configured
+        if config.send_welcome_email:
+            from employees.utils import send_welcome_email
+            send_welcome_email(employee, employer_profile)
         
         # Create audit log in tenant database
         create_employee_audit_log(

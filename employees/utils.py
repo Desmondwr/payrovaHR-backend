@@ -868,3 +868,258 @@ def send_profile_completion_notification(employee, missing_fields_info, employer
         import logging
         logger = logging.getLogger(__name__)
         logger.error(f"Failed to send profile completion email to {email}: {str(e)}")
+
+
+def send_welcome_email(employee, employer):
+    """Send welcome email to employee after accepting invitation"""
+    from django.core.mail import send_mail
+    from django.conf import settings
+    from django.template.loader import render_to_string
+    
+    context = {
+        'employee': employee,
+        'employer': employer,
+        'login_url': f"{settings.FRONTEND_URL}/login",
+    }
+    
+    subject = f"Welcome to {employer.company_name}"
+    html_message = render_to_string('emails/welcome_email.html', context)
+    text_message = render_to_string('emails/welcome_email.txt', context)
+    
+    try:
+        send_mail(
+            subject=subject,
+            message=text_message,
+            from_email=settings.DEFAULT_FROM_EMAIL,
+            recipient_list=[employee.email or employee.personal_email],
+            html_message=html_message,
+            fail_silently=False,
+        )
+    except Exception as e:
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.error(f"Failed to send welcome email to {employee.email}: {str(e)}")
+
+
+def send_document_expiry_reminder(employee, document, employer, days_until_expiry):
+    """Send reminder email for expiring document"""
+    from django.core.mail import send_mail
+    from django.conf import settings
+    from django.template.loader import render_to_string
+    
+    context = {
+        'employee': employee,
+        'employer': employer,
+        'document': document,
+        'days_until_expiry': days_until_expiry,
+        'expiry_date': document.expiry_date,
+    }
+    
+    subject = f"Document Expiring Soon - {document.title}"
+    html_message = render_to_string('emails/document_expiry_reminder.html', context)
+    text_message = render_to_string('emails/document_expiry_reminder.txt', context)
+    
+    try:
+        send_mail(
+            subject=subject,
+            message=text_message,
+            from_email=settings.DEFAULT_FROM_EMAIL,
+            recipient_list=[employee.email or employee.personal_email],
+            html_message=html_message,
+            fail_silently=False,
+        )
+    except Exception as e:
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.error(f"Failed to send document expiry reminder to {employee.email}: {str(e)}")
+
+
+def send_probation_ending_reminder(employee, employer, days_until_end):
+    """Send reminder email for probation period ending"""
+    from django.core.mail import send_mail
+    from django.conf import settings
+    from django.template.loader import render_to_string
+    
+    context = {
+        'employee': employee,
+        'employer': employer,
+        'days_until_end': days_until_end,
+        'probation_end_date': employee.probation_end_date,
+    }
+    
+    subject = f"Probation Period Ending Soon - {employer.company_name}"
+    html_message = render_to_string('emails/probation_ending_reminder.html', context)
+    text_message = render_to_string('emails/probation_ending_reminder.txt', context)
+    
+    try:
+        send_mail(
+            subject=subject,
+            message=text_message,
+            from_email=settings.DEFAULT_FROM_EMAIL,
+            recipient_list=[employee.email or employee.personal_email],
+            html_message=html_message,
+            fail_silently=False,
+        )
+    except Exception as e:
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.error(f"Failed to send probation ending reminder to {employee.email}: {str(e)}")
+
+
+def generate_consent_token():
+    """Generate a secure random token for consent requests"""
+    import secrets
+    return secrets.token_urlsafe(32)
+
+
+def check_concurrent_employment(employee_registry_id, new_employer_id, config):
+    """
+    Check if concurrent employment is allowed when linking employee to new employer
+    
+    Args:
+        employee_registry_id: EmployeeRegistry ID
+        new_employer_id: New employer ID to link to
+        config: EmployeeConfiguration for the new employer
+        
+    Returns:
+        dict: {'allowed': bool, 'reason': str, 'existing_employers': list}
+    """
+    from accounts.models import EmployerProfile
+    from employees.models import Employee
+    from accounts.database_utils import get_tenant_database_alias
+    
+    existing_employers = []
+    
+    # Search all tenant databases for this employee
+    all_employers = EmployerProfile.objects.filter(user__is_active=True)
+    
+    for employer in all_employers:
+        if employer.id == new_employer_id:
+            continue
+            
+        try:
+            tenant_db = get_tenant_database_alias(employer)
+            # Check if employee exists in this tenant and is active
+            active_employee = Employee.objects.using(tenant_db).filter(
+                user_id__isnull=False,
+                employment_status='ACTIVE'
+            ).first()
+            
+            if active_employee:
+                # Get user_id from EmployeeRegistry
+                from accounts.models import EmployeeRegistry
+                try:
+                    registry = EmployeeRegistry.objects.get(id=employee_registry_id)
+                    if active_employee.user_id == registry.user_id:
+                        existing_employers.append({
+                            'employer_id': employer.id,
+                            'employer_name': employer.company_name,
+                            'employee_id': active_employee.employee_id,
+                            'hire_date': active_employee.hire_date,
+                        })
+                except EmployeeRegistry.DoesNotExist:
+                    pass
+        except Exception:
+            continue
+    
+    # If there are existing active employments
+    if existing_employers:
+        if not config.allow_concurrent_employment:
+            return {
+                'allowed': False,
+                'reason': 'Concurrent employment is not allowed by this employer',
+                'existing_employers': existing_employers
+            }
+        else:
+            return {
+                'allowed': True,
+                'reason': 'Concurrent employment allowed',
+                'existing_employers': existing_employers,
+                'requires_consent': config.require_employee_consent_cross_institution
+            }
+    
+    # No existing employments found
+    return {
+        'allowed': True,
+        'reason': 'No concurrent employment detected',
+        'existing_employers': []
+    }
+
+
+def create_termination_approval_request(employee, requested_by, termination_date, termination_reason, config, tenant_db):
+    """
+    Create a termination approval request based on configuration
+    
+    Args:
+        employee: Employee instance
+        requested_by: User who requested termination
+        termination_date: Proposed termination date
+        termination_reason: Reason for termination
+        config: EmployeeConfiguration instance
+        tenant_db: Database alias
+        
+    Returns:
+        TerminationApproval instance or None if approval not required
+    """
+    from employees.models import TerminationApproval
+    from django.utils import timezone
+    
+    if not config.termination_approval_required:
+        return None
+    
+    # Determine what approvals are needed
+    requires_manager = config.termination_approval_by in ['MANAGER', 'BOTH']
+    requires_hr = config.termination_approval_by in ['HR', 'BOTH']
+    
+    # Create approval request in tenant database
+    approval = TerminationApproval.objects.using(tenant_db).create(
+        employee=employee,
+        requested_by_id=requested_by.id,
+        termination_date=termination_date,
+        termination_reason=termination_reason,
+        requires_manager_approval=requires_manager,
+        requires_hr_approval=requires_hr,
+        status='PENDING'
+    )
+    
+    return approval
+
+
+def revoke_employee_access(employee, config, tenant_db):
+    """
+    Revoke employee system access based on termination configuration
+    
+    Args:
+        employee: Employee instance
+        config: EmployeeConfiguration instance
+        tenant_db: Database alias
+    """
+    from django.utils import timezone
+    from datetime import timedelta
+    
+    if not employee.user_id:
+        return  # No user account to revoke
+    
+    timing = config.termination_revoke_access_timing
+    
+    if timing == 'IMMEDIATE':
+        # Revoke immediately
+        from django.contrib.auth import get_user_model
+        User = get_user_model()
+        try:
+            user = User.objects.get(id=employee.user_id)
+            user.is_active = False
+            user.save()
+        except User.DoesNotExist:
+            pass
+    
+    elif timing == 'ON_DATE':
+        # Will be revoked on termination date (handled by scheduled task)
+        pass
+    
+    elif timing == 'CUSTOM':
+        # Calculate revoke date
+        delay_days = config.termination_access_delay_days or 0
+        # Will be revoked after delay (handled by scheduled task)
+        pass
+

@@ -1,0 +1,27 @@
+Probation Period Ending Soon
+
+Hello {{ employee.first_name }},
+
+📋 IMPORTANT MILESTONE
+Your probation period is coming to an end soon.
+
+Probation Details:
+- Probation End Date: {{ probation_end_date|date:"F d, Y" }}
+- Days Remaining: {{ days_until_end }}
+- Position: {{ employee.job_title }}
+
+As your probation period concludes, your manager will be conducting a performance review to discuss:
+- Your achievements and contributions
+- Areas of strength
+- Future development opportunities
+- Confirmation of your permanent employment
+
+Please prepare for this review by reflecting on your experiences and any questions you may have about your role or the company.
+
+If you have any questions about the probation review process, please contact your manager or HR.
+
+Best regards,
+{{ employer.company_name }} HR Team
+
+---
+This is an automated reminder. Please do not reply to this message.

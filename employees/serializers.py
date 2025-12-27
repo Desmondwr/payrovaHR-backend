@@ -3,7 +3,7 @@ from django.contrib.auth import get_user_model
 from .models import (
     Department, Branch, Employee, EmployeeDocument,
     EmployeeCrossInstitutionRecord, EmployeeAuditLog, EmployeeInvitation,
-    EmployeeConfiguration
+    EmployeeConfiguration, TerminationApproval, CrossInstitutionConsent
 )
 from accounts.models import EmployerProfile
 
@@ -581,6 +581,45 @@ class EmployeeDocumentSerializer(serializers.ModelSerializer):
             'uploaded_by_name', 'uploaded_at'
         ]
         read_only_fields = ['id', 'uploaded_by', 'uploaded_at', 'file_size']
+    
+    def validate_file(self, value):
+        """Validate file size and format based on employer configuration"""
+        request = self.context.get('request')
+        if not request or not hasattr(request.user, 'employer_profile'):
+            return value
+        
+        # Get employer configuration
+        from accounts.database_utils import get_tenant_database_alias
+        from employees.utils import get_or_create_employee_config
+        
+        employer = request.user.employer_profile
+        tenant_db = get_tenant_database_alias(employer)
+        config = get_or_create_employee_config(employer.id, tenant_db)
+        
+        # Validate file size
+        max_size_mb = config.document_max_file_size_mb
+        if value.size > max_size_mb * 1024 * 1024:
+            raise serializers.ValidationError(
+                f"File size exceeds maximum allowed size of {max_size_mb}MB. "
+                f"Your file is {value.size / (1024 * 1024):.2f}MB."
+            )
+        
+        # Validate file format
+        if config.document_allowed_formats:
+            allowed_formats = config.document_allowed_formats
+            if isinstance(allowed_formats, str):
+                import json
+                allowed_formats = json.loads(allowed_formats)
+            
+            if allowed_formats:
+                file_extension = value.name.split('.')[-1].lower()
+                if file_extension not in [fmt.lower() for fmt in allowed_formats]:
+                    raise serializers.ValidationError(
+                        f"File format '.{file_extension}' is not allowed. "
+                        f"Allowed formats: {', '.join(allowed_formats)}"
+                    )
+        
+        return value
 
 
 class CrossInstitutionRecordSerializer(serializers.ModelSerializer):
@@ -899,7 +938,7 @@ class CreateEmployeeWithDetectionSerializer(serializers.ModelSerializer):
     
     def validate(self, data):
         """Validate employee data against configuration"""
-        from employees.utils import validate_employee_data, detect_duplicate_employees, get_or_create_employee_config
+        from employees.utils import validate_employee_data, detect_duplicate_employees, get_or_create_employee_config, check_concurrent_employment
         from accounts.database_utils import get_tenant_database_alias
         
         request = self.context['request']
@@ -913,6 +952,32 @@ class CreateEmployeeWithDetectionSerializer(serializers.ModelSerializer):
         # The configuration requirements apply when employees complete their own profiles,
         # not when employers are creating initial employee records
         # Employers only need to provide minimal fields: first_name, last_name, email, job_title, etc.
+        
+        # Check for concurrent employment if linking existing user
+        link_existing_user = data.get('link_existing_user')
+        acknowledge_cross_institution = data.get('acknowledge_cross_institution', False)
+        
+        if link_existing_user:
+            from accounts.models import EmployeeRegistry
+            try:
+                registry = EmployeeRegistry.objects.get(user_id=link_existing_user)
+                concurrent_check = check_concurrent_employment(registry.id, employer.id, config)
+                
+                if not concurrent_check['allowed']:
+                    raise serializers.ValidationError({
+                        'concurrent_employment': concurrent_check['reason'],
+                        'existing_employers': concurrent_check['existing_employers']
+                    })
+                
+                # If consent required and not acknowledged
+                if concurrent_check.get('requires_consent') and not acknowledge_cross_institution:
+                    raise serializers.ValidationError({
+                        'consent_required': 'Employee consent is required for cross-institution employment. Please set acknowledge_cross_institution=true after obtaining consent.',
+                        'existing_employers': concurrent_check['existing_employers']
+                    })
+                
+            except EmployeeRegistry.DoesNotExist:
+                pass  # No registry, no concurrent employment check needed
         
         # Detect duplicates
         force_create = data.get('force_create', False)
@@ -1454,4 +1519,94 @@ class EmployeeSelfProfileSerializer(serializers.ModelSerializer):
             return employer.company_name
         except EmployerProfile.DoesNotExist:
             return None
+
+
+class TerminationApprovalSerializer(serializers.ModelSerializer):
+    """Serializer for Termination Approval"""
+    
+    employee_name = serializers.CharField(source='employee.full_name', read_only=True)
+    requested_by_email = serializers.SerializerMethodField()
+    approval_status = serializers.SerializerMethodField()
+    
+    class Meta:
+        model = TerminationApproval
+        fields = [
+            'id', 'employee', 'employee_name', 'requested_by_id', 'requested_by_email',
+            'termination_date', 'termination_reason', 'status', 'approval_status',
+            'requires_manager_approval', 'manager_approved', 'manager_approved_by_id', 'manager_approved_at',
+            'requires_hr_approval', 'hr_approved', 'hr_approved_by_id', 'hr_approved_at',
+            'rejection_reason', 'rejected_by_id', 'rejected_at',
+            'created_at', 'updated_at'
+        ]
+        read_only_fields = ['id', 'created_at', 'updated_at', 'status']
+    
+    def get_requested_by_email(self, obj):
+        try:
+            user = User.objects.get(id=obj.requested_by_id)
+            return user.email
+        except User.DoesNotExist:
+            return None
+    
+    def get_approval_status(self, obj):
+        """Get detailed approval status"""
+        status = {
+            'fully_approved': obj.is_fully_approved(),
+            'pending_approvals': []
+        }
+        
+        if obj.requires_manager_approval and not obj.manager_approved:
+            status['pending_approvals'].append('manager')
+        if obj.requires_hr_approval and not obj.hr_approved:
+            status['pending_approvals'].append('hr')
+        
+        return status
+
+
+class ApproveTerminationSerializer(serializers.Serializer):
+    """Serializer for approving termination"""
+    
+    approval_type = serializers.ChoiceField(choices=['manager', 'hr'], required=True)
+    notes = serializers.CharField(required=False, allow_blank=True)
+
+
+class RejectTerminationSerializer(serializers.Serializer):
+    """Serializer for rejecting termination"""
+    
+    rejection_reason = serializers.CharField(required=True)
+
+
+class RequestTerminationSerializer(serializers.Serializer):
+    """Serializer for requesting employee termination with approval workflow"""
+    
+    termination_date = serializers.DateField()
+    termination_reason = serializers.CharField(required=True)
+    
+    def validate_termination_date(self, value):
+        from django.utils import timezone
+        if value > timezone.now().date():
+            raise serializers.ValidationError(
+                "Termination date cannot be in the future."
+            )
+        return value
+
+
+class CrossInstitutionConsentSerializer(serializers.ModelSerializer):
+    """Serializer for Cross-Institution Consent"""
+    
+    class Meta:
+        model = CrossInstitutionConsent
+        fields = [
+            'id', 'employee_registry_id', 'source_employer_id', 'target_employer_id',
+            'target_employer_name', 'status', 'consent_token', 'requested_at',
+            'expires_at', 'responded_at', 'notes'
+        ]
+        read_only_fields = ['id', 'consent_token', 'requested_at', 'updated_at']
+
+
+class RespondConsentSerializer(serializers.Serializer):
+    """Serializer for responding to cross-institution consent"""
+    
+    response = serializers.ChoiceField(choices=['approve', 'reject'], required=True)
+    notes = serializers.CharField(required=False, allow_blank=True)
+
 
