@@ -1263,6 +1263,13 @@ class EmployeeProfileCompletionSerializer(serializers.ModelSerializer):
             'emergency_contact_name', 'emergency_contact_relationship',
             'emergency_contact_phone',
         ]
+        # Explicitly make these fields read-only - employees cannot change their assignment
+        read_only_fields = [
+            'employee_id', 'first_name', 'last_name', 'middle_name', 'email',
+            'department', 'branch', 'manager', 'job_title', 'employment_type',
+            'employment_status', 'hire_date', 'probation_end_date',
+            'employer_id', 'user_id', 'created_by_id'
+        ]
         # String fields that support allow_blank
         string_fields = [
             'nationality', 'marital_status', 'phone_number', 'alternative_phone', 
@@ -1286,9 +1293,13 @@ class EmployeeProfileCompletionSerializer(serializers.ModelSerializer):
         
         # Get the employee instance being updated
         if self.instance:
+            # Get tenant_db from context if available
+            tenant_db = self.context.get('tenant_db')
+            
             try:
                 employer = EmployerProfile.objects.get(id=self.instance.employer_id)
-                tenant_db = get_tenant_database_alias(employer)
+                if not tenant_db:
+                    tenant_db = get_tenant_database_alias(employer)
                 config, created = EmployeeConfiguration.objects.using(tenant_db).get_or_create(
                     employer_id=self.instance.employer_id,
                     defaults={
@@ -1305,6 +1316,7 @@ class EmployeeProfileCompletionSerializer(serializers.ModelSerializer):
             # Fields marked as REQUIRED in config must be provided during profile completion
             if config:
                 # Merge existing instance data with update data for validation
+                # Only include fields that the employee can update
                 merged_data = {
                     'middle_name': data.get('middle_name', self.instance.middle_name),
                     'profile_photo': data.get('profile_photo', self.instance.profile_photo),
@@ -1324,10 +1336,6 @@ class EmployeeProfileCompletionSerializer(serializers.ModelSerializer):
                     'city': data.get('city', self.instance.city),
                     'state_region': data.get('state_region', self.instance.state_region),
                     'country': data.get('country', self.instance.country),
-                    'department': self.instance.department_id,
-                    'branch': self.instance.branch_id,
-                    'manager': self.instance.manager_id,
-                    'probation_end_date': self.instance.probation_end_date,
                     'bank_account_number': data.get('bank_account_number', self.instance.bank_account_number),
                     'bank_name': data.get('bank_name', self.instance.bank_name),
                     'bank_account_name': data.get('bank_account_name', self.instance.bank_account_name),
@@ -1359,6 +1367,12 @@ class EmployeeProfileCompletionSerializer(serializers.ModelSerializer):
         
         User = get_user_model()
         
+        # Get tenant database from context
+        tenant_db = self.context.get('tenant_db')
+        
+        # Track which fields are being updated
+        update_fields = list(validated_data.keys())
+        
         # Update all provided fields
         for attr, value in validated_data.items():
             setattr(instance, attr, value)
@@ -1366,7 +1380,8 @@ class EmployeeProfileCompletionSerializer(serializers.ModelSerializer):
         # Re-validate profile completion state after update
         try:
             employer = EmployerProfile.objects.get(id=instance.employer_id)
-            tenant_db = get_tenant_database_alias(employer)
+            if not tenant_db:
+                tenant_db = get_tenant_database_alias(employer)
             config = get_or_create_employee_config(instance.employer_id, tenant_db)
             
             # Check what fields are still missing after this update
@@ -1378,20 +1393,33 @@ class EmployeeProfileCompletionSerializer(serializers.ModelSerializer):
             instance.missing_required_fields = validation_result['missing_critical']
             instance.missing_optional_fields = validation_result['missing_non_critical']
             
+            # Add these fields to the update list
+            update_fields.extend([
+                'profile_completion_state', 'profile_completion_required',
+                'missing_required_fields', 'missing_optional_fields'
+            ])
+            
             # Mark as completed if all requirements met
             if validation_result['completion_state'] == 'COMPLETE':
                 instance.profile_completed = True
                 instance.profile_completed_at = timezone.now()
+                update_fields.extend(['profile_completed', 'profile_completed_at'])
             else:
                 instance.profile_completed = False
                 instance.profile_completed_at = None
+                update_fields.extend(['profile_completed', 'profile_completed_at'])
                 
         except EmployerProfile.DoesNotExist:
             # Fallback: mark as completed if we can't validate
             instance.profile_completed = True
             instance.profile_completed_at = timezone.now()
+            update_fields.extend(['profile_completed', 'profile_completed_at'])
         
-        instance.save()
+        # Save only the fields that were actually updated to the correct database
+        if tenant_db:
+            instance.save(using=tenant_db, update_fields=update_fields)
+        else:
+            instance.save(update_fields=update_fields)
         
         # Sync to central EmployeeRegistry
         if instance.user_id:
@@ -1490,9 +1518,9 @@ class EmployeeProfileCompletionSerializer(serializers.ModelSerializer):
 class EmployeeSelfProfileSerializer(serializers.ModelSerializer):
     """Read-only serializer for employees to view their own profile"""
     
-    department_name = serializers.CharField(source='department.name', read_only=True)
-    branch_name = serializers.CharField(source='branch.name', read_only=True)
-    manager_name = serializers.CharField(source='manager.full_name', read_only=True)
+    department_name = serializers.SerializerMethodField()
+    branch_name = serializers.SerializerMethodField()
+    manager_name = serializers.SerializerMethodField()
     employer_name = serializers.SerializerMethodField()
     
     class Meta:
@@ -1503,14 +1531,33 @@ class EmployeeSelfProfileSerializer(serializers.ModelSerializer):
             'email', 'personal_email', 'phone_number', 'alternative_phone',
             'address', 'city', 'state_region', 'postal_code', 'country',
             'national_id_number', 'passport_number', 'cnps_number', 'tax_number',
-            'job_title', 'department_name', 'branch_name', 'manager_name',
+            'job_title', 'department', 'department_name', 'branch', 'branch_name', 
+            'manager', 'manager_name',
             'employment_type', 'employment_status', 'hire_date', 'probation_end_date',
             'bank_name', 'bank_account_number', 'bank_account_name',
             'emergency_contact_name', 'emergency_contact_relationship', 'emergency_contact_phone',
-            'profile_completed', 'profile_completed_at',
+            'profile_completed', 'profile_completed_at', 'profile_completion_state',
+            'profile_completion_required', 'missing_required_fields', 'missing_optional_fields',
             'employer_name', 'created_at', 'updated_at'
         ]
-        read_only_fields = '__all__'
+    
+    def get_department_name(self, obj):
+        """Get department name safely"""
+        if obj.department:
+            return obj.department.name
+        return None
+    
+    def get_branch_name(self, obj):
+        """Get branch name safely"""
+        if obj.branch:
+            return obj.branch.name
+        return None
+    
+    def get_manager_name(self, obj):
+        """Get manager name safely"""
+        if obj.manager:
+            return obj.manager.full_name
+        return None
     
     def get_employer_name(self, obj):
         from accounts.models import EmployerProfile

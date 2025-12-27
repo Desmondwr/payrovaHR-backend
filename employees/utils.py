@@ -638,6 +638,7 @@ def check_missing_fields_against_config(employee_data, config):
     
     # Convert Employee instance to dict if needed
     if isinstance(employee_data, Employee):
+        # Use getattr with default to avoid triggering queries for foreign keys
         data = {
             'middle_name': employee_data.middle_name,
             'profile_photo': employee_data.profile_photo,
@@ -657,9 +658,10 @@ def check_missing_fields_against_config(employee_data, config):
             'city': employee_data.city,
             'state_region': employee_data.state_region,
             'country': employee_data.country,
-            'department': employee_data.department_id,
-            'branch': employee_data.branch_id,
-            'manager': employee_data.manager_id,
+            # Use direct field access for foreign key IDs to avoid queries
+            'department': getattr(employee_data, 'department_id', None),
+            'branch': getattr(employee_data, 'branch_id', None),
+            'manager': getattr(employee_data, 'manager_id', None),
             'probation_end_date': employee_data.probation_end_date,
             'bank_account_number': employee_data.bank_account_number,
             'bank_name': employee_data.bank_name,

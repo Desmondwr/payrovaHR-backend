@@ -1173,6 +1173,14 @@ class EmployeeProfileViewSet(viewsets.GenericViewSet):
             # Try to get from user relationship first
             if hasattr(user, 'employee_profile') and user.employee_profile:
                 employee = user.employee_profile
+                # Get the tenant database for this employee
+                from accounts.models import EmployerProfile
+                employer = EmployerProfile.objects.get(id=employee.employer_id)
+                tenant_db = get_tenant_database_alias(employer)
+                # Re-fetch with select_related to get department and branch
+                employee = Employee.objects.using(tenant_db).select_related(
+                    'department', 'branch', 'manager'
+                ).get(id=employee.id)
             else:
                 # Fallback: search all tenant databases
                 from accounts.models import EmployerProfile
@@ -1180,11 +1188,14 @@ class EmployeeProfileViewSet(viewsets.GenericViewSet):
                 # Get all employers
                 employers = EmployerProfile.objects.filter(user__is_active=True).select_related('user')
                 employee = None
+                tenant_db = None
                 
                 for employer in employers:
                     tenant_db = get_tenant_database_alias(employer)
                     try:
-                        employee = Employee.objects.using(tenant_db).get(user_id=user.id)
+                        employee = Employee.objects.using(tenant_db).select_related(
+                            'department', 'branch', 'manager'
+                        ).get(user_id=user.id)
                         break
                     except Employee.DoesNotExist:
                         continue
@@ -1194,7 +1205,8 @@ class EmployeeProfileViewSet(viewsets.GenericViewSet):
                         'error': 'Employee record not found'
                     }, status=status.HTTP_404_NOT_FOUND)
             
-            serializer = EmployeeSelfProfileSerializer(employee)
+            # Pass tenant_db in context for serializer
+            serializer = EmployeeSelfProfileSerializer(employee, context={'tenant_db': tenant_db})
             return Response(serializer.data, status=status.HTTP_200_OK)
             
         except Exception as e:
@@ -1249,7 +1261,8 @@ class EmployeeProfileViewSet(viewsets.GenericViewSet):
             serializer = EmployeeProfileCompletionSerializer(
                 employee, 
                 data=request.data, 
-                partial=partial
+                partial=partial,
+                context={'tenant_db': tenant_db}
             )
             
             if serializer.is_valid():
@@ -1285,13 +1298,15 @@ class EmployeeProfileViewSet(viewsets.GenericViewSet):
                     tenant_db=tenant_db
                 )
                 
-                # Refresh and return
-                updated_employee = Employee.objects.using(tenant_db).get(id=updated_employee.id)
+                # Refresh and return with related objects loaded
+                updated_employee = Employee.objects.using(tenant_db).select_related(
+                    'department', 'branch', 'manager'
+                ).get(id=updated_employee.id)
                 from .serializers import EmployeeSelfProfileSerializer
                 return Response({
                     'message': 'Profile completed successfully. You can now log in.',
                     'redirect_to': 'login',
-                    'profile': EmployeeSelfProfileSerializer(updated_employee).data
+                    'profile': EmployeeSelfProfileSerializer(updated_employee, context={'tenant_db': tenant_db}).data
                 }, status=status.HTTP_200_OK)
             
             return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
@@ -1301,17 +1316,3 @@ class EmployeeProfileViewSet(viewsets.GenericViewSet):
                 'error': 'Failed to update profile',
                 'detail': str(e)
             }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
-    
-    @action(detail=False, methods=['post'], url_path='complete')
-    def complete_profile(self, request):
-        """Handle employee profile completion"""
-        from .serializers import EmployeeProfileCompletionSerializer
-        
-        serializer = EmployeeProfileCompletionSerializer(data=request.data)
-        if serializer.is_valid():
-            # Perform profile completion logic here
-            return Response({
-                'message': 'Profile completed successfully.'
-            }, status=status.HTTP_200_OK)
-        
-        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
