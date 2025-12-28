@@ -525,6 +525,7 @@ class EmployeeDocument(models.Model):
         ('RESUME', 'Resume/CV'),
         ('ID_COPY', 'ID Copy'),
         ('PASSPORT_COPY', 'Passport Copy'),
+        ('BIRTH_CERTIFICATE', 'Birth Certificate'),
         ('CERTIFICATE', 'Certificate/Diploma'),
         ('CONTRACT', 'Employment Contract'),
         ('OFFER_LETTER', 'Offer Letter'),

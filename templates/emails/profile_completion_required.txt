@@ -30,6 +30,15 @@ NOTE: These fields must be completed to gain full system access.
 NOTE: While these fields are required for your profile to be complete, you can continue working while updating them.
 {% endif %}
 
+{% if missing_documents %}
+📎 REQUIRED DOCUMENTS TO UPLOAD:
+{% for document in missing_documents_formatted %}
+  - {{ document }}
+{% endfor %}
+
+NOTE: These documents must be uploaded to complete your profile.
+{% endif %}
+
 Completing your profile helps ensure accurate records and smooth operations within {{ company_name }}.
 
 To complete your profile, please visit:

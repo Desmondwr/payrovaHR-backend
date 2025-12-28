@@ -116,6 +116,18 @@
         </div>
         {% endif %}
         
+        {% if missing_documents %}
+        <div class="field-list">
+            <h4>📎 Required Documents to Upload:</h4>
+            <ul>
+                {% for document in missing_documents_formatted %}
+                <li>{{ document }}</li>
+                {% endfor %}
+            </ul>
+            <p style="color: #dc3545;"><strong>Note:</strong> These documents must be uploaded to complete your profile.</p>
+        </div>
+        {% endif %}
+        
         <p>Completing your profile helps ensure accurate records and smooth operations within {{ company_name }}.</p>
         
         <center>

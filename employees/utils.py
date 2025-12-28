@@ -332,15 +332,20 @@ def check_required_documents(employee):
     
     required_types = config.get_required_document_types()
     
-    # Get uploaded document types
-    uploaded_types = employee.documents.values_list('document_type', flat=True).distinct()
+    # Get uploaded document types from tenant database
+    uploaded_types = list(
+        EmployeeDocument.objects.using(tenant_db)
+        .filter(employee=employee)
+        .values_list('document_type', flat=True)
+        .distinct()
+    )
     
     # Find missing documents
     missing = [doc_type for doc_type in required_types if doc_type not in uploaded_types]
     
     return {
         'required': required_types,
-        'uploaded': list(uploaded_types),
+        'uploaded': uploaded_types,
         'missing': missing,
         'all_uploaded': len(missing) == 0
     }
@@ -739,6 +744,26 @@ def check_missing_fields_against_config(employee_data, config):
             else:
                 missing_non_critical.append(field_name)
     
+    # Check for missing required documents (if employee_data is an Employee instance)
+    missing_documents = []
+    if isinstance(employee_data, Employee):
+        required_doc_types = config.get_required_document_types()
+        
+        # Get uploaded document types for this employee
+        from employees.models import EmployeeDocument
+        uploaded_doc_types = list(
+            EmployeeDocument.objects.filter(employee=employee_data)
+            .values_list('document_type', flat=True)
+            .distinct()
+        )
+        
+        # Find missing documents
+        missing_documents = [doc_type for doc_type in required_doc_types if doc_type not in uploaded_doc_types]
+    
+    # Documents are always considered critical (blocking) if required
+    if missing_documents:
+        missing_critical.extend([f'document_{doc}' for doc in missing_documents])
+    
     # Determine completion state
     if missing_critical:
         completion_state = 'INCOMPLETE_BLOCKING'
@@ -753,6 +778,7 @@ def check_missing_fields_against_config(employee_data, config):
     return {
         'missing_critical': missing_critical,
         'missing_non_critical': missing_non_critical,
+        'missing_documents': missing_documents,
         'is_blocking': is_blocking,
         'completion_state': completion_state,
         'requires_update': len(missing_critical) > 0 or len(missing_non_critical) > 0
@@ -840,16 +866,32 @@ def send_profile_completion_notification(employee, missing_fields_info, employer
         'company_name': employer.company_name,
         'missing_critical': missing_fields_info.get('missing_critical', []),
         'missing_non_critical': missing_fields_info.get('missing_non_critical', []),
+        'missing_documents': missing_fields_info.get('missing_documents', []),
         'is_blocking': missing_fields_info.get('is_blocking', False),
         'completion_url': f"{settings.FRONTEND_URL}/employee/profile/complete",
     }
     
     # Format field names for display
     def format_field_name(field):
+        # Handle document fields specially
+        if field.startswith('document_'):
+            doc_type = field.replace('document_', '')
+            return f"Document: {doc_type.replace('_', ' ').title()}"
         return field.replace('_', ' ').title()
     
     context['missing_critical_formatted'] = [format_field_name(f) for f in context['missing_critical']]
     context['missing_non_critical_formatted'] = [format_field_name(f) for f in context['missing_non_critical']]
+    
+    # Format document types for display
+    def format_document_type(doc_type):
+        from employees.models import EmployeeDocument
+        # Get the human-readable name from choices
+        for choice_value, choice_label in EmployeeDocument.DOCUMENT_TYPE_CHOICES:
+            if choice_value == doc_type:
+                return choice_label
+        return doc_type.replace('_', ' ').title()
+    
+    context['missing_documents_formatted'] = [format_document_type(doc) for doc in context['missing_documents']]
     
     # Render email templates
     subject = f"Profile Completion Required - {employer.company_name}"

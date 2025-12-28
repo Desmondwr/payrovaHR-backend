@@ -167,6 +167,7 @@ class EmployeeDetailSerializer(serializers.ModelSerializer):
     manager_name = serializers.SerializerMethodField()
     has_user_account = serializers.SerializerMethodField()
     cross_institution_count = serializers.SerializerMethodField()
+    documents = serializers.SerializerMethodField()
     
     class Meta:
         model = Employee
@@ -229,6 +230,11 @@ class EmployeeDetailSerializer(serializers.ModelSerializer):
     
     def get_cross_institution_count(self, obj):
         return obj.cross_institution_records.count()
+    
+    def get_documents(self, obj):
+        """Get all documents for this employee"""
+        documents = obj.documents.all()
+        return EmployeeDocumentSerializer(documents, many=True, context=self.context).data
 
 
 class CreateEmployeeSerializer(serializers.ModelSerializer):
@@ -550,6 +556,41 @@ class UpdateEmployeeSerializer(serializers.ModelSerializer):
             'emergency_contact_name', 'emergency_contact_relationship',
             'emergency_contact_phone',
         ]
+    
+    def update(self, instance, validated_data):
+        """Update employee with validation of foreign key references"""
+        from accounts.database_utils import get_tenant_database_alias
+        
+        # Get tenant database from context
+        request = self.context.get('request')
+        if request and hasattr(request.user, 'employer_profile'):
+            tenant_db = get_tenant_database_alias(request.user.employer_profile)
+            
+            # Before updating, validate and clean up any invalid foreign key references
+            # This prevents IntegrityError for existing invalid references
+            if instance.branch_id:
+                branch_exists = Branch.objects.using(tenant_db).filter(id=instance.branch_id).exists()
+                if not branch_exists:
+                    instance.branch_id = None
+            
+            if instance.department_id:
+                dept_exists = Department.objects.using(tenant_db).filter(id=instance.department_id).exists()
+                if not dept_exists:
+                    instance.department_id = None
+            
+            if instance.manager_id:
+                manager_exists = Employee.objects.using(tenant_db).filter(id=instance.manager_id).exists()
+                if not manager_exists:
+                    instance.manager_id = None
+            
+            # Update instance with validated data
+            for attr, value in validated_data.items():
+                setattr(instance, attr, value)
+            
+            instance.save(using=tenant_db)
+            return instance
+        
+        return super().update(instance, validated_data)
 
 
 class TerminateEmployeeSerializer(serializers.Serializer):
@@ -570,17 +611,30 @@ class TerminateEmployeeSerializer(serializers.Serializer):
 class EmployeeDocumentSerializer(serializers.ModelSerializer):
     """Serializer for Employee Documents"""
     
-    uploaded_by_name = serializers.CharField(source='uploaded_by.email', read_only=True)
+    uploaded_by_name = serializers.SerializerMethodField()
     employee_name = serializers.CharField(source='employee.full_name', read_only=True)
     
     class Meta:
         model = EmployeeDocument
         fields = [
             'id', 'employee', 'employee_name', 'document_type', 'title',
-            'description', 'file', 'file_size', 'uploaded_by',
-            'uploaded_by_name', 'uploaded_at'
+            'description', 'file', 'file_size', 'uploaded_by_id',
+            'uploaded_by_name', 'uploaded_at', 'has_expiry', 'expiry_date',
+            'is_verified', 'verified_by_id', 'verified_at'
         ]
-        read_only_fields = ['id', 'uploaded_by', 'uploaded_at', 'file_size']
+        read_only_fields = ['id', 'uploaded_by_id', 'uploaded_at', 'file_size']
+    
+    def get_uploaded_by_name(self, obj):
+        """Get the name/email of the user who uploaded this document"""
+        if not obj.uploaded_by_id:
+            return None
+        try:
+            from django.contrib.auth import get_user_model
+            User = get_user_model()
+            user = User.objects.get(id=obj.uploaded_by_id)
+            return user.email
+        except:
+            return None
     
     def validate_file(self, value):
         """Validate file size and format based on employer configuration"""
@@ -642,15 +696,27 @@ class EmployeeAuditLogSerializer(serializers.ModelSerializer):
     """Serializer for Employee Audit Logs"""
     
     employee_name = serializers.CharField(source='employee.full_name', read_only=True)
-    performed_by_email = serializers.CharField(source='performed_by.email', read_only=True)
+    performed_by_email = serializers.SerializerMethodField()
     
     class Meta:
         model = EmployeeAuditLog
         fields = [
-            'id', 'employee', 'employee_name', 'action', 'performed_by',
+            'id', 'employee', 'employee_name', 'action', 'performed_by_id',
             'performed_by_email', 'timestamp', 'changes', 'notes', 'ip_address'
         ]
-        read_only_fields = '__all__'
+        read_only_fields = ['id', 'timestamp']
+    
+    def get_performed_by_email(self, obj):
+        """Get the email of the user who performed this action"""
+        if not obj.performed_by_id:
+            return None
+        try:
+            from django.contrib.auth import get_user_model
+            User = get_user_model()
+            user = User.objects.get(id=obj.performed_by_id)
+            return user.email
+        except:
+            return None
 
 
 class EmployeeInvitationSerializer(serializers.ModelSerializer):
@@ -1156,12 +1222,112 @@ class CreateEmployeeWithDetectionSerializer(serializers.ModelSerializer):
 class EmployeeDocumentUploadSerializer(serializers.ModelSerializer):
     """Serializer for uploading employee documents"""
     
+    # Accept 'name' as an alias for 'title' for frontend compatibility
+    name = serializers.CharField(write_only=True, required=False, allow_blank=True)
+    
     class Meta:
         model = EmployeeDocument
         fields = [
-            'employee', 'document_type', 'title', 'description', 'file',
+            'employee', 'document_type', 'title', 'name', 'description', 'file',
             'has_expiry', 'expiry_date'
         ]
+        extra_kwargs = {
+            'employee': {'required': True},
+            'title': {'required': False}  # Make title optional since we accept 'name' too
+        }
+    
+    def validate(self, data):
+        """Ensure either 'title' or 'name' is provided"""
+        # If 'name' is provided but not 'title', use 'name' as 'title'
+        if 'name' in data and data['name']:
+            data['title'] = data.pop('name')
+        elif 'title' not in data or not data['title']:
+            # If neither is provided, use filename or document type as title
+            if 'file' in data:
+                data['title'] = data['file'].name
+            elif 'document_type' in data:
+                # Use document type as fallback title
+                doc_type = data['document_type']
+                # Convert to readable format
+                data['title'] = doc_type.replace('_', ' ').title()
+            else:
+                raise serializers.ValidationError({
+                    'title': 'Either title or name field is required'
+                })
+        else:
+            # Remove 'name' if 'title' was provided
+            data.pop('name', None)
+        
+        return data
+    
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # Remove default queryset validation for employee field
+        # Accept any UUID and validate it in validate_employee method
+        if 'employee' in self.fields:
+            self.fields['employee'].queryset = Employee.objects.none()
+            
+            # Make employee field optional for employees (they upload for themselves)
+            request = self.context.get('request')
+            if request and request.user.is_employee:
+                self.fields['employee'].required = False
+    
+    def validate_employee(self, value):
+        """Validate that employee exists in the tenant database and belongs to employer"""
+        from accounts.database_utils import get_tenant_database_alias
+        
+        request = self.context.get('request')
+        if not request:
+            raise serializers.ValidationError("Request context is required")
+        
+        user = request.user
+        
+        # If employee is uploading for themselves
+        if user.is_employee:
+            # If employee field is not provided, use the logged-in employee
+            if not value:
+                # Get employee from context (set in get_serializer_context)
+                employee = self.context.get('employee')
+                if not employee:
+                    raise serializers.ValidationError("Employee record not found")
+                return employee
+            else:
+                # Employee provided an employee ID - must be their own
+                tenant_db = self.context.get('tenant_db')
+                employee_id = value.id if hasattr(value, 'id') else value
+                
+                # Verify it's their own employee record
+                try:
+                    employee = Employee.objects.using(tenant_db).get(id=employee_id, user_id=user.id)
+                    return employee
+                except Employee.DoesNotExist:
+                    raise serializers.ValidationError("You can only upload documents for yourself")
+        
+        # Employer uploading for an employee
+        if not hasattr(user, 'employer_profile') or not user.employer_profile:
+            raise serializers.ValidationError("User must be an employer")
+        
+        employer = user.employer_profile
+        tenant_db = self.context.get('tenant_db')
+        
+        if not tenant_db:
+            tenant_db = get_tenant_database_alias(employer)
+        
+        # Get employee ID - handle both UUID string and Employee instance
+        employee_id = value.id if hasattr(value, 'id') else value
+        
+        # Check if employee exists in tenant database and belongs to this employer
+        try:
+            employee = Employee.objects.using(tenant_db).get(
+                id=employee_id,
+                employer_id=employer.id
+            )
+            # Return the employee instance for use in create()
+            return employee
+        except Employee.DoesNotExist:
+            raise serializers.ValidationError(
+                f"Employee does not exist in your organization"
+            )
     
     def validate_file(self, value):
         """Validate file size and format based on configuration"""
@@ -1169,11 +1335,27 @@ class EmployeeDocumentUploadSerializer(serializers.ModelSerializer):
         from employees.utils import get_or_create_employee_config
         
         request = self.context['request']
-        employer = request.user.employer_profile
-        tenant_db = get_tenant_database_alias(employer)
+        user = request.user
+        tenant_db = self.context.get('tenant_db')
+        
+        # Get employer_id based on user type
+        if hasattr(user, 'employer_profile') and user.employer_profile:
+            employer_id = user.employer_profile.id
+            if not tenant_db:
+                tenant_db = get_tenant_database_alias(user.employer_profile)
+        elif user.is_employee:
+            # Get employee to find employer_id
+            employee = self.context.get('employee')
+            if employee:
+                employer_id = employee.employer_id
+            else:
+                # Skip validation if we can't determine employer
+                return value
+        else:
+            return value
         
         # Get or create configuration using helper function
-        config = get_or_create_employee_config(employer.id, tenant_db)
+        config = get_or_create_employee_config(employer_id, tenant_db)
             
         # Check file size
         max_size_bytes = config.document_max_file_size_mb * 1024 * 1024
@@ -1193,8 +1375,27 @@ class EmployeeDocumentUploadSerializer(serializers.ModelSerializer):
         return value
     
     def create(self, validated_data):
-        validated_data['uploaded_by'] = self.context['request'].user
+        """Create document in tenant database"""
+        # Pop the 'using' argument if it exists
+        tenant_db = validated_data.pop('using', None)
+        
+        # The employee field is now an Employee instance from validate_employee
+        employee = validated_data['employee']
+        validated_data['employee_id'] = employee.id
+        
+        validated_data['uploaded_by_id'] = self.context['request'].user.id
         validated_data['file_size'] = validated_data['file'].size
+        
+        # Get tenant_db from context if not provided
+        if not tenant_db:
+            tenant_db = self.context.get('tenant_db')
+        
+        # Save to tenant database
+        if tenant_db:
+            # Remove employee object and use employee_id instead
+            validated_data.pop('employee')
+            return EmployeeDocument.objects.using(tenant_db).create(**validated_data)
+        
         return super().create(validated_data)
 
 
@@ -1247,7 +1448,7 @@ class EmployeeProfileCompletionSerializer(serializers.ModelSerializer):
         fields = [
             # Personal Information to complete
             'date_of_birth', 'gender', 'nationality', 'marital_status',
-            'profile_photo',
+            'profile_photo', 'middle_name',
             
             # Contact Details
             'phone_number', 'alternative_phone', 'personal_email',
@@ -1265,7 +1466,7 @@ class EmployeeProfileCompletionSerializer(serializers.ModelSerializer):
         ]
         # Explicitly make these fields read-only - employees cannot change their assignment
         read_only_fields = [
-            'employee_id', 'first_name', 'last_name', 'middle_name', 'email',
+            'employee_id', 'first_name', 'last_name', 'email',
             'department', 'branch', 'manager', 'job_title', 'employment_type',
             'employment_status', 'hire_date', 'probation_end_date',
             'employer_id', 'user_id', 'created_by_id'
@@ -1276,7 +1477,8 @@ class EmployeeProfileCompletionSerializer(serializers.ModelSerializer):
             'personal_email', 'address', 'city', 'state_region', 'postal_code', 'country',
             'national_id_number', 'passport_number', 'cnps_number', 'tax_number',
             'bank_name', 'bank_account_number', 'bank_account_name',
-            'emergency_contact_name', 'emergency_contact_relationship', 'emergency_contact_phone'
+            'emergency_contact_name', 'emergency_contact_relationship', 'emergency_contact_phone',
+            'middle_name'
         ]
         extra_kwargs = {
             **{field: {'required': False, 'allow_null': True, 'allow_blank': True} 
@@ -1284,6 +1486,48 @@ class EmployeeProfileCompletionSerializer(serializers.ModelSerializer):
             **{field: {'required': False, 'allow_null': True} 
                for field in ['date_of_birth', 'gender', 'profile_photo']}
         }
+    
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        
+        # Dynamically remove hidden fields based on employer configuration
+        if self.instance:
+            from accounts.database_utils import get_tenant_database_alias
+            from accounts.models import EmployerProfile
+            
+            try:
+                employer = EmployerProfile.objects.get(id=self.instance.employer_id)
+                tenant_db = self.context.get('tenant_db') or get_tenant_database_alias(employer)
+                config, _ = EmployeeConfiguration.objects.using(tenant_db).get_or_create(
+                    employer_id=self.instance.employer_id
+                )
+                
+                # Map serializer fields to configuration attributes
+                field_config_map = {
+                    'middle_name': 'require_middle_name',
+                    'profile_photo': 'require_profile_photo',
+                    'gender': 'require_gender',
+                    'date_of_birth': 'require_date_of_birth',
+                    'marital_status': 'require_marital_status',
+                    'nationality': 'require_nationality',
+                    'personal_email': 'require_personal_email',
+                    'alternative_phone': 'require_alternative_phone',
+                    'address': 'require_address',
+                    'postal_code': 'require_postal_code',
+                    'national_id_number': 'require_national_id',
+                    'passport_number': 'require_passport',
+                    'cnps_number': 'require_cnps_number',
+                    'tax_number': 'require_tax_number',
+                }
+                
+                # Remove hidden fields
+                for field_name, config_attr in field_config_map.items():
+                    requirement = getattr(config, config_attr, 'OPTIONAL')
+                    if requirement == 'HIDDEN' and field_name in self.fields:
+                        self.fields.pop(field_name)
+                
+            except (EmployerProfile.DoesNotExist, Exception):
+                pass
     
     def validate(self, data):
         """Validate employee profile data against employer's specific configuration requirements"""
@@ -1522,6 +1766,8 @@ class EmployeeSelfProfileSerializer(serializers.ModelSerializer):
     branch_name = serializers.SerializerMethodField()
     manager_name = serializers.SerializerMethodField()
     employer_name = serializers.SerializerMethodField()
+    missing_documents = serializers.SerializerMethodField()
+    documents = serializers.SerializerMethodField()
     
     class Meta:
         model = Employee
@@ -1538,8 +1784,50 @@ class EmployeeSelfProfileSerializer(serializers.ModelSerializer):
             'emergency_contact_name', 'emergency_contact_relationship', 'emergency_contact_phone',
             'profile_completed', 'profile_completed_at', 'profile_completion_state',
             'profile_completion_required', 'missing_required_fields', 'missing_optional_fields',
-            'employer_name', 'created_at', 'updated_at'
+            'missing_documents', 'documents', 'employer_name', 'created_at', 'updated_at'
         ]
+    
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        
+        # Dynamically remove hidden fields based on employer configuration
+        if self.instance:
+            from accounts.database_utils import get_tenant_database_alias
+            from accounts.models import EmployerProfile
+            
+            try:
+                employer = EmployerProfile.objects.get(id=self.instance.employer_id)
+                tenant_db = self.context.get('tenant_db') or get_tenant_database_alias(employer)
+                config, _ = EmployeeConfiguration.objects.using(tenant_db).get_or_create(
+                    employer_id=self.instance.employer_id
+                )
+                
+                # Map serializer fields to configuration attributes
+                field_config_map = {
+                    'middle_name': 'require_middle_name',
+                    'profile_photo': 'require_profile_photo',
+                    'gender': 'require_gender',
+                    'date_of_birth': 'require_date_of_birth',
+                    'marital_status': 'require_marital_status',
+                    'nationality': 'require_nationality',
+                    'personal_email': 'require_personal_email',
+                    'alternative_phone': 'require_alternative_phone',
+                    'address': 'require_address',
+                    'postal_code': 'require_postal_code',
+                    'national_id_number': 'require_national_id',
+                    'passport_number': 'require_passport',
+                    'cnps_number': 'require_cnps_number',
+                    'tax_number': 'require_tax_number',
+                }
+                
+                # Remove hidden fields
+                for field_name, config_attr in field_config_map.items():
+                    requirement = getattr(config, config_attr, 'OPTIONAL')
+                    if requirement == 'HIDDEN' and field_name in self.fields:
+                        self.fields.pop(field_name)
+                
+            except (EmployerProfile.DoesNotExist, Exception):
+                pass
     
     def get_department_name(self, obj):
         """Get department name safely"""
@@ -1566,6 +1854,20 @@ class EmployeeSelfProfileSerializer(serializers.ModelSerializer):
             return employer.company_name
         except EmployerProfile.DoesNotExist:
             return None
+    
+    def get_missing_documents(self, obj):
+        """Get list of missing required documents"""
+        from employees.utils import check_required_documents
+        try:
+            result = check_required_documents(obj)
+            return result.get('missing', [])
+        except Exception:
+            return []
+    
+    def get_documents(self, obj):
+        """Get all documents for this employee"""
+        documents = obj.documents.all()
+        return EmployeeDocumentSerializer(documents, many=True, context=self.context).data
 
 
 class TerminationApprovalSerializer(serializers.ModelSerializer):

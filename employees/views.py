@@ -512,9 +512,17 @@ class EmployeeViewSet(viewsets.ModelViewSet):
     @action(detail=True, methods=['get'])
     def documents(self, request, pk=None):
         """Get all documents for an employee"""
+        from accounts.database_utils import get_tenant_database_alias
+        
         employee = self.get_object()
-        documents = employee.documents.all()
-        serializer = EmployeeDocumentSerializer(documents, many=True)
+        
+        # Get tenant database
+        employer = request.user.employer_profile
+        tenant_db = get_tenant_database_alias(employer)
+        
+        # Fetch documents from tenant database
+        documents = EmployeeDocument.objects.using(tenant_db).filter(employee=employee)
+        serializer = EmployeeDocumentSerializer(documents, many=True, context={'request': request})
         
         # Check for missing required documents
         required_check = check_required_documents(employee)
@@ -549,9 +557,17 @@ class EmployeeViewSet(viewsets.ModelViewSet):
     @action(detail=True, methods=['get'])
     def audit_log(self, request, pk=None):
         """Get audit log for an employee"""
+        from accounts.database_utils import get_tenant_database_alias
+        
         employee = self.get_object()
-        logs = employee.audit_logs.all()[:50]  # Last 50 entries
-        serializer = EmployeeAuditLogSerializer(logs, many=True)
+        
+        # Get tenant database
+        employer = request.user.employer_profile
+        tenant_db = get_tenant_database_alias(employer)
+        
+        # Fetch audit logs from tenant database
+        logs = EmployeeAuditLog.objects.using(tenant_db).filter(employee=employee).order_by('-timestamp')[:50]
+        serializer = EmployeeAuditLogSerializer(logs, many=True, context={'request': request})
         return Response(serializer.data)
     
     @action(detail=True, methods=['get'])
@@ -811,20 +827,105 @@ class EmployeeViewSet(viewsets.ModelViewSet):
 class EmployeeDocumentViewSet(viewsets.ModelViewSet):
     """ViewSet for managing employee documents"""
     
-    permission_classes = [IsAuthenticated, IsEmployer]
+    permission_classes = [IsAuthenticated]
     serializer_class = EmployeeDocumentSerializer
     
     def get_queryset(self):
-        """Return documents for employees in employer's organization"""
-        return EmployeeDocument.objects.filter(
-            employee__employer=self.request.user.employer_profile
-        ).select_related('employee', 'uploaded_by')
+        """Return documents based on user type"""
+        from accounts.database_utils import get_tenant_database_alias
+        
+        user = self.request.user
+        
+        # Employers can see all documents for their employees
+        if hasattr(user, 'employer_profile') and user.employer_profile:
+            employer = user.employer_profile
+            tenant_db = get_tenant_database_alias(employer)
+            
+            return EmployeeDocument.objects.using(tenant_db).filter(
+                employee__employer_id=employer.id
+            ).select_related('employee')
+        
+        # Employees can only see their own documents
+        elif user.is_employee:
+            # Find employee record across tenant databases
+            from accounts.models import EmployerProfile
+            employers = EmployerProfile.objects.filter(user__is_active=True)
+            
+            for employer in employers:
+                tenant_db = get_tenant_database_alias(employer)
+                try:
+                    employee = Employee.objects.using(tenant_db).get(user_id=user.id)
+                    return EmployeeDocument.objects.using(tenant_db).filter(
+                        employee=employee
+                    ).select_related('employee')
+                except Employee.DoesNotExist:
+                    continue
+            
+            return EmployeeDocument.objects.none()
+        
+        return EmployeeDocument.objects.none()
     
     def get_serializer_class(self):
         """Return appropriate serializer based on action"""
         if self.action == 'create':
             return EmployeeDocumentUploadSerializer
         return EmployeeDocumentSerializer
+    
+    def get_serializer_context(self):
+        """Add tenant_db to serializer context"""
+        context = super().get_serializer_context()
+        from accounts.database_utils import get_tenant_database_alias
+        
+        if hasattr(self.request.user, 'employer_profile') and self.request.user.employer_profile:
+            employer = self.request.user.employer_profile
+            context['tenant_db'] = get_tenant_database_alias(employer)
+        elif self.request.user.is_employee:
+            # Find employee's employer
+            from accounts.models import EmployerProfile
+            employers = EmployerProfile.objects.filter(user__is_active=True)
+            
+            for employer in employers:
+                tenant_db = get_tenant_database_alias(employer)
+                try:
+                    employee = Employee.objects.using(tenant_db).get(user_id=self.request.user.id)
+                    context['tenant_db'] = tenant_db
+                    context['employee'] = employee
+                    break
+                except Employee.DoesNotExist:
+                    continue
+        
+        return context
+    
+    def perform_create(self, serializer):
+        """Save document to tenant database"""
+        from accounts.database_utils import get_tenant_database_alias
+        
+        user = self.request.user
+        
+        # Determine tenant_db and handle document creation
+        if hasattr(user, 'employer_profile') and user.employer_profile:
+            # Employer uploading document
+            employer = user.employer_profile
+            tenant_db = get_tenant_database_alias(employer)
+            serializer.save(using=tenant_db, uploaded_by_id=user.id)
+        elif user.is_employee:
+            # Employee uploading their own document
+            from accounts.models import EmployerProfile
+            employers = EmployerProfile.objects.filter(user__is_active=True)
+            
+            for employer in employers:
+                tenant_db = get_tenant_database_alias(employer)
+                try:
+                    employee = Employee.objects.using(tenant_db).get(user_id=user.id)
+                    # Employee can only upload documents for themselves
+                    serializer.save(
+                        using=tenant_db,
+                        uploaded_by_id=user.id,
+                        employee=employee
+                    )
+                    break
+                except Employee.DoesNotExist:
+                    continue
     
     @action(detail=True, methods=['post'])
     def verify(self, request, pk=None):
@@ -1112,7 +1213,7 @@ class EmployeeInvitationViewSet(viewsets.ReadOnlyModelViewSet):
         
         # Serialize the full form fields for profile completion
         from .serializers import EmployeeProfileCompletionSerializer
-        employee_data = EmployeeProfileCompletionSerializer(instance=employee).data
+        employee_data = EmployeeProfileCompletionSerializer(instance=employee, context={'tenant_db': tenant_db}).data
 
         return Response({
             'message': 'Invitation accepted successfully.',
@@ -1126,6 +1227,7 @@ class EmployeeInvitationViewSet(viewsets.ReadOnlyModelViewSet):
                 'is_blocking': validation_result['is_blocking'],
                 'missing_critical_fields': validation_result['missing_critical'],
                 'missing_non_critical_fields': validation_result['missing_non_critical'],
+                'missing_documents': validation_result.get('missing_documents', []),
             }
         }, status=status.HTTP_200_OK)
         
