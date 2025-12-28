@@ -1375,20 +1375,39 @@ class EmployeeProfileViewSet(viewsets.GenericViewSet):
                 update_fields = {field: getattr(updated_employee, field) 
                                 for field in serializer.validated_data.keys()}
                 
-                # Change employment status from PENDING to ACTIVE when profile is completed
-                if updated_employee.employment_status == 'PENDING':
-                    update_fields['employment_status'] = 'ACTIVE'
-                    updated_employee.employment_status = 'ACTIVE'
-                
                 # Update in tenant database
                 Employee.objects.using(tenant_db).filter(id=updated_employee.id).update(**update_fields)
                 
-                # Add profile_completed fields
-                if not partial or ('profile_completed' in dir(updated_employee) and updated_employee.profile_completed):
-                    Employee.objects.using(tenant_db).filter(id=updated_employee.id).update(
-                        profile_completed=updated_employee.profile_completed,
-                        profile_completed_at=updated_employee.profile_completed_at
-                    )
+                # Refresh employee to get latest data
+                updated_employee = Employee.objects.using(tenant_db).select_related(
+                    'department', 'branch', 'manager'
+                ).get(id=updated_employee.id)
+                
+                # Re-check profile completion status
+                from employees.utils import check_missing_fields_against_config, get_or_create_employee_config
+                config = get_or_create_employee_config(updated_employee.employer_id, tenant_db)
+                validation_result = check_missing_fields_against_config(updated_employee, config)
+                
+                # Update profile completion fields
+                updated_employee.profile_completion_state = validation_result['completion_state']
+                updated_employee.profile_completion_required = validation_result['requires_update']
+                updated_employee.missing_required_fields = validation_result['missing_critical']
+                updated_employee.missing_optional_fields = validation_result['missing_non_critical']
+                
+                # Mark as completed if no missing fields
+                if validation_result['completion_state'] == 'COMPLETE':
+                    updated_employee.profile_completed = True
+                    updated_employee.profile_completed_at = timezone.now()
+                    # Change employment status from PENDING to ACTIVE when profile is completed
+                    if updated_employee.employment_status == 'PENDING':
+                        updated_employee.employment_status = 'ACTIVE'
+                
+                # Save the updated completion status
+                updated_employee.save(using=tenant_db, update_fields=[
+                    'profile_completion_state', 'profile_completion_required',
+                    'missing_required_fields', 'missing_optional_fields',
+                    'profile_completed', 'profile_completed_at', 'employment_status'
+                ])
                 
                 # Create audit log
                 create_employee_audit_log(
@@ -1400,15 +1419,18 @@ class EmployeeProfileViewSet(viewsets.GenericViewSet):
                     tenant_db=tenant_db
                 )
                 
-                # Refresh and return with related objects loaded
-                updated_employee = Employee.objects.using(tenant_db).select_related(
-                    'department', 'branch', 'manager'
-                ).get(id=updated_employee.id)
+                # Return updated profile
                 from .serializers import EmployeeSelfProfileSerializer
                 return Response({
-                    'message': 'Profile completed successfully. You can now log in.',
-                    'redirect_to': 'login',
-                    'profile': EmployeeSelfProfileSerializer(updated_employee, context={'tenant_db': tenant_db}).data
+                    'message': 'Profile updated successfully.' if not updated_employee.profile_completed else 'Profile completed successfully.',
+                    'profile': EmployeeSelfProfileSerializer(updated_employee, context={'tenant_db': tenant_db}).data,
+                    'profile_completion': {
+                        'state': validation_result['completion_state'],
+                        'is_blocking': validation_result['is_blocking'],
+                        'missing_critical_fields': validation_result['missing_critical'],
+                        'missing_non_critical_fields': validation_result['missing_non_critical'],
+                        'missing_documents': validation_result.get('missing_documents', []),
+                    }
                 }, status=status.HTTP_200_OK)
             
             return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
