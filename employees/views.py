@@ -1307,6 +1307,31 @@ class EmployeeProfileViewSet(viewsets.GenericViewSet):
                         'error': 'Employee record not found'
                     }, status=status.HTTP_404_NOT_FOUND)
             
+            # Recalculate profile completion status to reflect current configuration
+            from employees.utils import check_missing_fields_against_config, get_or_create_employee_config
+            config = get_or_create_employee_config(employee.employer_id, tenant_db)
+            validation_result = check_missing_fields_against_config(employee, config)
+            
+            # Update the stored completion fields if they've changed
+            if (employee.missing_required_fields != validation_result['missing_critical'] or
+                employee.missing_optional_fields != validation_result['missing_non_critical'] or
+                employee.profile_completion_state != validation_result['completion_state']):
+                
+                employee.profile_completion_state = validation_result['completion_state']
+                employee.profile_completion_required = validation_result['requires_update']
+                employee.missing_required_fields = validation_result['missing_critical']
+                employee.missing_optional_fields = validation_result['missing_non_critical']
+                
+                if validation_result['completion_state'] == 'COMPLETE' and not employee.profile_completed:
+                    employee.profile_completed = True
+                    employee.profile_completed_at = timezone.now()
+                
+                employee.save(using=tenant_db, update_fields=[
+                    'profile_completion_state', 'profile_completion_required',
+                    'missing_required_fields', 'missing_optional_fields',
+                    'profile_completed', 'profile_completed_at'
+                ])
+            
             # Pass tenant_db in context for serializer
             serializer = EmployeeSelfProfileSerializer(employee, context={'tenant_db': tenant_db})
             return Response(serializer.data, status=status.HTTP_200_OK)

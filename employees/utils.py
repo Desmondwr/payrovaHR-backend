@@ -717,8 +717,8 @@ def check_missing_fields_against_config(employee_data, config):
     for field_name, config_attr in field_config_map.items():
         requirement = getattr(config, config_attr, 'OPTIONAL')
         
-        # Skip if field is not required or is hidden
-        if requirement != config.FIELD_REQUIRED:
+        # Skip if field is hidden - don't track at all
+        if requirement == config.FIELD_HIDDEN:
             continue
         
         # Check if field has value
@@ -738,10 +738,15 @@ def check_missing_fields_against_config(employee_data, config):
             is_missing = value is None or value == '' or (isinstance(value, str) and value.strip() == '')
         
         if is_missing:
-            # Determine if this is a critical field
-            if field_name in critical_fields_list:
-                missing_critical.append(field_name)
-            else:
+            # Only add to missing lists if the field is required or optional (not hidden)
+            if requirement == config.FIELD_REQUIRED:
+                # Determine if this is a critical field
+                if field_name in critical_fields_list:
+                    missing_critical.append(field_name)
+                else:
+                    missing_non_critical.append(field_name)
+            elif requirement == config.FIELD_OPTIONAL:
+                # Optional missing fields go to non-critical
                 missing_non_critical.append(field_name)
     
     # Check for missing required documents (if employee_data is an Employee instance)
