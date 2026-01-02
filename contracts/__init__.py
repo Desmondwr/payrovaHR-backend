@@ -1,0 +1,1 @@
+# Contracts app initialization

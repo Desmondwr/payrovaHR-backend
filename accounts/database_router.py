@@ -85,9 +85,13 @@ class TenantDatabaseRouter:
         if model1_name in self.DEFAULT_DB_MODELS and model2_name in self.DEFAULT_DB_MODELS:
             return True
         
-        # Both models are from the same tenant app (e.g., employees app)
+        # Both models are from the same tenant app (e.g., employees app, contracts app)
         # Allow relations within the same app (like Employee -> Employee for manager)
-        if app1 == app2 and app1 == 'employees':
+        if app1 == app2 and app1 in ['employees', 'contracts']:
+            return True
+        
+        # Allow relations between tenant apps (e.g., Contract -> Employee)
+        if app1 in ['employees', 'contracts'] and app2 in ['employees', 'contracts']:
             return True
         
         # If both databases are explicitly set, they must match

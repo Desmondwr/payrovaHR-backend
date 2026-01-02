@@ -1513,7 +1513,7 @@ http://127.0.0.1:8000/api/employees/profile/complete-profile/
 
 ---
 
-## 📝 NOTES
+##  NOTES
 
 ### Authentication Headers
 - For endpoints requiring authentication, include the JWT access token in the Authorization header

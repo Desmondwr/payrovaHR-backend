@@ -159,8 +159,9 @@ def run_migrations_on_tenant_database(db_name, employer_id):
     try:
         alias = f"tenant_{employer_id}"
         
-        # Run migrations for employees app (and any other tenant-specific apps)
+        # Run migrations for tenant-specific apps
         call_command('migrate', 'employees', database=alias, verbosity=2)
+        call_command('migrate', 'contracts', database=alias, verbosity=2)
         
         logger.info(f"Successfully ran migrations on database: {db_name}")
         return True
