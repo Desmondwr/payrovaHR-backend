@@ -6,8 +6,8 @@ from .views import (
 )
 
 router = DefaultRouter()
-router.register(r'contracts', ContractViewSet, basename='contract')
 router.register(r'config', ContractConfigurationViewSet, basename='contract-config')
+router.register(r'', ContractViewSet, basename='contract')
 
 amendment_list = ContractAmendmentViewSet.as_view({
     'get': 'list',
@@ -23,6 +23,6 @@ amendment_detail = ContractAmendmentViewSet.as_view({
 
 urlpatterns = [
     path('', include(router.urls)),
-    path('contracts/<uuid:contract_pk>/amendments/', amendment_list, name='contract-amendments-list'),
-    path('contracts/<uuid:contract_pk>/amendments/<int:pk>/', amendment_detail, name='contract-amendments-detail'),
+    path('<uuid:contract_pk>/amendments/', amendment_list, name='contract-amendments-list'),
+    path('<uuid:contract_pk>/amendments/<int:pk>/', amendment_detail, name='contract-amendments-detail'),
 ]
