@@ -430,9 +430,9 @@ class ContractConfigurationViewSet(viewsets.ModelViewSet):
         if instance._state.db != tenant_db:
              instance.save(using=tenant_db)
 
-    @action(detail=False, methods=['get'], url_path='global')
-    def get_global_config(self, request):
-        """Helper to get the singleton-like global config"""
+    @action(detail=False, methods=['get', 'patch'], url_path='global')
+    def global_config(self, request):
+        """Helper to get and update the singleton-like global config"""
         from accounts.database_utils import get_tenant_database_alias
         employer = request.user.employer_profile
         tenant_db = get_tenant_database_alias(employer)
@@ -445,6 +445,13 @@ class ContractConfigurationViewSet(viewsets.ModelViewSet):
                 'id_sequence_padding': 5,
             }
         )
+
+        if request.method == 'PATCH':
+            serializer = self.get_serializer(config, data=request.data, partial=True)
+            serializer.is_valid(raise_exception=True)
+            self.perform_update(serializer)
+            return Response(serializer.data)
+
         serializer = self.get_serializer(config)
         return Response(serializer.data)
 
