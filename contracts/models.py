@@ -342,6 +342,10 @@ class Contract(models.Model):
     
     def save(self, *args, **kwargs):
         """Override save to run validation and auto-generate ID"""
+        # Ensure permanent contracts don't have an end date
+        if self.contract_type == 'PERMANENT' and self.end_date:
+            self.end_date = None
+
         if not self.contract_id:
             db_alias = self._state.db or 'default'
             config = ContractConfiguration.objects.using(db_alias).filter(
@@ -355,7 +359,10 @@ class Contract(models.Model):
                 import uuid
                 self.contract_id = f"CNT-{uuid.uuid4().hex[:8].upper()}"
         
-        self.full_clean()
+        # In a multi-tenant environment, full_clean() can fail on ForeignKeys 
+        # because it tries to validate them using the default manager.
+        # We exclude them here because they are validated by the serializer.
+        self.full_clean(exclude=['employee', 'branch', 'department', 'previous_contract'])
         super().save(*args, **kwargs)
 
     @property
