@@ -245,7 +245,6 @@ class ContractViewSet(viewsets.ModelViewSet):
                 employer_id=contract.employer_id,
                 contract_id=f"CNT-REN-{uuid.uuid4().hex[:8].upper()}", # temporary ID logic
                 employee=contract.employee,
-                institution=contract.institution,
                 branch=contract.branch,
                 department=contract.department,
                 contract_type=contract.contract_type,

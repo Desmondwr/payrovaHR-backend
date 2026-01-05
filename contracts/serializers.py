@@ -26,6 +26,25 @@ class ContractSerializer(serializers.ModelSerializer):
         fields = '__all__'
         read_only_fields = ('created_at', 'updated_at', 'employer_id', 'created_by', 'gross_salary')
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        request = self.context.get('request')
+        if request and hasattr(request, 'user') and hasattr(request.user, 'employer_profile'):
+            from accounts.database_utils import get_tenant_database_alias
+            from employees.models import Employee, Branch, Department
+            
+            tenant_db = get_tenant_database_alias(request.user.employer_profile)
+            
+            # Set dynamic querysets for tenant-aware relational fields
+            if 'employee' in self.fields:
+                self.fields['employee'].queryset = Employee.objects.using(tenant_db).all()
+            if 'branch' in self.fields:
+                self.fields['branch'].queryset = Branch.objects.using(tenant_db).all()
+            if 'department' in self.fields:
+                self.fields['department'].queryset = Department.objects.using(tenant_db).all()
+            if 'previous_contract' in self.fields:
+                self.fields['previous_contract'].queryset = Contract.objects.using(tenant_db).all()
+
     def validate(self, data):
         """
         Validate that there are no overlapping active contracts for the same employee

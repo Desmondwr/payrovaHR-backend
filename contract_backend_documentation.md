@@ -31,7 +31,6 @@ The primary entity representing an employment agreement.
 | `base_salary` | Decimal | Monthly/Weekly base amount. |
 | `currency` | String | ISO Code (default: `XAF`). |
 | `pay_frequency` | enum | `MONTHLY`, `BI_WEEKLY`, `WEEKLY`, `DAILY`. |
-| `institution` | String | Company/Institution name. |
 | `branch` | UUID | Optional link to a Branch. |
 | `department` | UUID | Optional link to a Department. |
 | `previous_contract`| UUID | Reference to parent contract if this is a renewal. |

@@ -59,11 +59,6 @@ class Contract(models.Model):
         help_text='Employee this contract belongs to'
     )
     
-    # Institution/Organization information
-    institution = models.CharField(
-        max_length=255,
-        help_text='Institution or company name'
-    )
     
     # Organizational structure (nullable)
     branch = models.ForeignKey(

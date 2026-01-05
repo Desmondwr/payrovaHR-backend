@@ -11,19 +11,19 @@ class DeductionInline(admin.TabularInline):
 
 @admin.register(Contract)
 class ContractAdmin(admin.ModelAdmin):
-    list_display = ('contract_id', 'employee', 'employer_id', 'institution', 
+    list_display = ('contract_id', 'employee', 'employer_id', 
                     'contract_type', 'start_date', 'end_date', 'status', 'base_salary')
-    list_filter = ('employer_id', 'status', 'contract_type', 'institution', 
+    list_filter = ('employer_id', 'status', 'contract_type', 
                    'pay_frequency')
-    search_fields = ('contract_id', 'institution', 'employee__first_name', 
+    search_fields = ('contract_id', 'employee__first_name', 
                      'employee__last_name', 'employee__email')
     readonly_fields = ('created_at', 'updated_at', 'created_by')
     fieldsets = (
         ('Identification', {
             'fields': ('contract_id', 'employer_id', 'employee')
         }),
-        ('Institution Info', {
-            'fields': ('institution', 'branch', 'department')
+        ('Organization', {
+            'fields': ('branch', 'department')
         }),
         ('Contract Details', {
             'fields': ('contract_type', 'status', 'start_date', 'end_date')

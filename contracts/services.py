@@ -58,7 +58,7 @@ def generate_contract_pdf(contract, template=None):
     context = {
         '[Employee.FirstName]': contract.employee.first_name,
         '[Employee.LastName]': contract.employee.last_name,
-        '[Employee.Company]': contract.institution, # Or employer company name? Prompt says "Employee.Company" in "Prepared for", likely the employer
+        '[Employee.Company]': employer_profile.company_name,
         
         '[Sender.FirstName]': "System", # Or created_by user lookup
         '[Sender.LastName]': "Admin",
