@@ -84,9 +84,12 @@ These are custom actions triggered on a specific contract ID.
 
 | Endpoint (POST) | Body Params | Description |
 | :--- | :--- | :--- |
+| `/contracts/{id}/send-for-signature/` | None | Moves `DRAFT` → `PENDING_APPROVAL` (if approval required) or `PENDING_SIGNATURE`. |
+| `/contracts/{id}/approve/` | None | Approves a `PENDING_APPROVAL` contract; status becomes `APPROVED`. |
 | `/contracts/{id}/sign/` | `signature_text` (req), `document_hash` (opt) | Records a signature. If both parties sign, status moves to `SIGNED`. |
-| `/contracts/{id}/activate/` | None | Manually move status to `ACTIVE`. Requires staff/admin permissions. |
+| `/contracts/{id}/activate/` | None | Manually move status to `ACTIVE`. Requires staff/admin or employer permissions. |
 | `/contracts/{id}/terminate/` | `termination_date` (req), `reason`, `notice_served` (bool) | Ends the contract. Sets `final_pay_flag=True` and status `TERMINATED`. |
+| `/contracts/{id}/expire/` | None | Marks an `ACTIVE` contract as `EXPIRED`. Requires staff/admin or employer permissions. |
 | `/contracts/{id}/renew/` | `extend` (bool), `create_new` (bool), `new_end_date` (req), `start_date` (opt) | **Extend**: Updates end_date of current contract. **Create New**: Creates a linked renewal contract. |
 | `/contracts/{id}/generate-document/` | `template_id` (opt) | Generates the PDF document based on a template. Returns file URL. |
 
@@ -99,8 +102,8 @@ To view or create history of changes (amendments) for a contract.
 ### Configuration (`ContractConfiguration`)
 Configurations control validation rules (e.g., min wage, max backdate) and ID generation.
 
-- **`GET /config/global/`**: Returns the global configuration object.
-- **`GET /config/`**: Returns a list of all configurations (Global + Type-specific overrides).
+  - **`GET /config/global/`**, **`PATCH /config/global/`**: Read/update the global configuration object.
+  - **`/config/`** collection supports GET (list), POST (create), and `/config/{id}/` supports GET/PUT/PATCH/DELETE for type-specific overrides.
 
 ---
 

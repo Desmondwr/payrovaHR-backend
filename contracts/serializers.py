@@ -20,6 +20,10 @@ class ContractSerializer(serializers.ModelSerializer):
     allowances = AllowanceSerializer(many=True, required=False)
     deductions = DeductionSerializer(many=True, required=False)
     gross_salary = serializers.DecimalField(max_digits=12, decimal_places=2, read_only=True)
+    branch_name = serializers.CharField(source='branch.name', read_only=True)
+    branch_code = serializers.CharField(source='branch.code', read_only=True)
+    department_name = serializers.CharField(source='department.name', read_only=True)
+    department_code = serializers.CharField(source='department.code', read_only=True)
 
     class Meta:
         model = Contract

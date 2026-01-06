@@ -9,6 +9,7 @@ from .serializers import (
 )
 from django.utils import timezone
 from django.core.exceptions import ValidationError
+from accounts.middleware import set_current_tenant_db
 
 class ContractViewSet(viewsets.ModelViewSet):
     """
@@ -17,6 +18,28 @@ class ContractViewSet(viewsets.ModelViewSet):
     """
     serializer_class = ContractSerializer
     permission_classes = [permissions.IsAuthenticated]
+
+    def _set_tenant_alias(self, alias):
+        """Set tenant context when we already know the DB alias."""
+        try:
+            set_current_tenant_db(alias)
+        except Exception:
+            pass
+
+    def _set_tenant_context(self, contract):
+        """
+        Ensure subsequent writes route to the contract's tenant DB.
+        """
+        db_alias = contract._state.db or 'default'
+        try:
+            set_current_tenant_db(db_alias)
+        except Exception:
+            # If middleware setter fails, we proceed; downstream saves may fall back to default
+            pass
+        return db_alias
+    def _is_employer_user(self, user, contract):
+        """Check if the user is the employer that owns the contract"""
+        return hasattr(user, 'employer_profile') and user.employer_profile.id == contract.employer_id
 
     def get_queryset(self):
         """
@@ -30,12 +53,14 @@ class ContractViewSet(viewsets.ModelViewSet):
         if user.is_authenticated and hasattr(user, 'employer_profile'):
             from accounts.database_utils import get_tenant_database_alias
             tenant_db = get_tenant_database_alias(user.employer_profile)
+            self._set_tenant_alias(tenant_db)
             return Contract.objects.using(tenant_db).filter(employer_id=user.employer_profile.id)
             
         # 2. Employee Access
         if user.is_authenticated and user.employee_profile:
             employee = user.employee_profile
             tenant_db = employee._state.db or 'default'
+            self._set_tenant_alias(tenant_db)
             return Contract.objects.using(tenant_db).filter(employee=employee)
             
         return Contract.objects.none()
@@ -53,13 +78,41 @@ class ContractViewSet(viewsets.ModelViewSet):
     @action(detail=True, methods=['post'], url_path='activate')
     def activate(self, request, pk=None):
         """Activate a signed contract"""
-        if not request.user.is_staff:
-            return Response({'error': 'Only staff can activate contracts.'}, status=status.HTTP_403_FORBIDDEN)
-            
         contract = self.get_object()
-        
+        self._set_tenant_context(contract)
+        if not (request.user.is_staff or self._is_employer_user(request.user, contract)):
+            return Response({'error': 'Only staff or the employer can activate contracts.'}, status=status.HTTP_403_FORBIDDEN)
+            
         try:
             contract.activate(request.user)
+            return Response(self.get_serializer(contract).data)
+        except ValidationError as e:
+            return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+    @action(detail=True, methods=['post'], url_path='approve')
+    def approve(self, request, pk=None):
+        """Approve a contract that is pending approval"""
+        contract = self.get_object()
+        self._set_tenant_context(contract)
+        if not (request.user.is_staff or self._is_employer_user(request.user, contract)):
+            return Response({'error': 'Only staff or the employer can approve contracts.'}, status=status.HTTP_403_FORBIDDEN)
+
+        try:
+            contract.approve(request.user)
+            return Response(self.get_serializer(contract).data)
+        except ValidationError as e:
+            return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+    @action(detail=True, methods=['post'], url_path='send-for-signature')
+    def send_for_signature(self, request, pk=None):
+        """Move contract to pending approval or pending signature based on config"""
+        contract = self.get_object()
+        self._set_tenant_context(contract)
+        if not (request.user.is_staff or self._is_employer_user(request.user, contract)):
+            return Response({'error': 'Only staff or the employer can send contracts for signature.'}, status=status.HTTP_403_FORBIDDEN)
+
+        try:
+            contract.send_for_signature(request.user)
             return Response(self.get_serializer(contract).data)
         except ValidationError as e:
             return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
@@ -77,10 +130,16 @@ class ContractViewSet(viewsets.ModelViewSet):
             document = generate_contract_pdf(contract)
             
             # Serialize the document object (simple representation)
+            file_url = None
+            if document.file:
+                try:
+                    file_url = request.build_absolute_uri(document.file.url)
+                except Exception:
+                    file_url = document.file.url
             return Response({
                 'id': document.id,
                 'name': document.name,
-                'file_url': document.file.url if document.file else None,
+                'file_url': file_url,
                 'created_at': document.created_at
             }, status=status.HTTP_201_CREATED)
             
@@ -99,6 +158,7 @@ class ContractViewSet(viewsets.ModelViewSet):
         'document_hash' is optional.
         """
         contract = self.get_object()
+        self._set_tenant_context(contract)
         user = request.user
         
         signature_text = request.data.get('signature_text')
@@ -153,7 +213,7 @@ class ContractViewSet(viewsets.ModelViewSet):
         
         signature = ContractSignature.objects.using(db_alias).create(
             contract=contract,
-            signer_user=user,
+            signer_user_id=user.id,
             signer_name=f"{user.first_name} {user.last_name}".strip() or user.email,
             role=role,
             signature_text=signature_text,
@@ -189,6 +249,7 @@ class ContractViewSet(viewsets.ModelViewSet):
         - new_end_date (date): Required for renewal/extension.
         """
         contract = self.get_object()
+        self._set_tenant_context(contract)
         data = request.data
         
         extend = data.get('extend', False)
@@ -233,7 +294,7 @@ class ContractViewSet(viewsets.ModelViewSet):
                 amendment_number=next_num,
                 effective_date=timezone.now().date(),
                 changed_fields={'end_date': {'old': old_end_date, 'new': new_end_date}},
-                created_by=request.user
+                created_by_id=request.user.id
             )
             
             return Response({'status': 'extended', 'new_end_date': new_end_date})
@@ -284,6 +345,7 @@ class ContractViewSet(viewsets.ModelViewSet):
         - notice_served (bool): Default False.
         """
         contract = self.get_object()
+        self._set_tenant_context(contract)
         data = request.data
         
         termination_date = data.get('termination_date')
@@ -319,6 +381,20 @@ class ContractViewSet(viewsets.ModelViewSet):
             'termination_date': termination_date,
             'final_pay_flag': True
         })
+
+    @action(detail=True, methods=['post'], url_path='expire')
+    def expire(self, request, pk=None):
+        """Expire an active contract"""
+        contract = self.get_object()
+        self._set_tenant_context(contract)
+        if not (request.user.is_staff or self._is_employer_user(request.user, contract)):
+            return Response({'error': 'Only staff or the employer can expire contracts.'}, status=status.HTTP_403_FORBIDDEN)
+
+        try:
+            contract.expire(request.user)
+            return Response(self.get_serializer(contract).data)
+        except ValidationError as e:
+            return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
 
 
 class ContractAmendmentViewSet(viewsets.ModelViewSet):
@@ -380,7 +456,7 @@ class ContractAmendmentViewSet(viewsets.ModelViewSet):
             serializer.save(
                 contract=contract,
                 amendment_number=next_num,
-                created_by=user
+                created_by_id=user.id
             )
             
             # Important: Save using tenant DB? 

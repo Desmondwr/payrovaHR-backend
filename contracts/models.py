@@ -390,6 +390,7 @@ class Contract(models.Model):
         """Helper to log status changes and other actions"""
         # Ensure we write to the same DB as the contract
         db_alias = self._state.db or 'default'
+        user_id = user.id if user else None
         
         details = ""
         if metadata:
@@ -401,7 +402,7 @@ class Contract(models.Model):
         ContractAudit.objects.using(db_alias).create(
             contract=self,
             action=action,
-            performed_by=user,
+            performed_by_id=user_id,
             metadata=metadata or {},
             details=details
         )

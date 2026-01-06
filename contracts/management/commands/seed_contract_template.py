@@ -1,171 +1,436 @@
 from django.core.management.base import BaseCommand
 from django.core.files.base import ContentFile
-from contracts.models import ContractTemplate, Contract
+from contracts.models import ContractTemplate
 from accounts.models import EmployerProfile
 from accounts.database_utils import get_tenant_database_alias
 from io import BytesIO
+from contracts.services import _basic_pdf_bytes
+
+# Generic fallback body (used for non-PERMANENT types)
+BASE_BODY = """
+EMPLOYMENT CONTRACT
+
+Created by:
+{CO_NAME}
+{CO_ADDRESS}, {CO_CITY}, {CO_COUNTRY}
+
+Prepared for:
+{EMP_FIRST} {EMP_LAST}
+{EMP_ADDRESS}, {EMP_CITY}, {EMP_COUNTRY}
+
+1. INTRODUCTION & RECITALS
+This Employment Contract (“Agreement”) is entered into between {CO_NAME}, a company duly organized under the laws of {CO_COUNTRY}, with its principal place of business at {CO_ADDRESS}, {CO_CITY} (“Employer” or “Company”), and {EMP_FIRST} {EMP_LAST}, residing at {EMP_ADDRESS}, {EMP_CITY}, {EMP_COUNTRY} (“Employee”).
+
+2. TERM & POSITION
+Start Date: {START_DATE}; End Date: {END_DATE}
+Role: {EMP_TITLE}; Location: {BRANCH_NAME} / {DEPARTMENT_NAME}; full effort, skill, and attention required; duties as assigned.
+
+3. COMPENSATION & BENEFITS
+Base Salary: {BASE_SALARY} {CURRENCY}, paid {PAY_FREQUENCY}.
+Allowances: {ALLOWANCES}. Deductions: {DEDUCTIONS}.
+Statutory taxes/withholdings apply. Benefits per Company policy and law.
+
+4. CONFIDENTIALITY & INTELLECTUAL PROPERTY
+Protect all Company confidential/proprietary info; do not misuse. All work product/IP created during employment belongs to {CO_NAME}.
+
+5. NON-COMPETE & NON-SOLICITATION
+For 12 months post-termination, do not solicit Company clients, employees, or contractors. Non-compete applies only as permitted by law.
+
+6. TERMINATION
+Either Party may terminate with {NOTICE_PERIOD} written notice unless immediate termination for gross misconduct/breach/legal grounds.
+
+7. RETURN OF COMPANY PROPERTY
+On termination, promptly return all Company property, data, documents, and equipment; retain no copies.
+
+8. GOVERNING LAW
+This Agreement is governed by the laws of {CO_COUNTRY}.
+
+9. ENTIRE AGREEMENT & AMENDMENTS
+Supersedes prior understandings; changes must be in writing and signed by both Parties.
+
+10. SIGNATURES
+For {CO_NAME}: __________________ Date: {SIGN_DATE_CO}
+Employee ({EMP_FIRST} {EMP_LAST}): __________________ Date: {SIGN_DATE_EMP}
+""".strip()
+
+# Permanent-specific body provided by user
+PERMANENT_BODY = """
+PERMANENT (INDEFINITE) EMPLOYMENT CONTRACT
+
+EMPLOYMENT CONTRACT (PERMANENT)
+
+Created by:
+{CO_NAME}
+{CO_ADDRESS}, {CO_CITY}, {CO_COUNTRY}
+
+Prepared for:
+{EMP_FIRST} {EMP_LAST}
+{EMP_ADDRESS}, {EMP_CITY}, {EMP_COUNTRY}
+
+1. INTRODUCTION & RECITALS
+This Employment Contract (“Agreement”) is entered into between {CO_NAME}, a company duly organized and existing under the laws of {CO_COUNTRY}, with its principal place of business at {CO_ADDRESS}, {CO_CITY} (“Employer” or “Company”), and {EMP_FIRST} {EMP_LAST}, residing at {EMP_ADDRESS}, {EMP_CITY}, {EMP_COUNTRY} (“Employee”).
+WHEREAS, the Company desires to employ the Employee in a permanent capacity; and
+WHEREAS, the Employee desires to accept such employment under the terms and conditions set forth herein;
+NOW, THEREFORE, in consideration of the mutual covenants herein, the Parties agree as follows:
+
+2. TERM OF EMPLOYMENT
+Employment shall commence on {START_DATE} (“Start Date”) and shall continue for an indefinite period unless terminated in accordance with this Agreement or applicable law.
+Nothing in this Agreement shall be construed as guaranteeing employment for a specific duration.
+
+3. POSITION & DUTIES
+The Employee is employed as {EMP_TITLE} and shall perform all duties customarily associated with this position, including duties reasonably assigned by the Company.
+The Employee shall report to the manager designated by the Company and shall perform duties at {BRANCH_NAME} / {DEPARTMENT_NAME}, or such other location as reasonably required.
+The Employee agrees to devote full professional effort, skill, and attention to the performance of duties.
+
+4. COMPENSATION & BENEFITS
+Base Salary: {BASE_SALARY} {CURRENCY}, paid {PAY_FREQUENCY}.
+Allowances: {ALLOWANCES}.
+Deductions: {DEDUCTIONS}.
+All statutory taxes and withholdings apply.
+Employee shall be entitled to benefits, leave, and entitlements in accordance with Company policy and applicable law.
+
+5. PROBATION
+The Employee shall be subject to a probation period of {PROBATION_PERIOD}, during which employment may be terminated with reduced notice as permitted by law.
+
+6. CONFIDENTIALITY & INTELLECTUAL PROPERTY
+The Employee shall not disclose or misuse confidential or proprietary information during or after employment.
+All inventions, work product, discoveries, and intellectual property created during employment shall be the exclusive property of {CO_NAME}.
+
+7. NON-COMPETE & NON-SOLICITATION
+For 12 months following termination, the Employee shall not solicit Company clients, employees, or contractors.
+Any non-compete obligations shall apply only to the extent permitted by law.
+
+8. TERMINATION
+Either Party may terminate this Agreement by providing {NOTICE_PERIOD} written notice.
+Immediate termination may occur for gross misconduct, breach, or legal grounds.
+
+9. RETURN OF COMPANY PROPERTY
+Upon termination, all Company property, data, documents, and equipment must be returned immediately.
+
+10. GOVERNING LAW
+This Agreement shall be governed by the laws of {CO_COUNTRY}.
+
+11. ENTIRE AGREEMENT & AMENDMENTS
+This Agreement constitutes the entire agreement and supersedes all prior understandings.
+Amendments must be in writing and signed by both Parties.
+
+12. SIGNATURES
+For {CO_NAME}: __________________ Date: {SIGN_DATE_CO}
+Employee ({EMP_FIRST} {EMP_LAST}): __________________ Date: {SIGN_DATE_EMP}
+""".strip()
+
+FIXED_TERM_BODY = """
+FIXED-TERM EMPLOYMENT CONTRACT
+
+EMPLOYMENT CONTRACT (FIXED-TERM)
+
+Created by:
+{CO_NAME}
+{CO_ADDRESS}, {CO_CITY}, {CO_COUNTRY}
+
+Prepared for:
+{EMP_FIRST} {EMP_LAST}
+{EMP_ADDRESS}, {EMP_CITY}, {EMP_COUNTRY}
+
+1. INTRODUCTION & RECITALS
+This Employment Contract (“Agreement”) is entered into between {CO_NAME}, a company duly organized and existing under the laws of {CO_COUNTRY}, with its principal place of business at {CO_ADDRESS}, {CO_CITY} (“Employer” or “Company”), and {EMP_FIRST} {EMP_LAST}, residing at {EMP_ADDRESS}, {EMP_CITY}, {EMP_COUNTRY} (“Employee”).
+WHEREAS, the Company desires to employ the Employee on a fixed-term basis; and
+WHEREAS, the Employee desires to accept such employment under the terms and conditions set forth herein;
+NOW, THEREFORE, in consideration of the mutual covenants herein, the Parties agree as follows:
+
+2. TERM OF EMPLOYMENT
+Employment shall commence on {START_DATE} and shall automatically terminate on {END_DATE}, unless renewed in writing by the Parties.
+Nothing herein creates any expectation of renewal or continued employment beyond the fixed term.
+
+3. POSITION & DUTIES
+The Employee is employed as {EMP_TITLE} and shall perform all duties customarily associated with this position, including duties reasonably assigned by the Company.
+The Employee shall report to the manager designated by the Company and shall perform duties at {BRANCH_NAME} / {DEPARTMENT_NAME}, or such other location as reasonably required.
+The Employee agrees to devote full professional effort, skill, and attention to the performance of duties.
+
+4. COMPENSATION & BENEFITS
+Base Salary: {BASE_SALARY} {CURRENCY}, paid {PAY_FREQUENCY}.
+Allowances: {ALLOWANCES}.
+Deductions: {DEDUCTIONS}.
+All statutory taxes and withholdings apply.
+Employee shall be entitled to benefits, leave, and entitlements in accordance with Company policy and applicable law.
+
+5. PROBATION
+The Employee may be subject to a probation period of {PROBATION_PERIOD}, during which employment may be terminated with reduced notice as permitted by law.
+
+6. CONFIDENTIALITY & INTELLECTUAL PROPERTY
+The Employee shall not disclose or misuse confidential or proprietary information during or after employment.
+All inventions, work product, discoveries, and intellectual property created during employment shall be the exclusive property of {CO_NAME}.
+
+7. NON-COMPETE & NON-SOLICITATION
+For 12 months following termination, the Employee shall not solicit Company clients, employees, or contractors.
+Any non-compete obligations shall apply only to the extent permitted by law.
+
+8. TERMINATION
+Either Party may terminate this Agreement by providing {NOTICE_PERIOD} written notice, subject to the fixed end date.
+Immediate termination may occur for gross misconduct, breach, or legal grounds.
+
+9. RETURN OF COMPANY PROPERTY
+Upon termination, all Company property, data, documents, and equipment must be returned immediately.
+
+10. GOVERNING LAW
+This Agreement shall be governed by the laws of {CO_COUNTRY}.
+
+11. ENTIRE AGREEMENT & AMENDMENTS
+This Agreement constitutes the entire agreement and supersedes all prior understandings.
+Amendments must be in writing and signed by both Parties.
+
+12. SIGNATURES
+For {CO_NAME}: __________________ Date: {SIGN_DATE_CO}
+Employee ({EMP_FIRST} {EMP_LAST}): __________________ Date: {SIGN_DATE_EMP}
+""".strip()
+
+
+CONTRACT_TYPES = [
+    ("PERMANENT", "Default Permanent Contract", "default_permanent.pdf"),
+    ("FIXED_TERM", "Default Fixed-Term Contract", "default_fixed_term.pdf"),
+    ("INTERNSHIP", "Default Internship Contract", "default_internship.pdf"),
+    ("CONSULTANT", "Default Consultant Contract", "default_consultant.pdf"),
+    ("PART_TIME", "Default Part-Time Contract", "default_part_time.pdf"),
+]
+
+TYPE_BODIES = {
+    "PERMANENT": PERMANENT_BODY,
+    "FIXED_TERM": FIXED_TERM_BODY,
+    "PART_TIME": """
+PART-TIME EMPLOYMENT CONTRACT
+
+EMPLOYMENT CONTRACT (PART-TIME)
+
+Created by:
+{CO_NAME}
+{CO_ADDRESS}, {CO_CITY}, {CO_COUNTRY}
+
+Prepared for:
+{EMP_FIRST} {EMP_LAST}
+{EMP_ADDRESS}, {EMP_CITY}, {EMP_COUNTRY}
+
+1. INTRODUCTION & RECITALS
+This Employment Contract (“Agreement”) is entered into between {CO_NAME}, a company duly organized and existing under the laws of {CO_COUNTRY}, with its principal place of business at {CO_ADDRESS}, {CO_CITY} (“Employer” or “Company”), and {EMP_FIRST} {EMP_LAST}, residing at {EMP_ADDRESS}, {EMP_CITY}, {EMP_COUNTRY} (“Employee”).
+WHEREAS, the Company desires to employ the Employee on a part-time basis; and
+WHEREAS, the Employee desires to accept such employment under the terms and conditions set forth herein;
+NOW, THEREFORE, in consideration of the mutual covenants herein, the Parties agree as follows:
+
+2. TERM OF EMPLOYMENT
+Employment shall commence on {START_DATE}. End Date (if applicable): {END_DATE}.
+
+3. POSITION & WORK SCHEDULE
+The Employee is employed as {EMP_TITLE} and shall perform duties customarily associated with this position, including duties reasonably assigned by the Company.
+The Employee shall work approximately {HOURS_PER_WEEK} hours per week, with schedule determined by the Company (subject to reasonable flexibility).
+The Employee shall report to the manager designated by the Company and shall perform duties at {BRANCH_NAME} / {DEPARTMENT_NAME}, or such other location as reasonably required.
+Compensation and benefits are pro-rated in accordance with hours worked and applicable law.
+
+4. COMPENSATION & BENEFITS
+Base Salary: {BASE_SALARY} {CURRENCY}, paid {PAY_FREQUENCY}.
+Allowances: {ALLOWANCES}.
+Deductions: {DEDUCTIONS}.
+All statutory taxes and withholdings apply.
+Employee shall be entitled to benefits, leave, and entitlements per Company policy and law, on a pro-rated basis where applicable.
+
+5. PROBATION
+The Employee may be subject to a probation period of {PROBATION_PERIOD}, during which employment may be terminated with reduced notice as permitted by law.
+
+6. CONFIDENTIALITY & INTELLECTUAL PROPERTY
+The Employee shall not disclose or misuse confidential or proprietary information during or after employment.
+All inventions, work product, discoveries, and intellectual property created during employment shall be the exclusive property of {CO_NAME}.
+
+7. NON-COMPETE & NON-SOLICITATION
+For 12 months following termination, the Employee shall not solicit Company clients, employees, or contractors.
+Any non-compete obligations shall apply only to the extent permitted by law.
+
+8. TERMINATION
+Either Party may terminate this Agreement by providing {NOTICE_PERIOD} written notice.
+Immediate termination may occur for gross misconduct, breach, or legal grounds.
+
+9. RETURN OF COMPANY PROPERTY
+Upon termination, all Company property, data, documents, and equipment must be returned immediately.
+
+10. GOVERNING LAW
+This Agreement shall be governed by the laws of {CO_COUNTRY}.
+
+11. ENTIRE AGREEMENT & AMENDMENTS
+This Agreement constitutes the entire agreement and supersedes all prior understandings.
+Amendments must be in writing and signed by both Parties.
+
+12. SIGNATURES
+For {CO_NAME}: __________________ Date: {SIGN_DATE_CO}
+Employee ({EMP_FIRST} {EMP_LAST}): __________________ Date: {SIGN_DATE_EMP}
+""".strip(),
+    "INTERNSHIP": """
+INTERNSHIP AGREEMENT
+
+Created by:
+{CO_NAME}
+{CO_ADDRESS}, {CO_CITY}, {CO_COUNTRY}
+
+Prepared for:
+{EMP_FIRST} {EMP_LAST}
+{EMP_ADDRESS}, {EMP_CITY}, {EMP_COUNTRY}
+
+1. INTRODUCTION & RECITALS
+This Internship Agreement (“Agreement”) is entered into between {CO_NAME}, a company duly organized and existing under the laws of {CO_COUNTRY}, with its principal place of business at {CO_ADDRESS}, {CO_CITY} (“Company”), and {EMP_FIRST} {EMP_LAST}, residing at {EMP_ADDRESS}, {EMP_CITY}, {EMP_COUNTRY} (“Intern”).
+
+2. TERM
+This Internship shall commence on {START_DATE} and end on {END_DATE}, unless terminated earlier. This Agreement does not create an employment relationship beyond the internship period, nor does it imply any guarantee of future employment.
+
+3. TRAINING & SUPERVISION
+The Intern shall perform duties under the supervision of a designated mentor and participate in learning activities. The Intern will carry out assigned tasks at {BRANCH_NAME} / {DEPARTMENT_NAME} or other locations as reasonably required. No promise of continued employment is made or implied.
+
+4. COMPENSATION & BENEFITS
+Base/Stipend: {BASE_SALARY} {CURRENCY}, paid {PAY_FREQUENCY} (if applicable).
+Allowances: {ALLOWANCES}. Deductions: {DEDUCTIONS}. Statutory withholdings apply where applicable.
+Any benefits or leave entitlements are limited to those expressly provided by Company policy and applicable law for interns.
+
+5. CONFIDENTIALITY & INTELLECTUAL PROPERTY
+The Intern shall not disclose or misuse confidential or proprietary information during or after the internship. All work product, inventions, and intellectual property created in the course of the internship are the exclusive property of {CO_NAME}.
+
+6. NON-COMPETE & NON-SOLICITATION
+For 12 months following the end of the internship, the Intern shall not solicit Company clients, employees, or contractors. Any non-compete obligations apply only to the extent permitted by law.
+
+7. TERMINATION
+Either Party may terminate this Agreement by providing {NOTICE_PERIOD} written notice. Immediate termination may occur for gross misconduct, breach, or legal grounds.
+
+8. RETURN OF COMPANY PROPERTY
+Upon termination or conclusion of the internship, all Company property, data, documents, and equipment must be returned immediately.
+
+9. GOVERNING LAW
+This Agreement shall be governed by the laws of {CO_COUNTRY}.
+
+10. ENTIRE AGREEMENT & AMENDMENTS
+This Agreement constitutes the entire agreement and supersedes all prior understandings. Amendments must be in writing and signed by both Parties.
+
+11. SIGNATURES
+For {CO_NAME}: __________________ Date: {SIGN_DATE_CO}
+Intern ({EMP_FIRST} {EMP_LAST}): __________________ Date: {SIGN_DATE_EMP}
+""".strip(),
+    "CONSULTANT": """
+CONSULTING AGREEMENT
+
+Created by:
+{CO_NAME}
+{CO_ADDRESS}, {CO_CITY}, {CO_COUNTRY}
+
+Prepared for:
+{EMP_FIRST} {EMP_LAST}
+{EMP_ADDRESS}, {EMP_CITY}, {EMP_COUNTRY}
+
+1. INTRODUCTION & RECITALS
+This Consulting Agreement (“Agreement”) is entered into between {CO_NAME}, a company duly organized and existing under the laws of {CO_COUNTRY}, with its principal place of business at {CO_ADDRESS}, {CO_CITY} (“Company”), and {EMP_FIRST} {EMP_LAST}, residing at {EMP_ADDRESS}, {EMP_CITY}, {EMP_COUNTRY} (“Consultant”).
+
+2. INDEPENDENT CONTRACTOR STATUS
+The Consultant is an independent contractor, not an employee. No employment benefits apply. The Consultant is responsible for all taxes, insurance, and statutory obligations.
+
+3. SERVICES & DELIVERABLES
+The Consultant shall provide professional services as agreed, subject to project scope and deliverables defined by the Parties. Location: {BRANCH_NAME} / {DEPARTMENT_NAME} or as mutually agreed. No guarantee of future engagements is implied.
+
+4. FEES & PAYMENT
+Fees: {BASE_SALARY} {CURRENCY}
+Billing cadence: {PAY_FREQUENCY}
+Invoices payable per agreed terms. Statutory withholdings, if any, as required by law.
+
+5. CONFIDENTIALITY & IP OWNERSHIP
+The Consultant shall not disclose or misuse Company confidential/proprietary information during or after the engagement. All deliverables and work product become the exclusive property of {CO_NAME} upon payment.
+
+6. NON-SOLICITATION
+For 12 months following termination, the Consultant shall not solicit Company clients, employees, or contractors. Any non-compete applies only to the extent permitted by law.
+
+7. TERM & TERMINATION
+Start Date: {START_DATE}; End Date (if applicable): {END_DATE}.
+Either Party may terminate this Agreement by providing {NOTICE_PERIOD} written notice, subject to any project-specific terms. Immediate termination may occur for material breach or legal grounds.
+
+8. RETURN OF COMPANY PROPERTY
+Upon termination, all Company property, data, documents, and equipment must be returned immediately.
+
+9. GOVERNING LAW
+This Agreement shall be governed by the laws of {CO_COUNTRY}.
+
+10. ENTIRE AGREEMENT & AMENDMENTS
+This Agreement constitutes the entire agreement and supersedes all prior understandings. Amendments must be in writing and signed by both Parties.
+
+11. SIGNATURES
+For {CO_NAME}: __________________ Date: {SIGN_DATE_CO}
+Consultant ({EMP_FIRST} {EMP_LAST}): __________________ Date: {SIGN_DATE_EMP}
+""".strip(),
+}
+
 
 class Command(BaseCommand):
-    help = 'Creates a default contract template with the provided text.'
+    help = 'Creates default contract templates (one per contract type) for each employer.'
+
+    def render_pdf(self, title: str, body: str) -> ContentFile:
+        """
+        Render a simple PDF from plain text using reportlab if available.
+        Falls back to a minimal PDF built with stdlib when reportlab is unavailable.
+        """
+        try:
+            from reportlab.lib.pagesizes import A4
+            from reportlab.pdfgen import canvas
+        except ImportError:
+            return ContentFile(_basic_pdf_bytes(title, body))
+
+        buffer = BytesIO()
+        c = canvas.Canvas(buffer, pagesize=A4)
+        width, height = A4
+        y = height - 50
+        # Write title
+        c.setFont("Helvetica-Bold", 14)
+        c.drawString(50, y, title)
+        y -= 20
+        c.setFont("Helvetica", 10)
+        for para in body.split("\n\n"):
+            for line in para.split("\n"):
+                if y < 50:
+                    c.showPage()
+                    y = height - 50
+                    c.setFont("Helvetica", 10)
+                c.drawString(50, y, line.strip())
+                y -= 14
+            y -= 8
+        c.showPage()
+        c.save()
+        buffer.seek(0)
+        return ContentFile(buffer.getvalue())
 
     def handle(self, *args, **options):
-        # Loop through employers and create template for each
         employers = EmployerProfile.objects.all()
+
         for employer in employers:
             tenant_db = get_tenant_database_alias(employer)
-            
-            # DYNAMIC DB CONFIGURATION
-            # Since this is a management command, the middleware hasn't run to set up connections.
-            # We must manually ensure the connection exists in settings.DATABASES or connections handler.
-            # However, standard Django usually requires setup in settings.DATABASES.
-            # But likely our project might have a helper or we should use the existing DB_NAME/USER etc
-            # and just mutate the connection settings temporarily or rely on how migrations do it.
-            
-            # Let's inspect how database_utils.get_tenant_database_alias works - 
-            # it returns a string alias. If settings.DATABASES doesn't have it, we must add it.
-            
+
+            # Ensure tenant DB is loaded
             from django.conf import settings
-            from django.db import connections
-            
             if tenant_db not in settings.DATABASES:
-                 # Construct the config based on default but with correct name
-                 default_config = settings.DATABASES['default'].copy()
-                 default_config['NAME'] = employer.database_name
-                 settings.DATABASES[tenant_db] = default_config
-            
-            # Check if template already exists
-            try:
-                if not ContractTemplate.objects.using(tenant_db).filter(
-                    employer_id=employer.id, 
-                    name="Default Fixed-Term Contract",
-                    contract_type='FIXED_TERM'
-                ).exists():
-                    
-                    try:
-                        from docx import Document
-                        doc = Document()
-                        doc.add_heading('EMPLOYMENT CONTRACT', 0)
+                default_config = settings.DATABASES['default'].copy()
+                default_config['NAME'] = employer.database_name
+                settings.DATABASES[tenant_db] = default_config
 
-                        text = """
-Prepared for: [Employee.FirstName] [Employee.LastName] [Employee.Company]
+            for contract_type, template_name, filename in CONTRACT_TYPES:
+                # Skip if a default already exists for this type
+                exists = ContractTemplate.objects.using(tenant_db).filter(
+                    employer_id=employer.id,
+                    contract_type=contract_type,
+                    is_default=True
+                ).exists()
+                if exists:
+                    self.stdout.write(f"Default template already exists for {employer.company_name} [{contract_type}]")
+                    continue
 
-Created by: [Sender.FirstName] [Sender.LastName] [Sender.Company]
+                body = TYPE_BODIES.get(contract_type, BASE_BODY)
 
-This Employment Contract (the "Contract" or "Employment Contract") states the terms and conditions that govern the contractual agreement between [Sender.Company] (the "Company") having its principal place of business at, [Sender.StreetAddress], [Sender.City], [Sender.State], [Sender.PostalCode] and [Employee.FirstName] [Employee.LastName] (the "Employee") who agrees to be bound by this Contract.
-
-WHEREAS, the Company is engaged in the description of business; and WHEREAS, the Company desires to employ and retain the Services of the Employee according to the terms and conditions herein.
-
-NOW, THEREFORE, In consideration of the mutual covenants and promises made by the parties hereto, the Company and the Employee (individually, each a "Party" and collectively, the "Parties") agree as follows:
-
-1. TERM
-The term of this Employment Contract shall commence on (Start.Date) (the "Start Date"). The Employee agrees and acknowledges that, just as they have the right to terminate their employment with the Company at any time for any reason, the Company has the same right, and may terminate their employment with the Company at any time for any reason. Either Party may terminate said employment with written notice to the other Party.
-
-2. DUTIES
-The Company shall employ the Employee as [Employee.Title] (the "Position"). The Employee accepts employment with the Company on the terms and conditions outlined in this Employment Contract and agrees to devote their full time and attention (with reasonable periods of illness excepted) to the performance of their duties under this Contract.
-
-The Employee pledges to operate in line with this Contract and in the business' best interests, which may or may not require utilizing their full range of abilities to carry out all job-related responsibilities. The Parties agreed to follow all guidelines, practices, norms, and requirements that are enforced by the Company in the performance of the functions and obligations of the job. Additionally, when working for the Company, the Employee promises to follow all applicable community, municipal, statewide, and national statutes.
-
-In general, the Employee shall perform all the duties outlined in the job description in Exhibit A attached hereto.
-
-3. COMPENSATION
-In consideration for the performance of the duties hereunder, the Employee shall be entitled to compensation as follows:
-
-a. The Company shall pay the Employee an annual salary (the "Annual Salary"), also referred to as "Wages." Initially, the Annual Salary shall be at the rate of (Annual.Salary.In.Words) ($Annual_Salary_Amount) per year. The Annual Salary shall be payable in installments, minus the usual and customary payroll deductions for FICA, federal and state withholding, etc., at the times and in the manner in effect in accordance with the usual and customary payroll policies in effect at Company.
-
-b. The Company shall pay and provide to employee retirement plans, health insurance, disability insurance plan benefits, and other benefits generally in effect for salaried employees of the Company beginning on the Effective Hiring Date in accordance with and on the same terms as are generally in effect for employees of the Company.
-
-c. The Employee shall be allowed paid time off for vacation, holidays, and other employee benefits not described above in accordance with the Company policies in general effect for the Company's salaried employees.
-
-4. CONFIDENTIALITY
-The Employee shall not (i) disclose to any third party any details regarding the business of the Company, including, without limitation, the names of any of its customers, the prices it obtains, the prices at which it sells products, its manner of operation, its plans, its strategies, any of the Company's trade secrets or any other information pertaining to the business of the Company (the "Confidential Information"), (ii) make copies of any Confidential Information or any content based on the concepts contained within the Confidential Information for personal use or for distribution unless requested to do so by the Company, or (iii) use Confidential Information other than solely for the benefit of the Company.
-
-Employee acknowledges and agrees that any legal remedy for any breach of this confidentiality provision may be inadequate and, in the event of any such breach, the Company shall be entitled to immediate and permanent injunctive relief to preclude and/or any such breach (in addition to any remedies at law to which the Company may be entitled) without the posting of any bond or security therefore.
-
-5. RETURN OF PROPERTY
-Within seven (7) days of the termination of this Contract, whether by expiration or otherwise, the Employee agrees to return to the Company, all products, samples, or models, and all documents, retaining no copies or notes, relating to the Company's business including, but not limited to:
-
-a. Item 1
-
-b. Item 2
-
-c. Item 3
-
-6. NON-COMPETE AND NON-SOLICITATION
-a. Employee hereby agrees (the "Non-Competition Agreement") that, upon the termination of Employee's Employment (for whatever reason, whether during the term of this Agreement or after the termination of this Agreement), for a period of (number of years) following the termination of Employment, Employee shall not directly or indirectly (whether as an officer, director, employee, partner, stockholder, creditor or agent, or representative of other persons or entities) engage in the (Company's industry or type of business) business or in any business in which the Company has, as of the date of such termination, engaged (the "Company's business"), in (Country, State), any county contiguous to such county, and in any county or state in which the Company maintains an office (the "Trade Area").
-
-b. Employee also agrees (the "Non-Solicitation Agreement"), that for a period of (number of years) following the termination of Employee's Employment (for whatever reason, whether during the term of this Agreement or after the termination of this Agreement), Employee shall not directly or indirectly (whether as an officer, director, employee, partner, stockholder, creditor or agent, or representative of other persons or entities) contact or solicit, in any manner indirectly or directly, individuals or entities who were at any time during the original or any extended Term clients of the Company for the purpose of providing (type of services Employee) services by Company during the Term or contact or solicit employees of the Company to seek employment with any person or entity except the Company.
-
-c. Employee agrees that (i) any remedy at law for any breach of the Non-Competition Agreement and/or the Non-Solicitation Agreement would be inadequate, (ii) any breach of the Non-Competition Agreement and/or the Non-Solicitation Agreement shall constitute incontrovertible evidence of irreparable injury to the Company, and (iii) the Company shall be entitled to both immediate and permanent injunctive relief without the necessity of establishing or posting any bond therefore to preclude any such breach (in addition to any remedies of law which the Company may be entitled).
-
-7. EXPENSES
-The Employee shall not be entitled to reimbursement for any expenses except those that have been previously approved in writing by the Company. Should the Company require travel by the Employee, the Company shall reimburse the Employee for such travel expenses, along with reasonable lodging and meal expenses upon presentation of receipts for such expenses.
-
-[Sender.Company] promises to reimburse or compensate the Employee once the Employee has provided receipts or expense reports for all the fees incurred by the Employee during their work hours. This includes all the money spent by the Employee while executing their responsibilities mentioned in the Contract. Costs include, without constraints, expenses for items such as commuting, accommodation, attending conferences, and similar items.
-
-This is as per the Employee's retention contract. The personal expenses policy initiatives states that the Business must incorporate this. The Employee shall maintain a list of compensated expenses which the Company shall classify and document as additional pay and which the Employer shall treat as deductible in the remuneration structure of expenditures.
-
-Additionally, and if applicable, the Employer shall give the Employee complete access to transportation and provide them with a vehicle that is currently up to date and fully operational. This shall be for the duration of the Implied Time clause under this Contract. Any and all general driving policies that the Company may at any time implement must be followed by the Employee when using this vehicle. For Employees who require a parking spot for such use, the parking space must be chosen, managed, and upgraded in accordance with the Company's business automobile policy.
-
-8. SEVERABILITY
-If a court finds any provision of this Employment Contract invalid or unenforceable, the remainder of this Employment Contract shall be interpreted as best as is possible with respect to the original intent of the Parties.
-
-9. EMPLOYEE REPRESENTATIONS AND WARRANTIES
-The Employee represents and warrants to the Company the following:
-
-a. There is no other employment contract or any other contractual obligation to which the Employee is subject, which prevents the Employee from entering into this Contract or from performing fully the Employee's duties under this Contract.
-
-b. The acceptance and submission of this Agreement and the performance of its provisions will (i) not violate any memorandum of understanding or any other documentation to which they are a participant or by which they will be obligated; and (ii) need not be subject to the approval of any individual or persons. Further, the Employee signifies, subpoenas, and commits that (i) their involvement with the Company is in good faith; (ii) their involvement with the Company is for the full term of his authorized employment with the Company; and (iii) their involvement with any authorized private entity as during time frame of their participation with the Company.
-
-c. The Company shall make no specific accommodations for the Employee to perform their duties and responsibilities, other than those specifically described under this Contract.
-
-10. NO MODIFICATION UNLESS IN WRITING
-No modification of this Employment Contract shall be valid unless in writing and agreed upon by both Parties.
-
-No aspect of this Contract may be changed, repealed, or dismissed unless both the Employee and the Company consent to it in writing and sign accordingly. No waiver by either Party hereto at any time of any breach or compliance by the other Party hereto with any circumstance or requirement of this Contract to be executed shall be permitted a waiver of similar or identical clauses or constraints for the same or at any preceding or immediately following period. With regard to the assessment hereof, neither Party has made any agreements or statements, whether oral or written, express or implied, that are not stated explicitly in this Agreement.
-
-11. ENTIRE AGREEMENT
-This Employment Contract expresses the complete understanding of the Parties with respect to the subject matter and supersedes all prior proposals, agreements, representations, and understandings. This Employment Contract may not be amended except in writing and signed by both Parties.
-
-12. APPLICABLE LAW
-This Employment Contract and the interpretation of its terms shall be governed by and construed in accordance with the laws of the State of [Sender.State] and subject to the exclusive jurisdiction of the federal and state courts located in [Sender.Country], [Sender.State].
-
-13. TERMINATION OF THE AGREEMENT
-Regardless of any clauses or statements to the contrary in this agreement, the Company or the Employee may end the agreement if they decide — this decision may be made at their discretion and will not result in any remedies, except the ones mentioned in the Contract. Any such termination must be carried out by delivering a formal termination notice to the other Party. The formal notice may be provided through email, written notice, fax, regular mail, or other courier. This notice has to be delivered to the home, fax, or email address provided by the Company or the Employee.
-
-14. ACCEPTANCE FORM
-IN WITNESS WHEREOF, each of the Parties has executed this Contract, both Parties by its duly authorized officer, as of the day and year set forth below.
-
-[Sender.FirstName] [Sender.LastName] [Sender.Company] Signature: ____________________ Date: MM / DD / YYYY
-
-[Employee.FirstName] [Employee.LastName] Signature: ____________________ Date: MM / DD / YYYY
-                        """
-                        
-                        # Split text into paragraphs
-                        for para in text.split('\\n\\n'):
-                            doc.add_paragraph(para.strip())
-
-                        # Save to BytesIO
-                        output = BytesIO()
-                        doc.save(output)
-                        content = ContentFile(output.getvalue())
-                    except ImportError:
-                         self.stdout.write(self.style.WARNING("python-docx missing. Creating dummy content."))
-                         content = ContentFile(b"Dummy DOCX content for template.")
-                    
-                    template = ContractTemplate(
-                        employer_id=employer.id,
-                        name="Default Fixed-Term Contract",
-                        contract_type="FIXED_TERM",
-                        is_default=True
-                    )
-                    template.file.save("default_fixed_term.docx", content, save=False)
-                    template.save(using=tenant_db)
-                    self.stdout.write(self.style.SUCCESS(f"Created default template for {employer.company_name}"))
-                else:
-                    self.stdout.write(f"Template already exists for {employer.company_name}")
-            except Exception as e:
-                self.stdout.write(self.style.ERROR(f"Error processing {employer.company_name}: {e}"))
-
-        self.stdout.write(self.style.SUCCESS('Successfully seeded default templates.'))
+                title = f'{contract_type} EMPLOYMENT CONTRACT'
+                content = self.render_pdf(title, body)
+                template = ContractTemplate(
+                    employer_id=employer.id,
+                    name=template_name,
+                    contract_type=contract_type,
+                    is_default=True
+                )
+                template.file.save(filename, content, save=False)
+                template.save(using=tenant_db)
+                self.stdout.write(self.style.SUCCESS(f"Created default template for {employer.company_name} [{contract_type}]"))
 
         self.stdout.write(self.style.SUCCESS('Successfully seeded default templates.'))
