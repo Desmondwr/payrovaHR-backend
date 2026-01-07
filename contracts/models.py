@@ -423,17 +423,54 @@ class Contract(models.Model):
         self.log_action(user, 'SENT_FOR_SIGNATURE')
         notify_sent_for_signature(self)
 
-    def approve(self, user):
-        if self.status != 'PENDING_APPROVAL':
-            raise ValidationError("Contract is not pending approval.")
-        
-        self.status = 'APPROVED'
+    def send_for_approval(self, user):
+        """
+        New flow: explicitly move to PENDING_APPROVAL (replaces send_for_signature entrypoint).
+        """
+        if self.status not in ['DRAFT', 'APPROVED', 'PENDING_APPROVAL']:
+            raise ValidationError("Only draft or approved contracts can be sent for approval.")
+        self.status = 'PENDING_APPROVAL'
         self.save()
-        self.log_action(user, 'APPROVED')
+        self.log_action(user, 'SENT_FOR_APPROVAL')
+
+    def approve(self, user, role=None):
+        """
+        Capture approval by role (EMPLOYEE/EMPLOYER). When both approvals exist,
+        mark the contract as signed.
+        """
+        if self.status not in ['PENDING_APPROVAL', 'APPROVED', 'PENDING_SIGNATURE']:
+            raise ValidationError("Contract is not pending approval.")
+
+        # Determine which DB to write to (tenant-aware)
+        db_alias = self._state.db or 'default'
+
+        # Record/Update signature approval entry
+        signer_name = user.get_full_name() or user.email or 'User'
+        ContractSignature.objects.using(db_alias).update_or_create(
+            contract=self,
+            role=role or 'EMPLOYER',
+            defaults={
+                'signer_user': user,
+                'signer_name': signer_name,
+                'signature_text': 'Signature on file',
+            }
+        )
+
+        # Check if both parties have approved
+        has_employee = ContractSignature.objects.using(db_alias).filter(contract=self, role='EMPLOYEE').exists()
+        has_employer = ContractSignature.objects.using(db_alias).filter(contract=self, role='EMPLOYER').exists()
+
+        if has_employee and has_employer:
+            # Both approvals captured; mark signed
+            self.mark_signed(user)
+        else:
+            self.status = 'PENDING_APPROVAL'
+            self.save()
+            self.log_action(user, 'APPROVED')
 
     def mark_signed(self, user):
-        if self.status != 'PENDING_SIGNATURE':
-            raise ValidationError("Contract must be pending signature to be marked as signed.")
+        if self.status not in ['PENDING_SIGNATURE', 'PENDING_APPROVAL', 'APPROVED']:
+            raise ValidationError("Contract must be awaiting approval/signature to be marked as signed.")
             
         self.status = 'SIGNED'
         self.save()
@@ -698,6 +735,9 @@ class ContractTemplate(models.Model):
         upload_to='contract_templates/',
         help_text='Template file (DOCX, PDF, etc.)'
     )
+
+    # Optional editable body override (used when regenerating default PDF templates)
+    body_override = models.TextField(blank=True, null=True)
     
     is_default = models.BooleanField(
         default=False,

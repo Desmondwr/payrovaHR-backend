@@ -2,7 +2,7 @@ from rest_framework import viewsets, permissions, status
 from rest_framework.decorators import action
 from rest_framework.response import Response
 from .models import (
-    Contract, ContractConfiguration
+    Contract, ContractConfiguration, ContractTemplate
 )
 from .serializers import (
     ContractSerializer, ContractConfigurationSerializer
@@ -10,6 +10,8 @@ from .serializers import (
 from django.utils import timezone
 from django.core.exceptions import ValidationError
 from accounts.middleware import set_current_tenant_db
+from accounts.models import EmployerProfile, User
+from contracts.management.commands.seed_contract_template import TYPE_BODIES, BASE_BODY
 
 class ContractViewSet(viewsets.ModelViewSet):
     """
@@ -40,6 +42,26 @@ class ContractViewSet(viewsets.ModelViewSet):
     def _is_employer_user(self, user, contract):
         """Check if the user is the employer that owns the contract"""
         return hasattr(user, 'employer_profile') and user.employer_profile.id == contract.employer_id
+
+    def _get_role(self, user, contract):
+        """Determine if user is employer or employee for this contract"""
+        if contract.employee and contract.employee.user_id == user.id:
+            return 'EMPLOYEE'
+        if self._is_employer_user(user, contract):
+            return 'EMPLOYER'
+        return None
+
+    def _get_user_signature_path(self, user_id):
+        """Fetch signature path from default DB for a user id (None if missing)."""
+        if not user_id:
+            return None
+        try:
+            user_obj = User.objects.using('default').get(id=user_id)
+            if user_obj.signature and user_obj.signature.name:
+                return user_obj.signature.path
+        except Exception:
+            return None
+        return None
 
     def get_queryset(self):
         """
@@ -74,6 +96,52 @@ class ContractViewSet(viewsets.ModelViewSet):
         else:
             instance.delete()
 
+    @action(detail=False, methods=['get', 'patch'], url_path='template/default')
+    def default_template(self, request):
+        """Get or update the default template body for the employer by contract_type (no uploads)."""
+        user = request.user
+        if not hasattr(user, 'employer_profile'):
+            return Response({'error': 'Only employers can manage templates.'}, status=status.HTTP_403_FORBIDDEN)
+
+        contract_type = request.query_params.get('contract_type') or request.data.get('contract_type')
+        if not contract_type:
+            return Response({'error': 'contract_type is required.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        from accounts.database_utils import get_tenant_database_alias
+        tenant_db = get_tenant_database_alias(user.employer_profile)
+
+        template = (
+            ContractTemplate.objects.using(tenant_db)
+            .filter(employer_id=user.employer_profile.id, contract_type=contract_type, is_default=True)
+            .order_by('-created_at')
+            .first()
+        )
+        if not template:
+            return Response({'error': 'Default template not found for this contract type.'}, status=status.HTTP_404_NOT_FOUND)
+
+        if request.method.lower() == 'get':
+            fallback = TYPE_BODIES.get(contract_type, BASE_BODY)
+            return Response({
+                'id': template.id,
+                'contract_type': contract_type,
+                'body': template.body_override or fallback,
+                'updated_at': template.updated_at,
+            })
+
+        # PATCH
+        body = request.data.get('body')
+        if not body:
+            return Response({'error': 'body is required.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        template.body_override = body
+        template.save(using=tenant_db)
+        return Response({
+            'id': template.id,
+            'contract_type': contract_type,
+            'body': template.body_override,
+            'updated_at': template.updated_at,
+        })
+
     @action(detail=True, methods=['post'])
     @action(detail=True, methods=['post'], url_path='activate')
     def activate(self, request, pk=None):
@@ -91,31 +159,50 @@ class ContractViewSet(viewsets.ModelViewSet):
 
     @action(detail=True, methods=['post'], url_path='approve')
     def approve(self, request, pk=None):
-        """Approve a contract that is pending approval"""
+        """Approve a contract. Requires employer and employee signatures on file in default DB."""
+        contract = self.get_object()
+        self._set_tenant_context(contract)
+
+        role = self._get_role(request.user, contract)
+        if not (request.user.is_staff or role):
+            return Response({'error': 'Only the employer or employee for this contract can approve.'}, status=status.HTTP_403_FORBIDDEN)
+
+        # Verify signatures exist for both parties in default DB
+        employee_sig = self._get_user_signature_path(getattr(contract.employee, 'user_id', None))
+        employer_profile = EmployerProfile.objects.using('default').filter(id=contract.employer_id).first()
+        employer_sig = self._get_user_signature_path(getattr(employer_profile, 'user_id', None))
+        missing = []
+        if not employee_sig:
+            missing.append('employee signature')
+        if not employer_sig:
+            missing.append('employer signature')
+        if missing:
+            return Response({'error': f"Missing {' and '.join(missing)}. Please upload signatures before approval."}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            contract.approve(request.user, role=role)
+            return Response(self.get_serializer(contract).data)
+        except ValidationError as e:
+            return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+    @action(detail=True, methods=['post'], url_path='send-for-approval')
+    def send_for_approval(self, request, pk=None):
+        """Move contract to pending approval (new flow)"""
         contract = self.get_object()
         self._set_tenant_context(contract)
         if not (request.user.is_staff or self._is_employer_user(request.user, contract)):
-            return Response({'error': 'Only staff or the employer can approve contracts.'}, status=status.HTTP_403_FORBIDDEN)
+            return Response({'error': 'Only staff or the employer can send contracts for approval.'}, status=status.HTTP_403_FORBIDDEN)
 
         try:
-            contract.approve(request.user)
+            contract.send_for_approval(request.user)
             return Response(self.get_serializer(contract).data)
         except ValidationError as e:
             return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
 
     @action(detail=True, methods=['post'], url_path='send-for-signature')
-    def send_for_signature(self, request, pk=None):
-        """Move contract to pending approval or pending signature based on config"""
-        contract = self.get_object()
-        self._set_tenant_context(contract)
-        if not (request.user.is_staff or self._is_employer_user(request.user, contract)):
-            return Response({'error': 'Only staff or the employer can send contracts for signature.'}, status=status.HTTP_403_FORBIDDEN)
-
-        try:
-            contract.send_for_signature(request.user)
-            return Response(self.get_serializer(contract).data)
-        except ValidationError as e:
-            return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
+    def send_for_signature_alias(self, request, pk=None):
+        """Compatibility alias - routes to send-for-approval"""
+        return self.send_for_approval(request, pk)
 
     @action(detail=True, methods=['post'], url_path='generate-document')
     def generate_document(self, request, pk=None):
