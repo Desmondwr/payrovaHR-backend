@@ -4,7 +4,7 @@ from .views import (
     CreateEmployerView, ActivateAccountView, LoginView,
     Setup2FAView, Verify2FAView, Disable2FAView,
     EmployerProfileView, CompleteEmployerProfileView, UserProfileView,
-    ListEmployersView, EmployerStatusView,
+    ListEmployersView, EmployerStatusView, UserSignatureView,
     RequestPasswordResetView, VerifyResetCodeView, ResendResetCodeView,
     ChangePasswordView
 )
@@ -37,6 +37,7 @@ urlpatterns = [
     
     # Profile endpoints
     path('profile/', UserProfileView.as_view(), name='user-profile'),
+    path('profile/signature/', UserSignatureView.as_view(), name='user-signature'),
     path('employer/profile/', EmployerProfileView.as_view(), name='employer-profile'),
     path('employer/profile/complete/', CompleteEmployerProfileView.as_view(), name='complete-employer-profile'),
 ]

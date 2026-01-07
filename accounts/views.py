@@ -6,12 +6,13 @@ from rest_framework_simplejwt.tokens import RefreshToken
 from django.contrib.auth import get_user_model
 from django_ratelimit.decorators import ratelimit
 from django.utils.decorators import method_decorator
+from django.core.files.base import ContentFile
 from .models import ActivationToken, EmployerProfile, EmployeeRegistry
 from .serializers import (
     UserSerializer, CreateEmployerSerializer, ActivateAccountSerializer,
     LoginSerializer, EmployerProfileSerializer, Enable2FASerializer,
     Disable2FASerializer, EmployeeRegistrySerializer,
-    EmployerListSerializer
+    EmployerListSerializer, SignatureUploadSerializer
 )
 from .utils import (
     api_response, send_activation_email, generate_totp_secret,
@@ -19,6 +20,7 @@ from .utils import (
 )
 from .database_utils import create_tenant_database
 import logging
+import base64
 
 logger = logging.getLogger(__name__)
 
@@ -639,3 +641,79 @@ class ChangePasswordView(APIView):
         )
 
 
+class UserSignatureView(APIView):
+    """Upload or fetch the authenticated user's signature (employer or employee)."""
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request):
+        user = request.user
+        signature_url = None
+        if user.signature:
+            try:
+                signature_url = request.build_absolute_uri(user.signature.url)
+            except Exception:
+                signature_url = user.signature.url
+        return api_response(
+            success=True,
+            message='Signature retrieved.',
+            data={'signature_url': signature_url},
+            status=status.HTTP_200_OK
+        )
+
+    def post(self, request):
+        serializer = SignatureUploadSerializer(data=request.data)
+        if not serializer.is_valid():
+            return api_response(
+                success=False,
+                message='Invalid signature payload.',
+                errors=serializer.errors,
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        user = request.user
+        sig_file = serializer.validated_data.get('signature')
+        data_url = serializer.validated_data.get('signature_data_url')
+
+        # Clear existing signature file to avoid stale blobs
+        if user.signature:
+            user.signature.delete(save=False)
+
+        if sig_file:
+            user.signature = sig_file
+            user.save()
+        else:
+            data_str = data_url or ''
+            ext = 'png'
+            if data_str.startswith('data:'):
+                try:
+                    header, b64data = data_str.split(';base64,')
+                    mime = header.split(':')[1]
+                    ext = mime.split('/')[-1] or 'png'
+                except Exception:
+                    b64data = data_str.split(',')[-1]
+            else:
+                b64data = data_str
+            try:
+                decoded = base64.b64decode(b64data)
+            except Exception:
+                return api_response(
+                    success=False,
+                    message='Invalid base64 signature data.',
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+            filename = f"signature_{user.id}.{ext}"
+            user.signature.save(filename, ContentFile(decoded), save=True)
+
+        signature_url = None
+        if user.signature:
+            try:
+                signature_url = request.build_absolute_uri(user.signature.url)
+            except Exception:
+                signature_url = user.signature.url
+
+        return api_response(
+            success=True,
+            message='Signature saved successfully.',
+            data={'signature_url': signature_url},
+            status=status.HTTP_201_CREATED
+        )

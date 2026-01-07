@@ -44,6 +44,7 @@ class User(AbstractUser):
     profile_completed = models.BooleanField(default=False, help_text='Designates whether the user has completed their profile')
     two_factor_enabled = models.BooleanField(default=False, help_text='Designates whether 2FA is enabled')
     two_factor_secret = models.CharField(max_length=32, blank=True, null=True, help_text='TOTP secret for 2FA')
+    signature = models.ImageField(upload_to='user_signatures/', blank=True, null=True, help_text='Stored user signature image')
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 

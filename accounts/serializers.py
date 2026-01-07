@@ -344,3 +344,14 @@ class ChangePasswordSerializer(serializers.Serializer):
         user.set_password(self.validated_data['new_password'])
         user.save()
         return user
+
+
+class SignatureUploadSerializer(serializers.Serializer):
+    """Serializer to accept uploaded or base64 signatures"""
+    signature = serializers.ImageField(required=False, allow_null=True)
+    signature_data_url = serializers.CharField(required=False, allow_blank=True)
+
+    def validate(self, attrs):
+        if not attrs.get('signature') and not attrs.get('signature_data_url'):
+            raise serializers.ValidationError("Provide a signature file or signature_data_url.")
+        return attrs
