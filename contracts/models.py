@@ -466,7 +466,7 @@ class Contract(models.Model):
             contract=self,
             role=role or 'EMPLOYER',
             defaults={
-                'signer_user': user,
+                'signer_user_id': user.id,
                 'signer_name': signer_name,
                 'signature_text': 'Signature on file',
             }
