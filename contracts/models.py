@@ -78,6 +78,13 @@ class Contract(models.Model):
         related_name='contracts',
         help_text='Department where employee works'
     )
+
+    job_position = models.CharField(
+        max_length=255,
+        null=True,
+        blank=True,
+        help_text='Job position or title for this contract'
+    )
     
     # Contract details
     contract_type = models.CharField(
@@ -104,6 +111,15 @@ class Contract(models.Model):
     )
     
     # Compensation details
+    salary_scale = models.ForeignKey(
+        'SalaryScale',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='contracts',
+        help_text='Salary scale for this contract'
+    )
+
     base_salary = models.DecimalField(
         max_digits=12,
         decimal_places=2,
@@ -362,7 +378,7 @@ class Contract(models.Model):
         # In a multi-tenant environment, full_clean() can fail on ForeignKeys 
         # because it tries to validate them using the default manager.
         # We exclude them here because they are validated by the serializer.
-        self.full_clean(exclude=['employee', 'branch', 'department', 'previous_contract'])
+        self.full_clean(exclude=['employee', 'branch', 'department', 'previous_contract', 'salary_scale'])
         super().save(*args, **kwargs)
 
     @property
@@ -514,6 +530,37 @@ class Contract(models.Model):
         self.status = 'TERMINATED'
         self.save()
         self.log_action(user, 'TERMINATED', metadata={'reason': reason})
+
+
+class SalaryScale(models.Model):
+    """Salary scale entry for contract compensation"""
+
+    STATUS_CHOICES = [
+        ('ENABLED', 'Enabled'),
+        ('DISABLED', 'Disabled'),
+    ]
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    employer_id = models.IntegerField(db_index=True, help_text='ID of the employer (from main database)')
+    salary_category = models.CharField(max_length=255, help_text='Salary category')
+    echelon = models.CharField(max_length=50, help_text='Echelon')
+    amount = models.DecimalField(max_digits=12, decimal_places=2, help_text='Salary amount')
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='ENABLED')
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = 'salary_scales'
+        verbose_name = 'Salary Scale'
+        verbose_name_plural = 'Salary Scales'
+        ordering = ['salary_category', 'echelon']
+        indexes = [
+            models.Index(fields=['employer_id', 'status'], name='salary_scale_emp_status_idx'),
+            models.Index(fields=['employer_id', 'salary_category'], name='salary_scale_emp_cat_idx'),
+        ]
+
+    def __str__(self):
+        return f"{self.salary_category} - {self.echelon} ({self.amount})"
 
 
 class ContractConfiguration(models.Model):

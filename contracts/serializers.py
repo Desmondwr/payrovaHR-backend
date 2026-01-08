@@ -1,7 +1,7 @@
 from rest_framework import serializers
 from .models import (
     Contract, Allowance, Deduction, ContractAmendment, 
-    ContractConfiguration
+    ContractConfiguration, SalaryScale
 )
 
 class AllowanceSerializer(serializers.ModelSerializer):
@@ -16,9 +16,21 @@ class DeductionSerializer(serializers.ModelSerializer):
         exclude = ('contract', 'created_at', 'updated_at')
         read_only_fields = ('id',)
 
+class SalaryScaleSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = SalaryScale
+        fields = '__all__'
+        read_only_fields = ('id', 'employer_id', 'created_at', 'updated_at')
+
+    def create(self, validated_data):
+        tenant_db = self.context.get('tenant_db')
+        if tenant_db:
+            return SalaryScale.objects.using(tenant_db).create(**validated_data)
+        return super().create(validated_data)
+
 class ContractSerializer(serializers.ModelSerializer):
-    allowances = AllowanceSerializer(many=True, required=False)
-    deductions = DeductionSerializer(many=True, required=False)
+    allowances = AllowanceSerializer(many=True, required=False, allow_null=True)
+    deductions = DeductionSerializer(many=True, required=False, allow_null=True)
     gross_salary = serializers.DecimalField(max_digits=12, decimal_places=2, read_only=True)
     branch_name = serializers.CharField(source='branch.name', read_only=True)
     branch_code = serializers.CharField(source='branch.code', read_only=True)
@@ -48,6 +60,8 @@ class ContractSerializer(serializers.ModelSerializer):
                 self.fields['department'].queryset = Department.objects.using(tenant_db).all()
             if 'previous_contract' in self.fields:
                 self.fields['previous_contract'].queryset = Contract.objects.using(tenant_db).all()
+            if 'salary_scale' in self.fields:
+                self.fields['salary_scale'].queryset = SalaryScale.objects.using(tenant_db).all()
 
     def validate(self, data):
         """
@@ -123,6 +137,10 @@ class ContractSerializer(serializers.ModelSerializer):
     def create(self, validated_data):
         allowances_data = validated_data.pop('allowances', [])
         deductions_data = validated_data.pop('deductions', [])
+        if allowances_data is None:
+            allowances_data = []
+        if deductions_data is None:
+            deductions_data = []
         
         # Set tenant and user context automatically
         request = self.context.get('request')

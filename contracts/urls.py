@@ -2,11 +2,12 @@ from django.urls import path, include
 from rest_framework.routers import DefaultRouter
 from .views import (
     ContractViewSet, ContractAmendmentViewSet, 
-    ContractConfigurationViewSet
+    ContractConfigurationViewSet, SalaryScaleViewSet
 )
 
 router = DefaultRouter()
 router.register(r'config', ContractConfigurationViewSet, basename='contract-config')
+router.register(r'salary-scales', SalaryScaleViewSet, basename='salary-scale')
 router.register(r'', ContractViewSet, basename='contract')
 
 amendment_list = ContractAmendmentViewSet.as_view({

@@ -2,15 +2,16 @@ from rest_framework import viewsets, permissions, status
 from rest_framework.decorators import action
 from rest_framework.response import Response
 from .models import (
-    Contract, ContractConfiguration, ContractTemplate
+    Contract, ContractConfiguration, ContractTemplate, SalaryScale
 )
 from .serializers import (
-    ContractSerializer, ContractConfigurationSerializer
+    ContractSerializer, ContractConfigurationSerializer, SalaryScaleSerializer
 )
 from django.utils import timezone
 from django.core.exceptions import ValidationError
 from accounts.middleware import set_current_tenant_db
 from accounts.models import EmployerProfile, User
+from accounts.permissions import IsEmployer
 from contracts.management.commands.seed_contract_template import TYPE_BODIES, BASE_BODY
 
 class ContractViewSet(viewsets.ModelViewSet):
@@ -395,11 +396,13 @@ class ContractViewSet(viewsets.ModelViewSet):
                 employee=contract.employee,
                 branch=contract.branch,
                 department=contract.department,
+                job_position=contract.job_position,
                 contract_type=contract.contract_type,
                 start_date=contract.end_date, # Starts when old one ends? Or strictly provided? 
                 # Ideally start_date = old_end_date + 1 day, but let's assume immediate continuation
                 # For MVP let's require start_date in input or default to old end_date
                 end_date=new_end_date,
+                salary_scale=contract.salary_scale,
                 base_salary=contract.base_salary,
                 currency=contract.currency,
                 pay_frequency=contract.pay_frequency,
@@ -616,4 +619,38 @@ class ContractConfigurationViewSet(viewsets.ModelViewSet):
 
         serializer = self.get_serializer(config)
         return Response(serializer.data)
+
+
+class SalaryScaleViewSet(viewsets.ModelViewSet):
+    """API endpoint for managing salary scales."""
+
+    permission_classes = [IsEmployer]
+    serializer_class = SalaryScaleSerializer
+
+    def get_serializer_context(self):
+        context = super().get_serializer_context()
+        if hasattr(self.request.user, 'employer_profile'):
+            from accounts.database_utils import ensure_tenant_database_loaded
+            tenant_db = ensure_tenant_database_loaded(self.request.user.employer_profile)
+            context['tenant_db'] = tenant_db
+        return context
+
+    def get_queryset(self):
+        from accounts.database_utils import get_tenant_database_alias
+        user = self.request.user
+        if hasattr(user, 'employer_profile'):
+            tenant_db = get_tenant_database_alias(user.employer_profile)
+            return SalaryScale.objects.using(tenant_db).filter(employer_id=user.employer_profile.id)
+        return SalaryScale.objects.none()
+
+    def perform_create(self, serializer):
+        serializer.save(employer_id=self.request.user.employer_profile.id)
+
+    def perform_update(self, serializer):
+        serializer.save()
+
+    def perform_destroy(self, instance):
+        from accounts.database_utils import get_tenant_database_alias
+        tenant_db = get_tenant_database_alias(self.request.user.employer_profile)
+        instance.delete(using=tenant_db)
 

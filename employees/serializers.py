@@ -12,18 +12,38 @@ User = get_user_model()
 
 class DepartmentSerializer(serializers.ModelSerializer):
     """Serializer for Department model"""
-    
+    branch = serializers.PrimaryKeyRelatedField(
+        queryset=Branch.objects.none(),
+        required=False,
+        allow_null=True
+    )
+    branch_name = serializers.CharField(source='branch.name', read_only=True)
     parent_department_name = serializers.CharField(source='parent_department.name', read_only=True)
     employee_count = serializers.SerializerMethodField()
     
     class Meta:
         model = Department
         fields = [
-            'id', 'employer_id', 'name', 'code', 'description', 'parent_department',
-            'parent_department_name', 'is_active', 'employee_count',
+            'id', 'employer_id', 'name', 'code', 'description', 'branch',
+            'branch_name', 'parent_department', 'parent_department_name',
+            'is_active', 'employee_count',
             'created_at', 'updated_at'
         ]
         read_only_fields = ['id', 'employer_id', 'created_at', 'updated_at']
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        request = self.context.get('request')
+        if request and hasattr(request.user, 'employer_profile'):
+            from accounts.database_utils import get_tenant_database_alias
+            tenant_db = get_tenant_database_alias(request.user.employer_profile)
+            self.fields['branch'].queryset = Branch.objects.using(tenant_db).filter(
+                employer_id=request.user.employer_profile.id
+            )
+            if 'parent_department' in self.fields:
+                self.fields['parent_department'].queryset = Department.objects.using(tenant_db).filter(
+                    employer_id=request.user.employer_profile.id
+                )
     
     def get_employee_count(self, obj):
         return obj.employees.count()
