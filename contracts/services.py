@@ -206,6 +206,7 @@ def generate_contract_pdf(contract, template=None):
             "amount": getattr(a, "amount", ""),
             "type": getattr(a, "type", ""),
         }
+        
         for a in contract.allowances.all()
     ]
     deductions_data = [
