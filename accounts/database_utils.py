@@ -176,7 +176,7 @@ def get_tenant_database_alias(employer_profile):
     Get the database alias for an employer's tenant database
     Returns 'default' if no tenant database exists
     """
-    if employer_profile and employer_profile.database_created:
+    if employer_profile and employer_profile.database_name:
         return f"tenant_{employer_profile.id}"
     return 'default'
 
@@ -280,7 +280,7 @@ def ensure_tenant_database_loaded(employer_profile):
     Ensure a specific tenant database is loaded into Django settings.
     Returns the database alias.
     """
-    if not employer_profile or not employer_profile.database_created:
+    if not employer_profile or not employer_profile.database_name:
         return 'default'
     
     alias = f"tenant_{employer_profile.id}"

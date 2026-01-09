@@ -43,7 +43,7 @@ class TenantDatabaseMiddleware(MiddlewareMixin):
             # If user is an employer, use their tenant database
             if hasattr(request.user, 'employer_profile') and request.user.employer_profile:
                 employer_profile = request.user.employer_profile
-                if employer_profile.database_created:
+                if employer_profile.database_name:
                     # Ensure the tenant database is loaded before using it
                     tenant_db = ensure_tenant_database_loaded(employer_profile)
             

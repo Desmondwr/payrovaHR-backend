@@ -33,7 +33,6 @@ class Command(BaseCommand):
             action='store_true',
             help='Show a list of all known migrations and which are applied.'
         )
-        
 
     def handle(self, *args, **options):
         app_label = options.get('app_label')
@@ -88,12 +87,12 @@ class Command(BaseCommand):
                 call_command('migrate', *migrate_args, **migrate_kwargs)
                 
                 self.stdout.write(
-                    self.style.SUCCESS(f'✓ Successfully migrated {employer.company_name}')
+                    self.style.SUCCESS(f'バ" Successfully migrated {employer.company_name}')
                 )
                 
             except Exception as e:
                 self.stdout.write(
-                    self.style.ERROR(f'✗ Error migrating {employer.company_name}: {str(e)}')
+                    self.style.ERROR(f'バ- Error migrating {employer.company_name}: {str(e)}')
                 )
                 continue
         

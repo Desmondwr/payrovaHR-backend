@@ -657,6 +657,17 @@ class ContractConfiguration(models.Model):
     enable_notifications = models.BooleanField(default=True)
     days_before_expiry_notify = models.IntegerField(default=30)
     
+    # Module-specific settings stored as JSON for flexibility
+    recruitment_configuration = models.JSONField(default=dict, blank=True, help_text='Recruitment metadata defaults (application IDs, offer refs, etc.)')
+    attendance_configuration = models.JSONField(default=dict, blank=True, help_text='Work rules (schedule type, shift template, attendance requirements)')
+    time_off_configuration = models.JSONField(default=dict, blank=True, help_text='Leave policy defaults & overrides per leave type')
+    payroll_configuration = models.JSONField(default=dict, blank=True, help_text='Payroll inputs (tax profile, CNPS, probation, proration)')
+    expense_configuration = models.JSONField(default=dict, blank=True, help_text='Expense routing (policy, cost center, reimbursement)')
+    fleet_configuration = models.JSONField(default=dict, blank=True, help_text='Fleet entitlements (vehicle, transport allowance)')
+    treasury_configuration = models.JSONField(default=dict, blank=True, help_text='Treasury preferences (payment priority/channel)')
+    signature_configuration = models.JSONField(default=dict, blank=True, help_text='Document & signature defaults (template, method, document hash)')
+    governance_configuration = models.JSONField(default=dict, blank=True, help_text='Governance/audit defaults (approval/activation ownership)')
+    
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 

@@ -37,6 +37,13 @@ class TenantDatabaseRouter:
         # Check if a specific database is hinted
         if 'tenant_db' in hints:
             return hints['tenant_db']
+
+        # Respect the instance database when provided (e.g., related managers).
+        instance = hints.get('instance')
+        if instance is not None:
+            instance_db = getattr(instance._state, 'db', None)
+            if instance_db:
+                return instance_db
         
         # Check for tenant context in thread-local storage
         tenant_db = getattr(settings, 'CURRENT_TENANT_DB', None)
@@ -57,6 +64,13 @@ class TenantDatabaseRouter:
         # Check if a specific database is hinted
         if 'tenant_db' in hints:
             return hints['tenant_db']
+
+        # Respect the instance database when provided (e.g., related managers).
+        instance = hints.get('instance')
+        if instance is not None:
+            instance_db = getattr(instance._state, 'db', None)
+            if instance_db:
+                return instance_db
         
         # Check for tenant context in thread-local storage
         tenant_db = getattr(settings, 'CURRENT_TENANT_DB', None)
