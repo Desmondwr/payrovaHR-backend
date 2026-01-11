@@ -10,6 +10,7 @@ from .serializers import (
     TimeOffRequestSerializer,
     TimeOffBalanceSerializer,
     TimeOffLedgerEntrySerializer,
+    TimeOffAllocationSerializer,
 )
 from .defaults import merge_time_off_defaults, get_time_off_defaults
 from .services import (
@@ -346,3 +347,12 @@ class TimeOffLedgerViewSet(viewsets.ReadOnlyModelViewSet):
             qs = qs.filter(effective_date__lte=date_to)
 
         return qs
+
+
+class TimeOffAllocationViewSet(viewsets.GenericViewSet, viewsets.mixins.CreateModelMixin):
+    permission_classes = [permissions.IsAuthenticated, IsEmployer]
+    serializer_class = TimeOffAllocationSerializer
+
+    def get_queryset(self):
+        # Not used for list; allocations are create-only in this viewset
+        return TimeOffLedgerEntry.objects.none()

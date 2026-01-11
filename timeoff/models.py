@@ -18,6 +18,33 @@ class TimeOffConfiguration(models.Model):
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     employer_id = models.IntegerField(db_index=True, help_text="ID of the employer (from main database)")
+    tenant_id = models.IntegerField(
+        null=True,
+        blank=True,
+        db_index=True,
+        help_text="Alias for employer_id to support tenant-aware queries",
+    )
+    schema_version = models.IntegerField(default=1, help_text="Schema version for normalization")
+    default_time_unit = models.CharField(max_length=10, default="DAYS")
+    working_hours_per_day = models.IntegerField(default=8)
+    leave_year_type = models.CharField(max_length=10, default="CALENDAR")
+    leave_year_start_month = models.IntegerField(default=1)
+    holiday_calendar_source = models.CharField(max_length=20, default="DEFAULT")
+    time_zone_handling = models.CharField(max_length=30, default="EMPLOYER_LOCAL")
+    reservation_policy = models.CharField(max_length=30, default="RESERVE_ON_SUBMIT")
+    rounding_increment_minutes = models.IntegerField(default=30)
+    rounding_method = models.CharField(max_length=10, default="NEAREST")
+    weekend_days = models.JSONField(default=list, blank=True)
+    module_enabled = models.BooleanField(default=True)
+    allow_backdated_requests = models.BooleanField(default=True)
+    allow_future_dated_requests = models.BooleanField(default=True)
+    allow_negative_balance = models.BooleanField(default=False)
+    negative_balance_limit = models.IntegerField(default=0)
+    allow_overlapping_requests = models.BooleanField(default=False)
+    backdated_limit_days = models.IntegerField(default=30)
+    future_window_days = models.IntegerField(default=180)
+    max_request_length_days = models.IntegerField(null=True, blank=True)
+    max_requests_per_month = models.IntegerField(null=True, blank=True)
     configuration = models.JSONField(
         default=get_time_off_defaults,
         blank=True,
@@ -43,11 +70,42 @@ class TimeOffConfiguration(models.Model):
         if errors:
             raise ValidationError(errors)
         self.configuration = merged
+        self._sync_columns_from_config(merged)
 
     def save(self, *args, **kwargs):
         # Ensure defaults + validation run on every save
         self.clean()
+        if self.tenant_id is None:
+            self.tenant_id = self.employer_id
         super().save(*args, **kwargs)
+
+    def _sync_columns_from_config(self, cfg):
+        """Populate columnized fields from the normalized configuration."""
+        global_settings = (cfg or {}).get("global_settings", {}) or {}
+        self.schema_version = cfg.get("schema_version") or global_settings.get("schema_version") or 1
+        self.default_time_unit = global_settings.get("default_time_unit", "DAYS")
+        self.working_hours_per_day = global_settings.get("working_hours_per_day", 8)
+        self.leave_year_type = global_settings.get("leave_year_type", "CALENDAR")
+        self.leave_year_start_month = global_settings.get("leave_year_start_month", 1)
+        self.holiday_calendar_source = global_settings.get("holiday_calendar_source", "DEFAULT")
+        self.time_zone_handling = global_settings.get("time_zone_handling", "EMPLOYER_LOCAL")
+        self.reservation_policy = global_settings.get("reservation_policy", "RESERVE_ON_SUBMIT")
+
+        rounding = global_settings.get("rounding") or {}
+        self.rounding_increment_minutes = rounding.get("increment_minutes", 30) or 0
+        self.rounding_method = rounding.get("method", "NEAREST") or "NEAREST"
+        self.weekend_days = global_settings.get("weekend_days") or []
+
+        self.module_enabled = global_settings.get("module_enabled", True)
+        self.allow_backdated_requests = global_settings.get("allow_backdated_requests", True)
+        self.allow_future_dated_requests = global_settings.get("allow_future_dated_requests", True)
+        self.allow_negative_balance = global_settings.get("allow_negative_balance", False)
+        self.negative_balance_limit = global_settings.get("negative_balance_limit", 0) or 0
+        self.allow_overlapping_requests = global_settings.get("allow_overlapping_requests", False)
+        self.backdated_limit_days = global_settings.get("backdated_limit_days", 30) or 0
+        self.future_window_days = global_settings.get("future_window_days", 180) or 0
+        self.max_request_length_days = global_settings.get("max_request_length_days")
+        self.max_requests_per_month = global_settings.get("max_requests_per_month")
 
 
 class TimeOffRequest(models.Model):
@@ -185,6 +243,12 @@ class TimeOffLedgerEntry(models.Model):
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     employer_id = models.IntegerField(db_index=True, help_text="Employer/tenant identifier (main DB)")
+    tenant_id = models.IntegerField(
+        null=True,
+        blank=True,
+        db_index=True,
+        help_text="Alias for employer/tenant identifier to simplify lookups",
+    )
     employee = models.ForeignKey(
         "employees.Employee",
         on_delete=models.CASCADE,

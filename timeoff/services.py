@@ -8,6 +8,7 @@ from typing import Iterable, Optional, Tuple
 
 from django.db import transaction
 
+from .defaults import get_time_off_defaults
 from .models import TimeOffLedgerEntry, TimeOffRequest
 
 
@@ -60,6 +61,7 @@ def compute_balances(
 def write_ledger_entry(
     *,
     employer_id: int,
+    tenant_id: Optional[int],
     employee,
     leave_type_code: str,
     entry_type: str,
@@ -75,6 +77,7 @@ def write_ledger_entry(
     effective = effective_date or date.today()
     return TimeOffLedgerEntry.objects.using(db_alias).create(
         employer_id=employer_id,
+        tenant_id=tenant_id or employer_id,
         employee=employee,
         leave_type_code=leave_type_code,
         entry_type=entry_type,
@@ -107,6 +110,7 @@ def apply_submit_transitions(
         if reservation_policy == "RESERVE_ON_SUBMIT":
             reservation_entry = write_ledger_entry(
                 employer_id=request.employer_id,
+                tenant_id=getattr(request, "tenant_id", None) or request.employer_id,
                 employee=request.employee,
                 leave_type_code=request.leave_type_code,
                 entry_type="RESERVATION",
@@ -142,6 +146,7 @@ def apply_approval_transitions(
     with transaction.atomic(using=db_alias):
         debit_entry = write_ledger_entry(
             employer_id=request.employer_id,
+            tenant_id=getattr(request, "tenant_id", None) or request.employer_id,
             employee=request.employee,
             leave_type_code=request.leave_type_code,
             entry_type="DEBIT",
@@ -155,6 +160,7 @@ def apply_approval_transitions(
         if reservation_policy == "RESERVE_ON_SUBMIT":
             reversal_entry = write_ledger_entry(
                 employer_id=request.employer_id,
+                tenant_id=getattr(request, "tenant_id", None) or request.employer_id,
                 employee=request.employee,
                 leave_type_code=request.leave_type_code,
                 entry_type="REVERSAL",
@@ -191,6 +197,7 @@ def apply_rejection_or_cancellation_transitions(
         if reservation_policy == "RESERVE_ON_SUBMIT":
             reversal_entry = write_ledger_entry(
                 employer_id=request.employer_id,
+                tenant_id=getattr(request, "tenant_id", None) or request.employer_id,
                 employee=request.employee,
                 leave_type_code=request.leave_type_code,
                 entry_type="REVERSAL",
