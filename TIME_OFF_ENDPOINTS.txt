@@ -1,0 +1,117 @@
+Time Off API Endpoints
+Base prefix: `/api/timeoff/`
+Auth: Employer user (IsEmployer) with tenant context.
+
+Router: `/api/timeoff/timeoff-configurations/`
+- List configs: `GET /api/timeoff/timeoff-configurations/`
+  - Response: array of config objects.
+- Create config: `POST /api/timeoff/timeoff-configurations/`
+  - v2 payload (preferred — includes schema_version and new policy blocks; server will merge defaults):
+    ```json
+    {
+      "configuration": {
+        "schema_version": 2,
+        "global_settings": {
+          "module_enabled": true,
+          "default_time_unit": "DAYS",
+          "working_hours_per_day": 8,
+          "minimum_request_unit": 0.5,
+          "allow_backdated_requests": true,
+          "backdated_limit_days": 30,
+          "allow_future_dated_requests": true,
+          "future_window_days": 180,
+          "allow_negative_balance": false,
+          "negative_balance_limit": 0,
+          "allow_overlapping_requests": false,
+          "time_zone_handling": "EMPLOYER_LOCAL",
+          "leave_year_type": "CALENDAR",
+          "leave_year_start_month": 1,
+          "weekend_days": ["SATURDAY", "SUNDAY"],
+          "reservation_policy": "RESERVE_ON_SUBMIT",
+          "rounding": { "unit": "MINUTES", "increment_minutes": 30, "method": "NEAREST" },
+          "holiday_calendar_source": "DEFAULT",
+          "max_request_length_days": null,
+          "max_requests_per_month": null,
+          "year_end_processing": {
+            "auto_carryover_enabled": false,
+            "auto_reset_enabled": false,
+            "process_on_month_day": "01-01"
+          },
+          "data_retention": { "request_history_years": 7, "ledger_history_years": 7 }
+        },
+        "leave_types": [
+          {
+            "code": "ANL",
+            "name": "Annual Leave",
+            "paid": true,
+            "color": "#2E86DE",
+            "description": "Default annual leave.",
+            "mobile_enabled": true,
+            "balance_visible_to_employee": true,
+            "request_policy": {
+              "allow_half_day": true,
+              "allow_hourly": false,
+              "minimum_duration": 0.5,
+              "maximum_duration": null,
+              "consecutive_days_limit": null,
+              "allow_prefix_suffix_holidays": true,
+              "count_weekends_as_leave": false,
+              "count_holidays_as_leave": false,
+              "blackout_dates": [],
+              "requires_reason": true,
+              "requires_document": false,
+              "document_mandatory_after_days": null
+            },
+            "approval_policy": {
+              "workflow_code": "DEFAULT",
+              "auto_approve": false,
+              "steps": [
+                { "type": "MANAGER", "required": true },
+                { "type": "HR", "required": false }
+              ],
+              "fallback_approver": "HR",
+              "reminders": { "enabled": true, "after_hours": 48 }
+            },
+            "accrual_policy": {
+              "enabled": true,
+              "method": "MONTHLY",
+              "rate_per_period": 1.25,
+              "start_trigger": "DATE_OF_JOINING",
+              "start_offset_days": 0,
+              "waiting_period_days": 0,
+              "proration": { "on_join": true, "on_termination": true, "method": "DAILY" },
+              "cap": { "enabled": false, "max_balance": null }
+            },
+            "carryover_policy": { "enabled": true, "max_carryover": 10, "expires_after_days": 90 }
+          }
+        ]
+      }
+    }
+    ```
+- Retrieve config: `GET /api/timeoff/timeoff-configurations/{id}/`
+- Update config: `PATCH /api/timeoff/timeoff-configurations/{id}/`
+  - Payload: partial `configuration` (merged with defaults server-side).
+- Replace config: `PUT /api/timeoff/timeoff-configurations/{id}/`
+  - Payload: full config object.
+- Delete config: `DELETE /api/timeoff/timeoff-configurations/{id}/`
+
+Global singleton helper
+- Get or create global config: `GET /api/timeoff/timeoff-configurations/global/`
+  - Response: config for employer; auto-seeded with defaults if missing.
+- Update global config: `PATCH /api/timeoff/timeoff-configurations/global/`
+  - Payload: partial `configuration` as above.
+
+Notes
+- Server merges missing keys with defaults from `timeoff/defaults.py` and normalizes legacy v1 payloads. If you post the older v1 shape (no `schema_version`, legacy `allow_half_day`, etc.), the response will echo the config with `schema_version: 1` plus derived `request_policy`/`approval_policy`/`accrual_policy`/`carryover_policy` blocks for backward compatibility.
+- Required fields per leave type: `code`, `name`, `paid`.
+- Allowed enums: 
+  - `default_time_unit` (DAYS|HALF_DAYS|HOURS), `leave_year_type` (CALENDAR|FISCAL)
+  - `reservation_policy` (RESERVE_ON_SUBMIT|DEDUCT_ON_APPROVAL)
+  - `rounding.unit` (MINUTES), `rounding.method` (UP|DOWN|NEAREST)
+  - `weekend_days` values: MONDAY..SUNDAY
+  - `accrual_policy.method` (FIXED_ANNUAL|MONTHLY|BI_WEEKLY|PER_PAY_PERIOD|PER_ATTENDANCE), `accrual_policy.start_trigger` (DATE_OF_JOINING|CONFIRMATION_DATE|FIXED_DATE), `accrual_policy.proration.method` (DAILY|MONTHLY)
+  - `approval_policy.steps[].type` (MANAGER|HR|ROLE), `approval_policy.fallback_approver` (HR|NONE)
+
+Quick normalization check (v1 -> v2 fields)
+- `PATCH /api/timeoff/timeoff-configurations/global/` with the legacy payload in the earlier example (no `schema_version`, top-level `allow_half_day`, etc.).
+- Expected response: `schema_version: 1` and the same leave type now includes `request_policy`, `approval_policy`, `accrual_policy`, and `carryover_policy` blocks derived from the legacy fields, plus new global defaults (weekend_days, rounding, reservation_policy, year_end_processing, data_retention).

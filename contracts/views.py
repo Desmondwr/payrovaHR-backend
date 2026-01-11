@@ -7,6 +7,7 @@ from .models import (
 from .serializers import (
     ContractSerializer, ContractConfigurationSerializer, SalaryScaleSerializer
 )
+from timeoff.defaults import merge_time_off_defaults
 from django.utils import timezone
 from django.core.exceptions import ValidationError
 from accounts.middleware import set_current_tenant_db
@@ -610,6 +611,11 @@ class ContractConfigurationViewSet(viewsets.ModelViewSet):
                 'id_sequence_padding': 5,
             }
         )
+
+        # Seed time-off configuration with defaults for new tenants or empty configs.
+        if created or not config.time_off_configuration:
+            config.time_off_configuration = merge_time_off_defaults(config.time_off_configuration or {})
+            config.save(using=tenant_db)
 
         if request.method == 'PATCH':
             serializer = self.get_serializer(config, data=request.data, partial=True)

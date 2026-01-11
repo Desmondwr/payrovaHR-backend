@@ -5,6 +5,7 @@ from .notifications import notify_sent_for_signature, notify_signed, notify_acti
 from django.core.exceptions import ValidationError
 import uuid
 from decimal import Decimal
+from datetime import timedelta
 
 User = get_user_model()
 
@@ -203,8 +204,11 @@ class Contract(models.Model):
     @property
     def is_expired(self):
         """Check if contract has expired"""
-        if self.end_date and timezone.now().date() > self.end_date:
-            return True
+        if self.end_date:
+            grace_days = self.get_effective_config('expiry_grace_period_days', 0) or 0
+            cutoff_date = self.end_date + timedelta(days=grace_days)
+            if timezone.now().date() > cutoff_date:
+                return True
         return self.status == 'EXPIRED'
     
     @property
@@ -229,6 +233,43 @@ class Contract(models.Model):
             return 0  # Expired
         return (self.end_date - today).days
     
+    @classmethod
+    def get_config_for(cls, employer_id, contract_type=None, db_alias='default'):
+        """
+        Fetch the global and type-specific configurations for an employer.
+        Returns a tuple of (global_config, type_config).
+        """
+        if not employer_id:
+            return None, None
+
+        type_config = None
+        if contract_type:
+            type_config = ContractConfiguration.objects.using(db_alias).filter(
+                employer_id=employer_id, 
+                contract_type=contract_type
+            ).first()
+
+        global_config = ContractConfiguration.objects.using(db_alias).filter(
+            employer_id=employer_id, 
+            contract_type__isnull=True
+        ).first()
+
+        return global_config, type_config
+
+    @classmethod
+    def get_effective_config_value(cls, employer_id, contract_type, field_name, default=None, db_alias='default'):
+        """
+        Retrieve a configuration value, checking type-specific first, then global.
+        """
+        global_config, type_config = cls.get_config_for(employer_id, contract_type, db_alias)
+        if type_config and getattr(type_config, field_name) is not None:
+            return getattr(type_config, field_name)
+        
+        if global_config and getattr(global_config, field_name) is not None:
+            return getattr(global_config, field_name)
+            
+        return default
+
     def get_config(self, get_global=True):
         """
         Retrieve contract configuration for the employer.
@@ -236,30 +277,85 @@ class Contract(models.Model):
         Otherwise returns the type-specific configuration for self.contract_type.
         """
         db_alias = self._state.db or 'default'
-        if get_global:
-            return ContractConfiguration.objects.using(db_alias).filter(
-                employer_id=self.employer_id, 
-                contract_type__isnull=True
-            ).first()
-        else:
-            return ContractConfiguration.objects.using(db_alias).filter(
-                employer_id=self.employer_id, 
-                contract_type=self.contract_type
-            ).first()
+        global_config, type_config = Contract.get_config_for(
+            employer_id=self.employer_id,
+            contract_type=self.contract_type,
+            db_alias=db_alias
+        )
+        return global_config if get_global else type_config
 
     def get_effective_config(self, field_name, default=None):
         """
         Retrieve a configuration value, checking type-specific first, then global.
         """
-        type_config = self.get_config(get_global=False)
-        if type_config and getattr(type_config, field_name) is not None:
-            return getattr(type_config, field_name)
-        
-        global_config = self.get_config(get_global=True)
-        if global_config and getattr(global_config, field_name) is not None:
-            return getattr(global_config, field_name)
-            
-        return default
+        db_alias = self._state.db or 'default'
+        return Contract.get_effective_config_value(
+            employer_id=self.employer_id,
+            contract_type=self.contract_type,
+            field_name=field_name,
+            default=default,
+            db_alias=db_alias
+        )
+
+    def get_approval_requirements(self):
+        """
+        Determine if this contract must follow the approval workflow and why.
+        Returns (required: bool, reasons: list[str]).
+        """
+        approval_enabled = self.get_effective_config('approval_enabled', False)
+        reasons = []
+
+        if not approval_enabled:
+            return False, reasons
+
+        if self.get_effective_config('requires_approval', False):
+            reasons.append('requires_approval')
+
+        base_salary = getattr(self, 'base_salary', None)
+        max_without = self.get_effective_config('max_salary_without_approval')
+        if base_salary is not None and max_without is not None and base_salary > max_without:
+            reasons.append('base_salary_above_threshold')
+
+        salary_thresholds = self.get_effective_config('salary_thresholds', {}) or {}
+        if base_salary is not None:
+            for level, threshold in salary_thresholds.items():
+                try:
+                    if base_salary > Decimal(str(threshold)):
+                        reasons.append(f'above_{level}_threshold')
+                except Exception:
+                    continue
+
+        return bool(reasons), reasons
+
+    def signature_required(self):
+        """
+        Resolve whether signatures are required for this contract based on configuration.
+        """
+        value = self.get_effective_config('requires_signature', None)
+        if value is None:
+            value = self.get_effective_config('signature_required', True)
+        return value
+
+    def _should_auto_expire(self):
+        """Check whether the contract should auto-expire based on config and dates."""
+        if self.contract_type != 'FIXED_TERM' or not self.end_date:
+            return False
+
+        auto_expire = self.get_effective_config('auto_expire_fixed_term', False)
+        if not auto_expire:
+            return False
+
+        grace_days = self.get_effective_config('expiry_grace_period_days', 0) or 0
+        cutoff_date = self.end_date + timedelta(days=grace_days)
+        return timezone.now().date() > cutoff_date
+
+    def _apply_auto_expiry_if_needed(self):
+        """Adjust status to EXPIRED if auto-expiry rules say so."""
+        if self.status in ['TERMINATED', 'CANCELLED', 'EXPIRED']:
+            return
+
+        if self._should_auto_expire() and self.status in ['ACTIVE', 'SIGNED', 'PENDING_SIGNATURE', 'APPROVED']:
+            self.status = 'EXPIRED'
 
     def generate_contract_id(self, config=None):
         """Auto-generate contract ID based on configuration"""
@@ -328,6 +424,37 @@ class Contract(models.Model):
             if self.end_date <= self.start_date:
                  errors['end_date'] = 'End date must be after start date.'
 
+        # 2b. Concurrent contract rules
+        allow_concurrent = self.get_effective_config('allow_concurrent_contracts_same_inst', False)
+        if not allow_concurrent and self.employee_id and self.start_date:
+            db_alias = self._state.db or 'default'
+            existing_contracts = Contract.objects.using(db_alias).filter(
+                employee=self.employee,
+                status__in=['ACTIVE', 'SIGNED', 'PENDING_SIGNATURE']
+            )
+            if self.pk:
+                existing_contracts = existing_contracts.exclude(id=self.pk)
+
+            for existing in existing_contracts:
+                exist_start = existing.start_date
+                exist_end = existing.end_date
+
+                if self.end_date and exist_end:
+                    if self.start_date <= exist_end and self.end_date >= exist_start:
+                        errors['start_date'] = f'Overlapping contract exists: {existing.contract_id} ({exist_start} - {exist_end})'
+                        break
+                elif not exist_end:
+                    if self.end_date:
+                        if self.end_date >= exist_start:
+                            errors['start_date'] = f'Overlapping permanent contract exists: {existing.contract_id} (Starts {exist_start})'
+                            break
+                    else:
+                        errors['start_date'] = f'Employee already has a permanent contract: {existing.contract_id}'
+                        break
+                elif not self.end_date and exist_end and self.start_date <= exist_end:
+                    errors['start_date'] = f'Cannot start permanent contract during existing contract: {existing.contract_id}'
+                    break
+
         # 3. Compensation Rules
         require_gross_gt_zero = self.get_effective_config('require_gross_salary_gt_zero')
         min_wage = self.get_effective_config('min_wage')
@@ -339,10 +466,22 @@ class Contract(models.Model):
         if min_wage is not None and self.base_salary and self.base_salary < min_wage:
             errors['base_salary'] = f'Base salary must be at least the minimum wage ({min_wage}).'
 
+        salary_scale_enforcement = self.get_effective_config('salary_scale_enforcement', 'WARNING')
+        allow_salary_override = self.get_effective_config('allow_salary_override', True)
+
+        if salary_scale_enforcement == 'STRICT' and not self.salary_scale:
+            errors['salary_scale'] = 'Salary scale is required by configuration.'
+
+        if self.salary_scale and allow_salary_override is not None and not allow_salary_override:
+            if self.base_salary is not None and self.base_salary != self.salary_scale.amount:
+                errors['base_salary'] = 'Base salary must match the selected salary scale when overrides are disabled.'
+
         # 4. Allowance Rules
         if self.pk:
             allow_pct = self.get_effective_config('allow_percentage_allowances')
             max_pct = self.get_effective_config('max_allowance_percentage')
+            allow_duplicate_allowances = self.get_effective_config('allow_duplicate_allowances', False)
+            duplicate_names = set()
 
             if allow_pct is not None and not allow_pct:
                 if self.allowances.all().filter(type='PERCENTAGE').exists():
@@ -352,6 +491,26 @@ class Contract(models.Model):
                 total_pct = sum([a.amount for a in self.allowances.all().filter(type='PERCENTAGE')])
                 if total_pct > max_pct:
                     errors['allowances'] = f'Total allowance percentage exceeds maximum allowed ({max_pct}%).'
+
+            if not allow_duplicate_allowances:
+                seen = set()
+                for allowance in self.allowances.all():
+                    key = (allowance.name or '').strip().lower()
+                    if not key:
+                        continue
+                    if key in seen:
+                        duplicate_names.add(allowance.name)
+                    seen.add(key)
+                if duplicate_names:
+                    existing = errors.get('allowances')
+                    dup_message = f"Duplicate allowances are not allowed: {', '.join(sorted(duplicate_names))}."
+                    if existing:
+                        if isinstance(existing, list):
+                            existing.append(dup_message)
+                        else:
+                            errors['allowances'] = [existing, dup_message]
+                    else:
+                        errors['allowances'] = dup_message
 
         if errors:
             raise ValidationError(errors)
@@ -378,6 +537,7 @@ class Contract(models.Model):
         # In a multi-tenant environment, full_clean() can fail on ForeignKeys 
         # because it tries to validate them using the default manager.
         # We exclude them here because they are validated by the serializer.
+        self._apply_auto_expiry_if_needed()
         self.full_clean(exclude=['employee', 'branch', 'department', 'previous_contract', 'salary_scale'])
         super().save(*args, **kwargs)
 
@@ -427,15 +587,21 @@ class Contract(models.Model):
         if self.status not in ['DRAFT', 'APPROVED']:
             raise ValidationError("Only draft or approved contracts can be sent for signature.")
         
-        requires_approval = self.get_effective_config('requires_approval', False)
-        if self.status == 'DRAFT' and requires_approval:
+        approval_required, reasons = self.get_approval_requirements()
+        if self.status in ['DRAFT', 'APPROVED'] and approval_required:
              self.status = 'PENDING_APPROVAL'
              self.save()
-             self.log_action(user, 'SENT_FOR_APPROVAL')
+             self.log_action(user, 'SENT_FOR_APPROVAL', metadata={'reasons': reasons})
              return
 
         self.status = 'PENDING_SIGNATURE'
         self.save()
+
+        if not self.signature_required():
+            self.log_action(user, 'SIGNATURE_SKIPPED', metadata={'reasons': ['signature_not_required']})
+            self.mark_signed(user)
+            return
+
         self.log_action(user, 'SENT_FOR_SIGNATURE')
         notify_sent_for_signature(self)
 
@@ -497,7 +663,11 @@ class Contract(models.Model):
         auto_activate = self.get_effective_config('auto_activate_on_start', False)
         if auto_activate:
              today = timezone.now().date()
-             if self.start_date <= today:
+             if self._should_auto_expire():
+                  self.status = 'EXPIRED'
+                  self.save()
+                  self.log_action(user, 'EXPIRED')
+             elif self.start_date <= today:
                   self.activate(user)
 
     def activate(self, user):
@@ -507,11 +677,17 @@ class Contract(models.Model):
                 pass
             else:
                 raise ValidationError("Contract must be signed to be activated.")
+
+        if self._should_auto_expire():
+            raise ValidationError("Contract has passed its end date and cannot be activated without renewal.")
             
         self.status = 'ACTIVE'
         self.save()
-        self.log_action(user, 'ACTIVATED')
-        notify_activated(self)
+        if self.status == 'EXPIRED':
+            self.log_action(user, 'EXPIRED')
+        else:
+            self.log_action(user, 'ACTIVATED')
+            notify_activated(self)
 
     def expire(self, user):
         if self.status != 'ACTIVE':
