@@ -75,6 +75,13 @@ DEFAULT_ACCRUAL_POLICY = {
 
 DEFAULT_CARRYOVER_POLICY = {"enabled": False, "max_carryover": None, "expires_after_days": None}
 
+DEFAULT_LEAVE_ENTITLEMENT = {
+    "leave_type_id": None,
+    "annual_allocation": None,
+    "accrual_method": None,
+    "effective_from": None,
+}
+
 
 def _deep_merge(base: Any, override: Any) -> Any:
     """
@@ -429,6 +436,9 @@ TIME_OFF_DEFAULTS: Dict[str, Any] = {
             }),
         },
     ],
+    "leave_policy_id": None,
+    "leave_override_enabled": False,
+    "leave_entitlements": [],
 }
 
 
@@ -451,6 +461,14 @@ def merge_time_off_defaults(config: Dict[str, Any]) -> Dict[str, Any]:
     merged["schema_version"] = incoming_version if incoming_version is not None else 1
 
     return normalize_time_off_config(merged)
+
+
+def _normalize_leave_entitlement(entitlement: Dict[str, Any]) -> Dict[str, Any]:
+    """Ensure each entitlement entry exposes the expected keys."""
+    base = DEFAULT_LEAVE_ENTITLEMENT.copy()
+    if isinstance(entitlement, dict):
+        base.update(entitlement)
+    return base
 
 
 def _normalize_leave_type(leave_type: Dict[str, Any]) -> Dict[str, Any]:
@@ -561,6 +579,17 @@ def normalize_time_off_config(config: Dict[str, Any]) -> Dict[str, Any]:
         normalized_leaves.append(_normalize_leave_type(leave_type))
     cfg["leave_types"] = normalized_leaves
 
+    raw_entitlements = cfg.get("leave_entitlements", []) or []
+    if not isinstance(raw_entitlements, list):
+        raw_entitlements = []
+    cfg["leave_entitlements"] = [
+        _normalize_leave_entitlement(entitlement)
+        for entitlement in raw_entitlements
+    ]
+
+    cfg["leave_policy_id"] = cfg.get("leave_policy_id")
+    cfg["leave_override_enabled"] = cfg.get("leave_override_enabled", False)
+
     return cfg
 
 
@@ -629,6 +658,32 @@ def validate_time_off_config(config: Dict[str, Any]) -> Dict[str, str]:
 
     if not isinstance(cfg.get("schema_version", 1), int):
         errors["schema_version"] = "schema_version must be an integer."
+
+    leave_policy_id = cfg.get("leave_policy_id")
+    if leave_policy_id is not None and not isinstance(leave_policy_id, int):
+        errors["leave_policy_id"] = "leave_policy_id must be an integer."
+
+    leave_override_enabled = cfg.get("leave_override_enabled")
+    if leave_override_enabled is not None and not isinstance(leave_override_enabled, bool):
+        errors["leave_override_enabled"] = "leave_override_enabled must be a boolean."
+
+    leave_entitlements = cfg.get("leave_entitlements", []) or []
+    if not isinstance(leave_entitlements, list):
+        errors["leave_entitlements"] = "leave_entitlements must be a list."
+        leave_entitlements = []
+    for ent_idx, entitlement in enumerate(leave_entitlements):
+        if not isinstance(entitlement, dict):
+            errors[f"leave_entitlements[{ent_idx}]"] = "Each entitlement must be an object."
+            continue
+        leave_type_id = entitlement.get("leave_type_id")
+        if leave_type_id is not None and not isinstance(leave_type_id, int):
+            errors[f"leave_entitlements[{ent_idx}].leave_type_id"] = "leave_type_id must be an integer."
+        annual_allocation = entitlement.get("annual_allocation")
+        if annual_allocation is not None:
+            try:
+                float(annual_allocation)
+            except (TypeError, ValueError):
+                errors[f"leave_entitlements[{ent_idx}].annual_allocation"] = "annual_allocation must be numeric."
 
     policy_defaults = (cfg or {}).get("policy_defaults", {})
     accrual_defaults = policy_defaults.get("accrual_and_allocation", {})

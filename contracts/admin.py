@@ -12,7 +12,7 @@ class DeductionInline(admin.TabularInline):
 @admin.register(Contract)
 class ContractAdmin(admin.ModelAdmin):
     list_display = ('contract_id', 'employee', 'employer_id', 
-                    'contract_type', 'start_date', 'end_date', 'status', 'base_salary', 'job_position')
+                    'contract_type', 'start_date', 'end_date', 'status', 'base_salary')
     list_filter = ('employer_id', 'status', 'contract_type', 
                    'pay_frequency')
     search_fields = ('contract_id', 'employee__first_name', 
@@ -23,7 +23,7 @@ class ContractAdmin(admin.ModelAdmin):
             'fields': ('contract_id', 'employer_id', 'employee')
         }),
         ('Organization', {
-            'fields': ('branch', 'department', 'job_position')
+            'fields': ('branch', 'department')
         }),
         ('Contract Details', {
             'fields': ('contract_type', 'status', 'start_date', 'end_date')

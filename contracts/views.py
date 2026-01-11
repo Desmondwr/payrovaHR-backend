@@ -2,7 +2,8 @@ from rest_framework import viewsets, permissions, status
 from rest_framework.decorators import action
 from rest_framework.response import Response
 from .models import (
-    Contract, ContractConfiguration, ContractTemplate, SalaryScale
+    Contract, ContractConfiguration, ContractTemplate, SalaryScale,
+    ContractDocument, ContractSignature
 )
 from .serializers import (
     ContractSerializer, ContractConfigurationSerializer, SalaryScaleSerializer
@@ -249,57 +250,43 @@ class ContractViewSet(viewsets.ModelViewSet):
         contract = self.get_object()
         self._set_tenant_context(contract)
         user = request.user
-        
+
         signature_text = request.data.get('signature_text')
         if not signature_text:
-             return Response({'error': 'Signature text is required.'}, status=status.HTTP_400_BAD_REQUEST)
+            return Response({'error': 'Signature text is required.'}, status=status.HTTP_400_BAD_REQUEST)
 
-        # Determine signer role
         role = None
-        # Check if user is the employee for this contract
-        # Note: 'user.employee_profile' might be cached or we need strict check
-        # But contract.employee is an Employee object.
-        # We need to see if request.user is linked to contract.employee
-        # contract.employee.user_id should match request.user.id
-        
-        # We need to access contract.employee which is in tenant DB
-        # self.get_object() returns contract from tenant DB, so relations should work if they are in same DB
-        # But Employee -> User is loose if User is in default DB. 
-        # Usually we store user_id on Employee.
-        
-        is_employee_signer = False
         if contract.employee and contract.employee.user_id == user.id:
             role = 'EMPLOYEE'
-            is_employee_signer = True
-            
-        # Check if user is employer (admin/owner)
-        is_employer_signer = False
-        if not is_employee_signer:
-            # Simple check: is this user the owner of the employer profile linked to contract?
-            # contract.employer_id is just an ID.
-            # We need to check if request.user.employer_profile.id == contract.employer_id
-            if hasattr(user, 'employer_profile') and user.employer_profile.id == contract.employer_id:
-                role = 'EMPLOYER'
-                is_employer_signer = True
-        
+        elif hasattr(user, 'employer_profile') and user.employer_profile.id == contract.employer_id:
+            role = 'EMPLOYER'
+
         if not role:
-             return Response({'error': 'You are not authorized to sign this contract.'}, status=status.HTTP_403_FORBIDDEN)
-             
-        # Create Signature
-        from .models import ContractSignature
-        
-        # Get Client IP
+            return Response({'error': 'You are not authorized to sign this contract.'}, status=status.HTTP_403_FORBIDDEN)
+
         x_forwarded_for = request.META.get('HTTP_X_FORWARDED_FOR')
         if x_forwarded_for:
             ip = x_forwarded_for.split(',')[0]
         else:
             ip = request.META.get('REMOTE_ADDR')
-            
+
         user_agent = request.META.get('HTTP_USER_AGENT', '')
-        
-        # Use tenant DB for signature creation (same as contract)
+
         db_alias = contract._state.db or 'default'
-        
+        signed_document = None
+        signed_document_id = request.data.get('signed_document_id')
+        if signed_document_id:
+            try:
+                signed_document = ContractDocument.objects.using(db_alias).get(
+                    id=signed_document_id,
+                    contract=contract
+                )
+            except ContractDocument.DoesNotExist:
+                return Response(
+                    {'error': 'signed_document_id must belong to this contract.'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+
         signature = ContractSignature.objects.using(db_alias).create(
             contract=contract,
             signer_user_id=user.id,
@@ -308,25 +295,24 @@ class ContractViewSet(viewsets.ModelViewSet):
             signature_text=signature_text,
             ip_address=ip,
             user_agent=user_agent,
-            document_hash=request.data.get('document_hash', '')
+            signature_method=request.data.get('signature_method'),
+            signature_audit_id=request.data.get('signature_audit_id'),
+            signed_document=signed_document,
+            document_hash=request.data.get('document_hash')
         )
-        
-        # Check if we should mark as SIGNED
-        # Logic: If we have at least one EMPLOYEE signature AND one EMPLOYER signature
+
         signatures = ContractSignature.objects.using(db_alias).filter(contract=contract)
         has_employee_sign = signatures.filter(role='EMPLOYEE').exists()
         has_employer_sign = signatures.filter(role='EMPLOYER').exists()
-        
-        if has_employee_sign and has_employer_sign:
-            if contract.status != 'SIGNED':
-                contract.mark_signed(user)
-                
+
+        if has_employee_sign and has_employer_sign and contract.status != 'SIGNED':
+            contract.mark_signed(user)
+
         return Response({
             'status': 'signed',
             'role': role,
             'signed_at': signature.signed_at
         }, status=status.HTTP_201_CREATED)
-
 
     @action(detail=True, methods=['post'], url_path='renew')
     def renew(self, request, pk=None):
@@ -397,7 +383,6 @@ class ContractViewSet(viewsets.ModelViewSet):
                 employee=contract.employee,
                 branch=contract.branch,
                 department=contract.department,
-                job_position=contract.job_position,
                 contract_type=contract.contract_type,
                 start_date=contract.end_date, # Starts when old one ends? Or strictly provided? 
                 # Ideally start_date = old_end_date + 1 day, but let's assume immediate continuation

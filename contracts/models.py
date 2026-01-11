@@ -6,6 +6,7 @@ from django.core.exceptions import ValidationError
 import uuid
 from decimal import Decimal
 from datetime import timedelta
+from .configuration_defaults import SIGNATURE_METHOD_CHOICES
 
 User = get_user_model()
 
@@ -80,13 +81,6 @@ class Contract(models.Model):
         help_text='Department where employee works'
     )
 
-    job_position = models.CharField(
-        max_length=255,
-        null=True,
-        blank=True,
-        help_text='Job position or title for this contract'
-    )
-    
     # Contract details
     contract_type = models.CharField(
         max_length=20,
@@ -914,6 +908,19 @@ class ContractComponentBase(models.Model):
 
 class Allowance(ContractComponentBase):
     """Allowance associated with a contract"""
+
+    allowance_id = models.IntegerField(
+        null=True,
+        blank=True,
+        help_text='Optional reference to an allowance template or master list'
+    )
+
+    effective_from = models.DateField(
+        null=True,
+        blank=True,
+        help_text='Date when this allowance takes effect'
+    )
+
     class Meta(ContractComponentBase.Meta):
         db_table = 'contract_allowances'
         verbose_name = 'Allowance'
@@ -922,6 +929,19 @@ class Allowance(ContractComponentBase):
 
 class Deduction(ContractComponentBase):
     """Deduction associated with a contract"""
+
+    deduction_id = models.IntegerField(
+        null=True,
+        blank=True,
+        help_text='Optional reference to a deduction template or master list'
+    )
+
+    effective_from = models.DateField(
+        null=True,
+        blank=True,
+        help_text='Date when this deduction takes effect'
+    )
+
     class Meta(ContractComponentBase.Meta):
         db_table = 'contract_deductions'
         verbose_name = 'Deduction'
@@ -1071,14 +1091,38 @@ class ContractSignature(models.Model):
     
     signer_name = models.CharField(max_length=255, help_text='Typed name of the signer')
     role = models.CharField(max_length=20, choices=ROLE_CHOICES)
-    
+
     signature_text = models.CharField(max_length=255, help_text='Text or representation of signature')
-    
+
     ip_address = models.GenericIPAddressField(null=True, blank=True)
     user_agent = models.TextField(null=True, blank=True)
-    
+
+    signature_method = models.CharField(
+        max_length=20,
+        choices=SIGNATURE_METHOD_CHOICES,
+        null=True,
+        blank=True,
+        help_text='Method used to obtain this signature'
+    )
+
+    signature_audit_id = models.CharField(
+        max_length=255,
+        null=True,
+        blank=True,
+        help_text='Optional audit trail reference'
+    )
+
+    signed_document = models.ForeignKey(
+        'ContractDocument',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='signatures',
+        help_text='Document that was signed'
+    )
+
     document_hash = models.CharField(max_length=64, help_text='SHA256 hash of the document signed')
-    
+
     signed_at = models.DateTimeField(auto_now_add=True)
     
     class Meta:

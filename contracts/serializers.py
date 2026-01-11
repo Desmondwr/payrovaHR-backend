@@ -5,6 +5,7 @@ from .models import (
     ContractConfiguration, SalaryScale
 )
 from timeoff.defaults import merge_time_off_defaults, validate_time_off_config
+from .configuration_defaults import CONFIGURATION_MERGE_FUNCTIONS
 
 class AllowanceSerializer(serializers.ModelSerializer):
     class Meta:
@@ -328,10 +329,18 @@ class ContractConfigurationSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError(errors)
         return merged
 
+    def _normalize_json_sections(self, data, include_missing=False):
+        for field, merge_fn in CONFIGURATION_MERGE_FUNCTIONS.items():
+            if field in data:
+                data[field] = merge_fn(data[field])
+            elif include_missing:
+                data[field] = merge_fn(None)
+
     def create(self, validated_data):
         validated_data['time_off_configuration'] = merge_time_off_defaults(
             validated_data.get('time_off_configuration', {})
         )
+        self._normalize_json_sections(validated_data, include_missing=True)
         return super().create(validated_data)
 
     def update(self, instance, validated_data):
@@ -339,4 +348,5 @@ class ContractConfigurationSerializer(serializers.ModelSerializer):
             validated_data['time_off_configuration'] = merge_time_off_defaults(
                 validated_data.get('time_off_configuration', {})
             )
+        self._normalize_json_sections(validated_data, include_missing=False)
         return super().update(instance, validated_data)
