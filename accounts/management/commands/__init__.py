@@ -1,1 +1,1 @@
-# This file makes the directory a Python package
+# Register custom commands for the accounts app.

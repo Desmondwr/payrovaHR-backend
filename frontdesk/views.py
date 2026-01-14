@@ -1,0 +1,229 @@
+from django.conf import settings
+from rest_framework import permissions, status, viewsets
+from rest_framework.decorators import action
+from rest_framework.response import Response
+from rest_framework.views import APIView
+
+from accounts.database_utils import get_tenant_database_alias
+from accounts.permissions import IsAuthenticated, IsEmployer
+from .models import FrontdeskStation, StationResponsible, Visitor, Visit
+from .serializers import (
+    FrontdeskStationSerializer,
+    StationResponsibleSerializer,
+    VisitorSerializer,
+    VisitSerializer,
+    KioskCheckInSerializer,
+    KioskStationSerializer,
+    KioskHostSerializer,
+)
+from employees.models import Employee
+
+
+class FrontdeskStationViewSet(viewsets.ModelViewSet):
+    """Manage branch-based stations (one active per branch)."""
+
+    permission_classes = [IsAuthenticated, IsEmployer]
+    serializer_class = FrontdeskStationSerializer
+
+    def get_queryset(self):
+        employer = self.request.user.employer_profile
+        tenant_db = get_tenant_database_alias(employer)
+        return (
+            FrontdeskStation.objects.using(tenant_db)
+            .filter(employer_id=employer.id)
+            .select_related("branch")
+            .prefetch_related("responsibles")
+        )
+
+    def perform_destroy(self, instance):
+        tenant_db = get_tenant_database_alias(self.request.user.employer_profile)
+        instance.delete(using=tenant_db)
+
+
+class StationResponsibleViewSet(viewsets.ModelViewSet):
+    """Manage station responsibles (HR/office admins scoped to branch)."""
+
+    permission_classes = [IsAuthenticated, IsEmployer]
+    serializer_class = StationResponsibleSerializer
+
+    def get_queryset(self):
+        employer = self.request.user.employer_profile
+        tenant_db = get_tenant_database_alias(employer)
+        return (
+            StationResponsible.objects.using(tenant_db)
+            .filter(station__employer_id=employer.id)
+            .select_related("station", "employee")
+        )
+
+    def perform_destroy(self, instance):
+        tenant_db = get_tenant_database_alias(self.request.user.employer_profile)
+        instance.delete(using=tenant_db)
+
+
+class VisitorViewSet(viewsets.ModelViewSet):
+    """CRUD for external visitors."""
+
+    permission_classes = [IsAuthenticated, IsEmployer]
+    serializer_class = VisitorSerializer
+
+    def get_queryset(self):
+        employer = self.request.user.employer_profile
+        tenant_db = get_tenant_database_alias(employer)
+        return Visitor.objects.using(tenant_db).filter(employer_id=employer.id)
+
+    def perform_destroy(self, instance):
+        tenant_db = get_tenant_database_alias(self.request.user.employer_profile)
+        instance.delete(using=tenant_db)
+
+
+class VisitViewSet(viewsets.ModelViewSet):
+    """Visitor lifecycle: planned/walk-in, check-in, manual check-out."""
+
+    permission_classes = [IsAuthenticated, IsEmployer]
+    serializer_class = VisitSerializer
+
+    def get_queryset(self):
+        employer = self.request.user.employer_profile
+        tenant_db = get_tenant_database_alias(employer)
+        qs = (
+            Visit.objects.using(tenant_db)
+            .filter(employer_id=employer.id)
+            .select_related("branch", "station", "visitor", "host")
+        )
+
+        branch = self.request.query_params.get("branch")
+        status_filter = self.request.query_params.get("status")
+        station = self.request.query_params.get("station")
+        if branch:
+            qs = qs.filter(branch_id=branch)
+        if station:
+            qs = qs.filter(station_id=station)
+        if status_filter:
+            qs = qs.filter(status=status_filter)
+        return qs
+
+    def perform_destroy(self, instance):
+        tenant_db = get_tenant_database_alias(self.request.user.employer_profile)
+        instance.delete(using=tenant_db)
+
+    @action(detail=True, methods=["post"])
+    def check_in(self, request, pk=None):
+        visit = self.get_object()
+        if visit.status == "CHECKED_OUT":
+            return Response({"detail": "Visit already checked out."}, status=status.HTTP_400_BAD_REQUEST)
+        if visit.status == "CHECKED_IN":
+            return Response({"detail": "Visit already checked in."}, status=status.HTTP_200_OK)
+
+        method = request.data.get("method", "MANUAL")
+        kiosk_reference = request.data.get("kiosk_reference")
+        visit.check_in(method=method, kiosk_reference=kiosk_reference)
+        serializer = self.get_serializer(visit)
+        return Response(serializer.data, status=status.HTTP_200_OK)
+
+    @action(detail=True, methods=["post"])
+    def check_out(self, request, pk=None):
+        visit = self.get_object()
+        if visit.status == "CHECKED_OUT":
+            return Response({"detail": "Visit already checked out."}, status=status.HTTP_200_OK)
+        if visit.status != "CHECKED_IN":
+            return Response({"detail": "Visit must be checked in before checkout."}, status=status.HTTP_400_BAD_REQUEST)
+
+        visit.check_out(user_id=request.user.id)
+        serializer = self.get_serializer(visit)
+        return Response(serializer.data, status=status.HTTP_200_OK)
+
+
+def resolve_station_by_slug(kiosk_slug):
+    """Find station across tenant databases by kiosk_slug."""
+    aliases = list(settings.DATABASES.keys())
+    # Prefer tenant databases first, then default
+    tenant_aliases = [a for a in aliases if a.startswith("tenant_")]
+    ordered_aliases = tenant_aliases + [a for a in aliases if a not in tenant_aliases]
+    for alias in ordered_aliases:
+        try:
+            station = FrontdeskStation.objects.using(alias).select_related("branch").get(kiosk_slug=kiosk_slug)
+            return station, alias
+        except FrontdeskStation.DoesNotExist:
+            continue
+    return None, None
+
+
+def process_kiosk_check_in(request, kiosk_slug):
+    """Shared logic to create a visit for a kiosk check-in."""
+    station, tenant_db = resolve_station_by_slug(kiosk_slug)
+    if not station:
+        return Response({"detail": "Invalid kiosk."}, status=status.HTTP_404_NOT_FOUND)
+    if not station.is_active or not station.allow_self_check_in:
+        return Response({"detail": "Self check-in is disabled for this station."}, status=status.HTTP_400_BAD_REQUEST)
+
+    serializer = KioskCheckInSerializer(
+        data=request.data,
+        context={"station": station, "tenant_db": tenant_db},
+    )
+    serializer.is_valid(raise_exception=True)
+    visit = serializer.save()
+    response_serializer = VisitSerializer(visit, context={"request": request})
+    return Response(response_serializer.data, status=status.HTTP_201_CREATED)
+
+
+class KioskCheckInView(APIView):
+    """Unauthenticated kiosk/QR self check-in using station kiosk_slug."""
+
+    permission_classes = [permissions.AllowAny]
+    authentication_classes = []
+
+    def post(self, request, kiosk_slug):
+        return process_kiosk_check_in(request, kiosk_slug)
+
+
+class KioskStationView(APIView):
+    """Public station lookup by kiosk_slug for kiosk UI configuration."""
+
+    permission_classes = [permissions.AllowAny]
+    authentication_classes = []
+
+    def get(self, request, kiosk_slug):
+        station, tenant_db = resolve_station_by_slug(kiosk_slug)
+        if not station:
+            return Response({"detail": "Invalid kiosk."}, status=status.HTTP_404_NOT_FOUND)
+        serializer = KioskStationSerializer(station, context={"request": request})
+        return Response(serializer.data, status=status.HTTP_200_OK)
+
+
+class KioskHostsView(APIView):
+    """Public list of active hosts for a station (branch-scoped)."""
+
+    permission_classes = [permissions.AllowAny]
+    authentication_classes = []
+
+    def get(self, request, kiosk_slug):
+        station, tenant_db = resolve_station_by_slug(kiosk_slug)
+        if not station:
+            return Response({"detail": "Invalid kiosk."}, status=status.HTTP_404_NOT_FOUND)
+        if not station.is_active or not station.allow_self_check_in:
+            return Response({"detail": "Self check-in is disabled for this station."}, status=status.HTTP_400_BAD_REQUEST)
+
+        hosts = (
+            Employee.objects.using(tenant_db)
+            .filter(
+                employer_id=station.employer_id,
+                branch_id=station.branch_id,
+                employment_status="ACTIVE",
+            )
+            .order_by("last_name", "first_name")
+        )
+        serializer = KioskHostSerializer(hosts, many=True)
+        return Response(serializer.data, status=status.HTTP_200_OK)
+
+
+class GlobalKioskCheckInView(APIView):
+    """Unauthenticated check-in that accepts kiosk_slug in the request payload."""
+
+    permission_classes = [permissions.AllowAny]
+    authentication_classes = []
+
+    def post(self, request):
+        kiosk_slug = request.data.get("kiosk_slug")
+        if not kiosk_slug:
+            return Response({"detail": "kiosk_slug is required."}, status=status.HTTP_400_BAD_REQUEST)
+        return process_kiosk_check_in(request, kiosk_slug)

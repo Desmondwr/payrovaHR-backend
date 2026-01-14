@@ -1,7 +1,8 @@
 """
 Default schema and helper utilities for the Time Off module.
 
-The configuration is stored as JSON (see timeoff.models.TimeOffConfiguration.configuration).
+The configuration defaults are represented as dictionaries and are used to seed structured
+database tables (see timeoff.models.TimeOffConfiguration/TimeOffType) and to shape responses.
 This module keeps a canonical default structure and merge/validation helpers so every tenant
 starts with a usable configuration and partial updates stay well-formed.
 """
