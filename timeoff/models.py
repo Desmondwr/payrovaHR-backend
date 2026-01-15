@@ -54,11 +54,6 @@ class TimeOffConfiguration(models.Model):
     year_end_process_on_month_day = models.CharField(max_length=5, default="01-01")
     request_history_years = models.IntegerField(default=7)
     ledger_history_years = models.IntegerField(default=7)
-    configuration = models.JSONField(
-        default=dict,
-        blank=True,
-        help_text="Legacy configuration snapshot (not authoritative).",
-    )
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 

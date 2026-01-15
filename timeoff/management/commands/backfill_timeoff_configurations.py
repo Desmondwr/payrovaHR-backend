@@ -1,6 +1,7 @@
 import sys
 from typing import List
 
+from django.core.exceptions import FieldDoesNotExist
 from django.core.management import BaseCommand, call_command
 from django.db import transaction
 
@@ -13,7 +14,7 @@ class Command(BaseCommand):
     help = (
         "Backfill structured time-off tables (TimeOffType/ApprovalStep) from legacy "
         "JSON in timeoff_configurations.configuration. Intended for tenants created "
-        "before the normalization migration."
+        "before the normalization migration. No-op if the legacy column is removed."
     )
 
     def add_arguments(self, parser):
@@ -40,6 +41,14 @@ class Command(BaseCommand):
         )
 
     def handle(self, *args, **options):
+        if not self._legacy_configuration_available():
+            self.stdout.write(
+                self.style.WARNING(
+                    "Legacy configuration column is not available; nothing to backfill."
+                )
+            )
+            return
+
         clear_legacy = options.get("clear_legacy", False)
         app_label = options.get("app_label")
         verbosity = options.get("verbosity", 1)
@@ -73,6 +82,13 @@ class Command(BaseCommand):
             self.stderr.write(self.style.ERROR(f"Completed with {failures} failure(s)."))
             sys.exit(1)
         self.stdout.write(self.style.SUCCESS(f"Backfill completed for {len(aliases)} database(s)."))
+
+    def _legacy_configuration_available(self) -> bool:
+        try:
+            TimeOffConfiguration._meta.get_field("configuration")
+        except FieldDoesNotExist:
+            return False
+        return True
 
     def _process_alias(self, alias: str, clear_legacy: bool):
         configs = TimeOffConfiguration.objects.using(alias).all()
