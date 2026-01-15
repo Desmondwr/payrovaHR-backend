@@ -232,7 +232,11 @@ class TimeOffRequestViewSet(viewsets.ModelViewSet):
         leave_types = config.get("leave_types") or []
         leave_type = next((lt for lt in leave_types if lt.get("code") == request_obj.leave_type_code), {})
         global_settings = config.get("global_settings") or {}
-        reservation_policy = global_settings.get("reservation_policy") or "RESERVE_ON_SUBMIT"
+        reservation_policy = (
+            leave_type.get("reservation_policy")
+            or global_settings.get("reservation_policy")
+            or "RESERVE_ON_SUBMIT"
+        )
         approval_policy = leave_type.get("approval_policy") or {}
         return reservation_policy, approval_policy, tenant_db
 
@@ -353,12 +357,29 @@ class TimeOffBalanceViewSet(viewsets.ViewSet):
         employee, employer_id, tenant_db = self._get_context(request)
 
         config = _load_config(employer_id, tenant_db)
-        reservation_policy = (
-            (config.get("global_settings") or {}).get("reservation_policy") or "RESERVE_ON_SUBMIT"
-        )
+        global_settings = config.get("global_settings") or {}
+        reservation_policy = global_settings.get("reservation_policy") or "RESERVE_ON_SUBMIT"
+        as_of_param = request.query_params.get("as_of")
+        as_of_date = None
+        if as_of_param:
+            try:
+                as_of_date = date.fromisoformat(as_of_param)
+            except ValueError:
+                raise permissions.PermissionDenied("Invalid as_of date format. Use YYYY-MM-DD.")
+        reservation_map = {}
+        for lt in config.get("leave_types") or []:
+            policy = lt.get("reservation_policy") or reservation_policy
+            reservation_map[lt.get("code")] = policy
 
         entries = TimeOffLedgerEntry.objects.using(tenant_db).filter(employee=employee)
-        data = TimeOffBalanceSerializer.from_entries(entries, reservation_policy)
+        if as_of_date:
+            entries = entries.filter(effective_date__lte=as_of_date)
+        data = TimeOffBalanceSerializer.from_entries(
+            entries,
+            reservation_policy,
+            as_of=as_of_date,
+            reservation_policy_by_code=reservation_map,
+        )
         return Response(data)
 
 

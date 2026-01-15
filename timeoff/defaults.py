@@ -53,6 +53,9 @@ DEFAULT_REQUEST_POLICY = {
     "requires_reason": True,
     "requires_document": False,
     "document_mandatory_after_days": None,
+    "reservation_policy": "RESERVE_ON_SUBMIT",
+    "allow_negative_balance": False,
+    "negative_balance_limit": 0,
 }
 
 DEFAULT_APPROVAL_POLICY = {
@@ -498,6 +501,12 @@ def _normalize_leave_type(leave_type: Dict[str, Any]) -> Dict[str, Any]:
                 request_policy[target] = lt.get(source, request_policy.get(target))
         if "blackout_dates" in lt:
             request_policy["blackout_dates"] = lt.get("blackout_dates") or []
+        if "reservation_policy" in lt:
+            request_policy["reservation_policy"] = lt.get("reservation_policy") or request_policy.get("reservation_policy")
+        if "allow_negative_balance" in lt:
+            request_policy["allow_negative_balance"] = lt.get("allow_negative_balance")
+        if "negative_balance_limit" in lt:
+            request_policy["negative_balance_limit"] = lt.get("negative_balance_limit")
     lt["request_policy"] = request_policy
     # Sync legacy fields back from request_policy for backward compatibility
     lt["allow_half_day"] = request_policy.get("allow_half_day")
@@ -511,6 +520,9 @@ def _normalize_leave_type(leave_type: Dict[str, Any]) -> Dict[str, Any]:
     lt["requires_reason"] = request_policy.get("requires_reason")
     lt["requires_document"] = request_policy.get("requires_document")
     lt["document_mandatory_after_days"] = request_policy.get("document_mandatory_after_days")
+    lt["reservation_policy"] = request_policy.get("reservation_policy")
+    lt["allow_negative_balance"] = request_policy.get("allow_negative_balance")
+    lt["negative_balance_limit"] = request_policy.get("negative_balance_limit")
 
     # Approval policy
     approval_policy = _deep_merge(DEFAULT_APPROVAL_POLICY, lt.get("approval_policy", {}))
@@ -712,6 +724,17 @@ def validate_time_off_config(config: Dict[str, Any]) -> Dict[str, str]:
             errors[f"{prefix}.request_policy.allow_hourly"] = (
                 "Hourly requests are disabled for this leave type while default_time_unit is HOURS."
             )
+        reservation_policy = rp.get("reservation_policy") or leave_type.get("reservation_policy")
+        if reservation_policy and reservation_policy not in ALLOWED_RESERVATION_POLICIES:
+            errors[f"{prefix}.reservation_policy"] = (
+                f"Invalid reservation_policy '{reservation_policy}'. Allowed: {sorted(ALLOWED_RESERVATION_POLICIES)}"
+            )
+        neg_limit = rp.get("negative_balance_limit", leave_type.get("negative_balance_limit", 0))
+        try:
+            if neg_limit is not None and int(neg_limit) < 0:
+                errors[f"{prefix}.negative_balance_limit"] = "negative_balance_limit must be >= 0."
+        except (TypeError, ValueError):
+            errors[f"{prefix}.negative_balance_limit"] = "negative_balance_limit must be numeric."
 
         # Approval policy validation
         ap = leave_type.get("approval_policy", {}) or {}

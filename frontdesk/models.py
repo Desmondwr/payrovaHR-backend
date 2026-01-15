@@ -15,8 +15,7 @@ def generate_kiosk_slug():
 class FrontdeskStation(models.Model):
     """
     A station represents the physical frontdesk for a branch.
-    Station names are locked to their branch name and only one active station
-    is allowed per branch.
+    Branches can host multiple stations with custom names.
     """
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
@@ -56,18 +55,9 @@ class FrontdeskStation(models.Model):
         db_table = "frontdesk_stations"
         verbose_name = "Frontdesk Station"
         verbose_name_plural = "Frontdesk Stations"
-        constraints = [
-            models.UniqueConstraint(
-                fields=["branch"],
-                condition=Q(is_active=True),
-                name="unique_active_frontdesk_station_per_branch",
-            ),
-        ]
         ordering = ["branch__name", "-is_active", "created_at"]
 
     def clean(self):
-        if self.branch and self.name != self.branch.name:
-            raise ValidationError({"name": "Station name must match the branch name."})
         if self.branch and self.employer_id and self.employer_id != self.branch.employer_id:
             raise ValidationError({"branch": "Branch must belong to the same employer as the station."})
 
@@ -76,7 +66,6 @@ class FrontdeskStation(models.Model):
         if using:
             self._state.db = using
         if self.branch:
-            self.name = self.branch.name
             if not self.employer_id:
                 self.employer_id = self.branch.employer_id
         if not self.kiosk_slug:
@@ -90,7 +79,7 @@ class FrontdeskStation(models.Model):
         return f"/frontdesk/kiosk/{self.kiosk_slug}/"
 
     def __str__(self):
-        return f"{self.branch.name} Station ({'Active' if self.is_active else 'Inactive'})"
+        return f"{self.name} ({'Active' if self.is_active else 'Inactive'})"
 
 
 class StationResponsible(models.Model):

@@ -5,6 +5,19 @@ from accounts.database_utils import get_tenant_database_alias
 from employees.models import Branch, Employee
 from .models import FrontdeskStation, StationResponsible, Visitor, Visit
 
+DEFAULT_KIOSK_THEME = {
+    "background_color": "#ffffff",
+    "text_color": "#111827",
+    "check_in_button_bg_color": "#2563eb",
+}
+
+
+def normalize_kiosk_theme(theme):
+    merged = {**DEFAULT_KIOSK_THEME}
+    if isinstance(theme, dict):
+        merged.update({k: v for k, v in theme.items() if v is not None})
+    return merged
+
 
 class FrontdeskStationSerializer(serializers.ModelSerializer):
     branch_name = serializers.CharField(source="branch.name", read_only=True)
@@ -37,7 +50,7 @@ class FrontdeskStationSerializer(serializers.ModelSerializer):
             "created_at",
             "updated_at",
         ]
-        read_only_fields = ["id", "employer_id", "name", "kiosk_slug", "kiosk_url_path", "created_at", "updated_at"]
+        read_only_fields = ["id", "employer_id", "kiosk_slug", "kiosk_url_path", "created_at", "updated_at"]
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -57,22 +70,9 @@ class FrontdeskStationSerializer(serializers.ModelSerializer):
         responsibles = attrs.get("responsibles")
         request = self.context.get("request")
         employer_id = request.user.employer_profile.id if request and hasattr(request.user, "employer_profile") else None
-        is_active = attrs.get("is_active", getattr(self.instance, "is_active", True))
 
         if branch and employer_id and branch.employer_id != employer_id:
             raise serializers.ValidationError({"branch": "Branch must belong to the current employer."})
-
-        if branch and is_active:
-            tenant_db = (
-                get_tenant_database_alias(request.user.employer_profile)
-                if request and hasattr(request.user, "employer_profile")
-                else "default"
-            )
-            existing = FrontdeskStation.objects.using(tenant_db).filter(branch=branch, is_active=True)
-            if self.instance:
-                existing = existing.exclude(pk=self.instance.pk)
-            if existing.exists():
-                raise serializers.ValidationError({"is_active": "Only one active station is allowed per branch."})
 
         if responsibles is not None:
             invalid = []
@@ -97,8 +97,13 @@ class FrontdeskStationSerializer(serializers.ModelSerializer):
             else "default"
         )
 
+        station_name = validated_data.pop("name", None)
+        if not station_name:
+            raise serializers.ValidationError({"name": "Station name is required."})
+
         station = FrontdeskStation.objects.using(tenant_db).create(
             employer_id=employer_id,
+            name=station_name,
             **validated_data,
         )
         if responsibles:
@@ -121,6 +126,18 @@ class FrontdeskStationSerializer(serializers.ModelSerializer):
         if responsibles is not None:
             instance.responsibles.set(responsibles)
         return instance
+
+    def validate_kiosk_theme(self, value):
+        if value in (None, {}):
+            return {}
+        if not isinstance(value, dict):
+            raise serializers.ValidationError("kiosk_theme must be an object.")
+        return value
+
+    def to_representation(self, instance):
+        representation = super().to_representation(instance)
+        representation["kiosk_theme"] = normalize_kiosk_theme(instance.kiosk_theme or {})
+        return representation
 
 
 class StationResponsibleSerializer(serializers.ModelSerializer):
@@ -225,6 +242,8 @@ class VisitSerializer(serializers.ModelSerializer):
     station_name = serializers.CharField(source="station.name", read_only=True)
     host_name = serializers.CharField(source="host.full_name", read_only=True)
     visitor_name = serializers.CharField(source="visitor.full_name", read_only=True)
+    visitor_phone = serializers.CharField(source="visitor.phone", read_only=True)
+    visitor_email = serializers.EmailField(source="visitor.email", read_only=True)
 
     class Meta:
         model = Visit
@@ -237,6 +256,8 @@ class VisitSerializer(serializers.ModelSerializer):
             "station_name",
             "visitor",
             "visitor_name",
+            "visitor_phone",
+            "visitor_email",
             "host",
             "host_name",
             "visit_type",
@@ -261,6 +282,8 @@ class VisitSerializer(serializers.ModelSerializer):
             "check_out_by_id",
             "created_at",
             "updated_at",
+            "visitor_phone",
+            "visitor_email",
         ]
 
     def __init__(self, *args, **kwargs):
@@ -439,3 +462,8 @@ class KioskStationSerializer(serializers.ModelSerializer):
         if obj.kiosk_logo:
             return obj.kiosk_logo.url
         return None
+
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        data["kiosk_theme"] = normalize_kiosk_theme(instance.kiosk_theme or {})
+        return data

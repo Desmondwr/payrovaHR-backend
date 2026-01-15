@@ -117,6 +117,7 @@ def calculate_duration_minutes(
 def compute_balances(
     entries: Iterable[TimeOffLedgerEntry],
     reservation_policy: str = "RESERVE_ON_SUBMIT",
+    as_of: Optional[date] = None,
 ) -> dict:
     """
     Compute earned/reserved/taken/available from a set of ledger entries.
@@ -125,6 +126,12 @@ def compute_balances(
     - taken: DEBIT (absolute minutes)
     - available: earned - reserved - taken (or earned - taken when policy deducts on approval)
     """
+    if as_of:
+        if hasattr(entries, "filter"):
+            entries = entries.filter(effective_date__lte=as_of)
+        else:
+            entries = [e for e in entries if getattr(e, "effective_date", None) and e.effective_date <= as_of]
+
     earned = 0
     reserved = 0
     taken = 0
@@ -155,13 +162,19 @@ def compute_balances(
     }
 
 
-def get_available_balance(employee, leave_type_code: str, reservation_policy: str, db_alias: str = "default") -> int:
-    """Return available minutes for an employee/leave type."""
+def get_available_balance(
+    employee,
+    leave_type_code: str,
+    reservation_policy: str,
+    db_alias: str = "default",
+    as_of: Optional[date] = None,
+) -> int:
+    """Return available minutes for an employee/leave type (optionally as of a date)."""
     entries = TimeOffLedgerEntry.objects.using(db_alias).filter(
         employee=employee,
         leave_type_code=leave_type_code,
     )
-    return compute_balances(entries, reservation_policy).get("available_minutes", 0)
+    return compute_balances(entries, reservation_policy, as_of=as_of).get("available_minutes", 0)
 
 
 def has_overlap(employee, start_at: datetime, end_at: datetime, db_alias: str, exclude_request_id=None) -> bool:
@@ -189,6 +202,7 @@ def write_ledger_entry(
     request: Optional[TimeOffRequest] = None,
     allocation: Optional[TimeOffAllocation] = None,
     allocation_request: Optional[TimeOffAllocationRequest] = None,
+    source_reference: Optional[str] = None,
     effective_date: Optional[date] = None,
     notes: Optional[str] = None,
     metadata: Optional[dict] = None,
@@ -207,6 +221,7 @@ def write_ledger_entry(
         request=request,
         allocation=allocation,
         allocation_request=allocation_request,
+        source_reference=source_reference,
         notes=notes,
         created_by=created_by,
         metadata=metadata or {},
@@ -245,6 +260,7 @@ def apply_submit_transitions(
                     created_by=created_by,
                     request=request,
                     effective_date=effective_date or request.start_at.date(),
+                    source_reference=f"request:{request.id}",
                     metadata={"source": "reservation"},
                     db_alias=db_alias,
                 )
@@ -283,6 +299,7 @@ def apply_approval_transitions(
                 created_by=created_by,
                 request=request,
                 effective_date=effective_date or request.start_at.date(),
+                source_reference=f"request:{request.id}",
                 metadata={"source": "approval_debit"},
                 db_alias=db_alias,
             )
@@ -297,15 +314,16 @@ def apply_approval_transitions(
                     employer_id=request.employer_id,
                     tenant_id=getattr(request, "tenant_id", None) or request.employer_id,
                     employee=request.employee,
-                    leave_type_code=request.leave_type_code,
-                    entry_type="REVERSAL",
-                    amount_minutes=abs(duration_minutes),
-                    created_by=created_by,
-                    request=request,
-                    effective_date=effective_date or request.start_at.date(),
-                    metadata={"source": "reservation_reversal"},
-                    db_alias=db_alias,
-                )
+                leave_type_code=request.leave_type_code,
+                entry_type="REVERSAL",
+                amount_minutes=abs(duration_minutes),
+                created_by=created_by,
+                request=request,
+                effective_date=effective_date or request.start_at.date(),
+                source_reference=f"request:{request.id}",
+                metadata={"source": "reservation_reversal"},
+                db_alias=db_alias,
+            )
 
         request.mark_approved()
         request.save(using=db_alias)
@@ -337,15 +355,16 @@ def apply_rejection_or_cancellation_transitions(
                     employer_id=request.employer_id,
                     tenant_id=getattr(request, "tenant_id", None) or request.employer_id,
                     employee=request.employee,
-                    leave_type_code=request.leave_type_code,
-                    entry_type="REVERSAL",
-                    amount_minutes=abs(duration_minutes),
-                    created_by=created_by,
-                    request=request,
-                    effective_date=effective_date or request.start_at.date(),
-                    metadata={"source": "cancellation_reversal" if cancelled else "rejection_reversal"},
-                    db_alias=db_alias,
-                )
+                leave_type_code=request.leave_type_code,
+                entry_type="REVERSAL",
+                amount_minutes=abs(duration_minutes),
+                created_by=created_by,
+                request=request,
+                effective_date=effective_date or request.start_at.date(),
+                source_reference=f"request:{request.id}",
+                metadata={"source": "cancellation_reversal" if cancelled else "rejection_reversal"},
+                db_alias=db_alias,
+            )
 
         if cancelled:
             request.mark_cancelled()
@@ -392,6 +411,7 @@ def post_allocation_entries(
             created_by=created_by,
             allocation=allocation,
             effective_date=allocation.start_date,
+            source_reference=f"allocation:{allocation.id}",
             metadata={"source": "allocation"},
             db_alias=db_alias,
         )
@@ -456,9 +476,128 @@ def run_accruals_for_subscriptions(
                     created_by=created_by,
                     allocation=sub.allocation,
                     effective_date=current,
+                    source_reference=f"accrual_plan:{plan.id}",
                     metadata={"source": "accrual_run", "subscription_id": str(sub.id)},
                     db_alias=db_alias,
                 )
                 sub.last_accrual_date = current
                 sub.save(using=db_alias)
             current = add_month(current)
+
+
+def write_adjustment(
+    *,
+    employer_id: int,
+    tenant_id: int,
+    employee,
+    leave_type_code: str,
+    amount_minutes: int,
+    created_by: int,
+    effective_date: date,
+    source_reference: str,
+    notes: Optional[str] = None,
+    metadata: Optional[dict] = None,
+    db_alias: str = "default",
+) -> TimeOffLedgerEntry:
+    """Manual correction recorded as an ADJUSTMENT entry."""
+    return write_ledger_entry(
+        employer_id=employer_id,
+        tenant_id=tenant_id,
+        employee=employee,
+        leave_type_code=leave_type_code,
+        entry_type="ADJUSTMENT",
+        amount_minutes=amount_minutes,
+        created_by=created_by,
+        effective_date=effective_date,
+        source_reference=source_reference,
+        notes=notes,
+        metadata=metadata,
+        db_alias=db_alias,
+    )
+
+
+def write_carryover(
+    *,
+    employer_id: int,
+    tenant_id: int,
+    employee,
+    leave_type_code: str,
+    amount_minutes: int,
+    created_by: int,
+    effective_date: date,
+    source_reference: str,
+    metadata: Optional[dict] = None,
+    db_alias: str = "default",
+) -> TimeOffLedgerEntry:
+    """Year-end carryover entry."""
+    return write_ledger_entry(
+        employer_id=employer_id,
+        tenant_id=tenant_id,
+        employee=employee,
+        leave_type_code=leave_type_code,
+        entry_type="CARRYOVER",
+        amount_minutes=amount_minutes,
+        created_by=created_by,
+        effective_date=effective_date,
+        source_reference=source_reference,
+        metadata=metadata,
+        db_alias=db_alias,
+    )
+
+
+def write_expiry(
+    *,
+    employer_id: int,
+    tenant_id: int,
+    employee,
+    leave_type_code: str,
+    amount_minutes: int,
+    created_by: int,
+    effective_date: date,
+    source_reference: str,
+    metadata: Optional[dict] = None,
+    db_alias: str = "default",
+) -> TimeOffLedgerEntry:
+    """Expiry entry when unused balance lapses."""
+    return write_ledger_entry(
+        employer_id=employer_id,
+        tenant_id=tenant_id,
+        employee=employee,
+        leave_type_code=leave_type_code,
+        entry_type="EXPIRY",
+        amount_minutes=-abs(amount_minutes),
+        created_by=created_by,
+        effective_date=effective_date,
+        source_reference=source_reference,
+        metadata=metadata,
+        db_alias=db_alias,
+    )
+
+
+def write_encashment(
+    *,
+    employer_id: int,
+    tenant_id: int,
+    employee,
+    leave_type_code: str,
+    amount_minutes: int,
+    created_by: int,
+    effective_date: date,
+    source_reference: str,
+    metadata: Optional[dict] = None,
+    db_alias: str = "default",
+) -> TimeOffLedgerEntry:
+    """Encashment entry for converted leave."""
+    return write_ledger_entry(
+        employer_id=employer_id,
+        tenant_id=tenant_id,
+        employee=employee,
+        leave_type_code=leave_type_code,
+        entry_type="ENCASHMENT",
+        amount_minutes=-abs(amount_minutes),
+        created_by=created_by,
+        effective_date=effective_date,
+        source_reference=source_reference,
+        metadata=metadata,
+        db_alias=db_alias,
+    )

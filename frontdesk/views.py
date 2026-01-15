@@ -39,6 +39,13 @@ class FrontdeskStationViewSet(viewsets.ModelViewSet):
         tenant_db = get_tenant_database_alias(self.request.user.employer_profile)
         instance.delete(using=tenant_db)
 
+    @action(detail=True, methods=["delete"], url_path="delete")
+    def delete_station(self, request, pk=None):
+        station = self.get_object()
+        tenant_db = get_tenant_database_alias(request.user.employer_profile)
+        station.delete(using=tenant_db)
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
 
 class StationResponsibleViewSet(viewsets.ModelViewSet):
     """Manage station responsibles (HR/office admins scoped to branch)."""
@@ -113,6 +120,8 @@ class VisitViewSet(viewsets.ModelViewSet):
             return Response({"detail": "Visit already checked out."}, status=status.HTTP_400_BAD_REQUEST)
         if visit.status == "CHECKED_IN":
             return Response({"detail": "Visit already checked in."}, status=status.HTTP_200_OK)
+        if visit.status == "CANCELLED":
+            return Response({"detail": "Cancelled visits cannot be checked in."}, status=status.HTTP_400_BAD_REQUEST)
 
         method = request.data.get("method", "MANUAL")
         kiosk_reference = request.data.get("kiosk_reference")
@@ -129,6 +138,21 @@ class VisitViewSet(viewsets.ModelViewSet):
             return Response({"detail": "Visit must be checked in before checkout."}, status=status.HTTP_400_BAD_REQUEST)
 
         visit.check_out(user_id=request.user.id)
+        serializer = self.get_serializer(visit)
+        return Response(serializer.data, status=status.HTTP_200_OK)
+
+    @action(detail=True, methods=["post"])
+    def cancel(self, request, pk=None):
+        visit = self.get_object()
+        if visit.status == "CANCELLED":
+            serializer = self.get_serializer(visit)
+            return Response(serializer.data, status=status.HTTP_200_OK)
+        if visit.status != "PLANNED":
+            return Response({"detail": "Only planned visits can be cancelled."}, status=status.HTTP_400_BAD_REQUEST)
+
+        tenant_db = get_tenant_database_alias(request.user.employer_profile)
+        visit.status = "CANCELLED"
+        visit.save(using=tenant_db)
         serializer = self.get_serializer(visit)
         return Response(serializer.data, status=status.HTTP_200_OK)
 

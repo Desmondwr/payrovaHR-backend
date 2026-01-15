@@ -85,6 +85,9 @@ class TimeOffTypeSerializer(serializers.ModelSerializer):
             "request_requires_reason",
             "request_requires_document",
             "request_document_mandatory_after_days",
+            "reservation_policy",
+            "allow_negative_balance",
+            "negative_balance_limit",
             "approval_auto_approve",
             "approval_workflow_code",
             "approval_fallback_approver",
@@ -278,6 +281,11 @@ class TimeOffRequestInputSerializer(serializers.ModelSerializer):
             "duration_minutes",
             "unit",
         )
+        extra_kwargs = {
+            "start_at": {"required": False},
+            "end_at": {"required": False},
+            "employee": {"required": False},
+        }
 
     def validate(self, attrs):
         user = self.context.get("request").user if self.context.get("request") else None
@@ -289,8 +297,11 @@ class TimeOffRequestInputSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError({"detail": "Choose either half_day or custom_hours, not both."})
 
         date_single = attrs.pop("date", None)
-        start_date = attrs.get("start_date") or date_single or (self.instance.start_at.date() if self.instance else None)
-        end_date = attrs.get("end_date") or start_date or (self.instance.end_at.date() if self.instance else None)
+        start_date_val = attrs.pop("start_date", None)
+        end_date_val = attrs.pop("end_date", None)
+
+        start_date = start_date_val or date_single or (self.instance.start_at.date() if self.instance else None)
+        end_date = end_date_val or start_date or (self.instance.end_at.date() if self.instance else None)
         if not start_date:
             raise serializers.ValidationError({"start_date": "start_date or date is required."})
 
@@ -427,22 +438,40 @@ class TimeOffRequestInputSerializer(serializers.ModelSerializer):
                 errors["detail"] = "Request overlaps with an existing request."
 
         # Balance validation
-        allow_negative = global_settings.get("allow_negative_balance", False)
-        if not allow_negative or global_settings.get("negative_balance_limit"):
+        reservation_policy = (leave_type.get("reservation_policy") or reservation_policy).upper()
+
+        allow_negative = leave_type.get("allow_negative_balance")
+        if allow_negative is None:
+            allow_negative = global_settings.get("allow_negative_balance", False)
+        negative_balance_limit = leave_type.get("negative_balance_limit")
+        if negative_balance_limit is None:
+            negative_balance_limit = global_settings.get("negative_balance_limit", 0)
+
+        if not allow_negative or negative_balance_limit:
             available_minutes = get_available_balance(
                 employee_obj,
                 leave_type_code,
                 reservation_policy,
                 db_alias=tenant_db,
+                as_of=start_at.date(),
             )
             projected = available_minutes - duration_minutes
             if not allow_negative and projected < 0:
-                errors["detail"] = "Insufficient balance for this request."
+                available_days = available_minutes / float(working_hours * 60 or 1)
+                errors["detail"] = (
+                    f"Insufficient balance: {available_days:.2f} day(s) available, "
+                    f"{duration_days:.2f} day(s) requested."
+                )
             elif allow_negative:
-                limit_days = int(global_settings.get("negative_balance_limit") or 0)
+                limit_days = int(negative_balance_limit or 0)
                 limit_minutes = limit_days * working_hours * 60  # treat limit as days-equivalent
                 if limit_minutes and projected < -limit_minutes:
-                    errors["detail"] = "Request exceeds allowed negative balance."
+                    available_days = available_minutes / float(working_hours * 60 or 1)
+                    errors["detail"] = (
+                        f"Request exceeds allowed negative balance. "
+                        f"Available including negative: {available_days:.2f} day(s), "
+                        f"{duration_days:.2f} day(s) requested."
+                    )
 
         if errors:
             raise serializers.ValidationError(errors)
@@ -534,7 +563,7 @@ class TimeOffBalanceSerializer(serializers.Serializer):
     available_minutes = serializers.IntegerField()
 
     @staticmethod
-    def from_entries(entries, reservation_policy):
+    def from_entries(entries, reservation_policy, as_of=None, reservation_policy_by_code=None):
         grouped = {}
         for entry in entries:
             code = entry.leave_type_code
@@ -542,7 +571,10 @@ class TimeOffBalanceSerializer(serializers.Serializer):
 
         results = []
         for code, items in grouped.items():
-            balances = compute_balances(items, reservation_policy=reservation_policy)
+            policy = reservation_policy
+            if reservation_policy_by_code and code in reservation_policy_by_code:
+                policy = reservation_policy_by_code[code]
+            balances = compute_balances(items, reservation_policy=policy, as_of=as_of)
             results.append(
                 {
                     "leave_type_code": code,

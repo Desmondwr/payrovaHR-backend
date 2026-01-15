@@ -221,6 +221,9 @@ class TimeOffType(models.Model):
     request_requires_reason = models.BooleanField(default=True)
     request_requires_document = models.BooleanField(default=False)
     request_document_mandatory_after_days = models.DecimalField(max_digits=7, decimal_places=2, blank=True, null=True)
+    reservation_policy = models.CharField(max_length=30, default="RESERVE_ON_SUBMIT")
+    allow_negative_balance = models.BooleanField(default=False)
+    negative_balance_limit = models.IntegerField(default=0)
 
     approval_auto_approve = models.BooleanField(default=False)
     approval_workflow_code = models.CharField(max_length=100, default="DEFAULT")
@@ -329,6 +332,9 @@ class TimeOffType(models.Model):
                 "request_requires_reason": request_policy.get("requires_reason", True),
                 "request_requires_document": request_policy.get("requires_document", False),
                 "request_document_mandatory_after_days": cls._to_decimal(request_policy.get("document_mandatory_after_days")),
+                "reservation_policy": request_policy.get("reservation_policy", "RESERVE_ON_SUBMIT"),
+                "allow_negative_balance": request_policy.get("allow_negative_balance", False),
+                "negative_balance_limit": request_policy.get("negative_balance_limit", 0) or 0,
                 "approval_auto_approve": approval_policy.get("auto_approve", False),
                 "approval_workflow_code": approval_policy.get("workflow_code", "DEFAULT"),
                 "approval_fallback_approver": approval_policy.get("fallback_approver", "HR"),
@@ -350,6 +356,18 @@ class TimeOffType(models.Model):
                 "carryover_expires_after_days": carryover_policy.get("expires_after_days"),
             },
         )
+
+        update_fields = {}
+        for field, value in {
+            "reservation_policy": request_policy.get("reservation_policy"),
+            "allow_negative_balance": request_policy.get("allow_negative_balance"),
+            "negative_balance_limit": request_policy.get("negative_balance_limit"),
+        }.items():
+            if value is not None and getattr(instance, field) != value:
+                setattr(instance, field, value)
+                update_fields[field] = value
+        if update_fields:
+            instance.save(using=db_alias, update_fields=list(update_fields.keys()))
 
         steps = approval_policy.get("steps") or []
         if not _ and instance.approval_steps.exists():
@@ -405,6 +423,9 @@ class TimeOffType(models.Model):
             "requires_reason": self.request_requires_reason,
             "requires_document": self.request_requires_document,
             "document_mandatory_after_days": float(self.request_document_mandatory_after_days) if self.request_document_mandatory_after_days is not None else None,
+            "reservation_policy": self.reservation_policy,
+            "allow_negative_balance": self.allow_negative_balance,
+            "negative_balance_limit": self.negative_balance_limit,
             "request_policy": {
                 "allow_half_day": self.request_allow_half_day,
                 "allow_hourly": self.request_allow_hourly,
@@ -418,6 +439,9 @@ class TimeOffType(models.Model):
                 "requires_reason": self.request_requires_reason,
                 "requires_document": self.request_requires_document,
                 "document_mandatory_after_days": float(self.request_document_mandatory_after_days) if self.request_document_mandatory_after_days is not None else None,
+                "reservation_policy": self.reservation_policy,
+                "allow_negative_balance": self.allow_negative_balance,
+                "negative_balance_limit": self.negative_balance_limit,
             },
             "approval_policy": {
                 "workflow_code": self.approval_workflow_code,
@@ -704,6 +728,12 @@ class TimeOffLedgerEntry(models.Model):
         related_name="ledger_entries",
         help_text="Linked allocation request (if any)",
     )
+    source_reference = models.CharField(
+        max_length=100,
+        blank=True,
+        null=True,
+        help_text="Human-readable source reference (e.g., request/plan/run identifier).",
+    )
     notes = models.TextField(blank=True, null=True)
     created_by = models.IntegerField(help_text="User ID from main DB", db_index=True)
     metadata = models.JSONField(default=dict, blank=True)
@@ -721,6 +751,18 @@ class TimeOffLedgerEntry(models.Model):
 
     def __str__(self):
         return f"{self.entry_type} {self.amount_minutes}m for {self.leave_type_code}"
+
+    def save(self, *args, **kwargs):
+        from django.core.exceptions import ValidationError
+
+        if not self._state.adding:
+            raise ValidationError("Ledger entries are immutable and cannot be updated.")
+        super().save(*args, **kwargs)
+
+    def delete(self, *args, **kwargs):
+        from django.core.exceptions import ValidationError
+
+        raise ValidationError("Ledger entries are immutable and cannot be deleted.")
 
 
 class TimeOffAllocation(models.Model):
