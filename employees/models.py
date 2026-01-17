@@ -1,5 +1,6 @@
 from django.db import models
 from django.contrib.auth import get_user_model
+from django.contrib.auth.hashers import check_password, make_password
 # Remove direct import to avoid cross-database foreign key issues
 # from accounts.models import EmployerProfile
 from django.utils import timezone
@@ -411,6 +412,8 @@ class Employee(models.Model):
     
     # Basic Information (core fields required by employer)
     employee_id = models.CharField(max_length=50, blank=True, help_text='Company-assigned employee ID (auto-generated if not provided)')
+    badge_id = models.CharField(max_length=100, blank=True, null=True, db_index=True, help_text='Badge/RFID identifier')
+    pin_code_hash = models.CharField(max_length=128, blank=True, null=True, help_text='Hashed kiosk PIN')
     first_name = models.CharField(max_length=100)  # Required by employer
     last_name = models.CharField(max_length=100)  # Required by employer
     middle_name = models.CharField(max_length=100, blank=True, null=True)
@@ -516,6 +519,15 @@ class Employee(models.Model):
     @property
     def is_terminated(self):
         return self.employment_status in ['TERMINATED', 'RESIGNED', 'RETIRED']
+
+    def set_pin_code(self, raw_pin: str) -> None:
+        if raw_pin:
+            self.pin_code_hash = make_password(raw_pin)
+
+    def check_pin_code(self, raw_pin: str) -> bool:
+        if not raw_pin or not self.pin_code_hash:
+            return False
+        return check_password(raw_pin, self.pin_code_hash)
 
 
 class EmployeeDocument(models.Model):

@@ -261,6 +261,7 @@ class CreateEmployeeSerializer(serializers.ModelSerializer):
     """Serializer for creating a new employee - minimal fields required by employer"""
     
     send_invitation = serializers.BooleanField(default=True, write_only=True)
+    pin_code = serializers.CharField(write_only=True, required=False, allow_blank=True)
     # Define as explicit UUID fields OUTSIDE of Meta.fields to prevent auto ForeignKey handling
     department = serializers.UUIDField(
         required=False, 
@@ -285,7 +286,7 @@ class CreateEmployeeSerializer(serializers.ModelSerializer):
         model = Employee
         fields = [
             # Basic Information
-            'employee_id', 'first_name', 'last_name', 'middle_name',
+            'employee_id', 'badge_id', 'pin_code', 'first_name', 'last_name', 'middle_name',
             'date_of_birth', 'gender', 'marital_status', 'nationality',
             
             # Contact Information
@@ -446,6 +447,7 @@ class CreateEmployeeSerializer(serializers.ModelSerializer):
     
     def create(self, validated_data):
         send_invitation = validated_data.pop('send_invitation', False)
+        pin_code = validated_data.pop('pin_code', None)
         request = self.context['request']
         
         # Set employer_id from logged-in user
@@ -536,6 +538,9 @@ class CreateEmployeeSerializer(serializers.ModelSerializer):
         
         # Create employee in tenant database
         employee = Employee.objects.using(tenant_db).create(**validated_data)
+        if pin_code:
+            employee.set_pin_code(pin_code)
+            employee.save(using=tenant_db, update_fields=["pin_code_hash"])
         
         # Store invitation flag and tenant_db for view to handle
         employee._send_invitation = send_invitation
@@ -550,6 +555,8 @@ class CreateEmployeeSerializer(serializers.ModelSerializer):
 
 class UpdateEmployeeSerializer(serializers.ModelSerializer):
     """Serializer for updating employee information"""
+
+    pin_code = serializers.CharField(write_only=True, required=False, allow_blank=True)
     
     class Meta:
         model = Employee
@@ -557,6 +564,7 @@ class UpdateEmployeeSerializer(serializers.ModelSerializer):
             # Basic Information
             'first_name', 'last_name', 'middle_name', 'date_of_birth',
             'gender', 'marital_status', 'nationality', 'profile_photo',
+            'badge_id', 'pin_code',
             
             # Contact Information
             'email', 'personal_email', 'phone_number', 'alternative_phone',
@@ -585,6 +593,7 @@ class UpdateEmployeeSerializer(serializers.ModelSerializer):
         request = self.context.get('request')
         if request and hasattr(request.user, 'employer_profile'):
             tenant_db = get_tenant_database_alias(request.user.employer_profile)
+            pin_code = validated_data.pop("pin_code", None)
             
             # Before updating, validate and clean up any invalid foreign key references
             # This prevents IntegrityError for existing invalid references
@@ -606,6 +615,9 @@ class UpdateEmployeeSerializer(serializers.ModelSerializer):
             # Update instance with validated data
             for attr, value in validated_data.items():
                 setattr(instance, attr, value)
+
+            if pin_code:
+                instance.set_pin_code(pin_code)
             
             instance.save(using=tenant_db)
             return instance

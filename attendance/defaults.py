@@ -1,0 +1,58 @@
+ATTENDANCE_DEFAULTS = {
+    "schema_version": 1,
+    "working_calendar": {
+        "timezone": "UTC",
+        "working_days": ["MONDAY", "TUESDAY", "WEDNESDAY", "THURSDAY", "FRIDAY"],
+        "weekend_days": [],
+        "holiday_calendar_source": "TIMEOFF",
+        "holiday_dates": [],
+        "special_days": [],
+    },
+    "attendance_policy": {
+        "allow_self_check_in": True,
+        "allow_manual_edits": True,
+        "allow_device_only": False,
+        "max_early_check_in_minutes": 60,
+        "max_late_check_out_minutes": 240,
+        "duplicate_punch_handling": "WARN",
+        "missing_punch_handling": "ANOMALY",
+        "allow_employee_correction": True,
+        "late_grace_minutes": 5,
+        "early_grace_minutes": 5,
+        "rounding": {
+            "unit": "MINUTES",
+            "increment": 5,
+            "method": "NEAREST",
+            "in_rounding": "DOWN",
+            "out_rounding": "UP",
+        },
+        "require_edit_reason": True,
+        "edit_approval_after_days": 3,
+    },
+    "overtime_policy": {
+        "starts_after_minutes": 0,
+        "minimum_minutes": 30,
+        "require_approval": True,
+        "rate_categories": {
+            "WEEKDAY": 1.0,
+            "WEEKEND": 1.5,
+            "HOLIDAY": 2.0,
+        },
+        "max_overtime_minutes_per_day": 240,
+    },
+    "shift_policy": {
+        "assignment_strategy": "FIXED",
+        "default_shift_template_id": None,
+    },
+    "payroll_mapping": {
+        "count_worked_minutes": True,
+        "count_approved_overtime_only": True,
+        "late_penalty_mode": "DEDUCT_MINUTES",
+        "absence_penalty_mode": "UNPAID",
+    },
+    "geo_rules": {
+        "enabled": False,
+        "radius_meters": 200,
+        "allowed_locations": [],
+    },
+}

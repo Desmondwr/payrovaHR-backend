@@ -101,11 +101,11 @@ class TenantDatabaseRouter:
         
         # Both models are from the same tenant app (e.g., employees app, contracts app)
         # Allow relations within the same app (like Employee -> Employee for manager)
-        if app1 == app2 and app1 in ['employees', 'contracts', 'frontdesk', 'timeoff']:
+        if app1 == app2 and app1 in ['employees', 'contracts', 'frontdesk', 'timeoff', 'attendance']:
             return True
         
         # Allow relations between tenant apps (e.g., Contract -> Employee)
-        if app1 in ['employees', 'contracts', 'frontdesk', 'timeoff'] and app2 in ['employees', 'contracts', 'frontdesk', 'timeoff']:
+        if app1 in ['employees', 'contracts', 'frontdesk', 'timeoff', 'attendance'] and app2 in ['employees', 'contracts', 'frontdesk', 'timeoff', 'attendance']:
             return True
         
         # If both databases are explicitly set, they must match
@@ -128,6 +128,9 @@ class TenantDatabaseRouter:
         """
         # Default database gets everything
         if db == 'default':
+            if app_label == 'attendance':
+                # Attendance data lives only in tenant databases.
+                return False
             return True
         
         # Tenant databases skip auth and admin related migrations
