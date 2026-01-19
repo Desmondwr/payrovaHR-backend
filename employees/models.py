@@ -4,6 +4,7 @@ from django.contrib.auth.hashers import check_password, make_password
 # Remove direct import to avoid cross-database foreign key issues
 # from accounts.models import EmployerProfile
 from django.utils import timezone
+from django.db.models import Q
 import uuid
 import json
 
@@ -409,11 +410,19 @@ class Employee(models.Model):
     
     # Link to user account (optional - employee may not have created account yet)
     user_id = models.IntegerField(null=True, blank=True, db_index=True, help_text='ID of the user account (from main database)')
+    user_account_id = models.IntegerField(
+        null=True,
+        blank=True,
+        db_index=True,
+        help_text='Optional link to the portal user account (mirrors user_id where applicable)',
+    )
     
     # Basic Information (core fields required by employer)
     employee_id = models.CharField(max_length=50, blank=True, help_text='Company-assigned employee ID (auto-generated if not provided)')
     badge_id = models.CharField(max_length=100, blank=True, null=True, db_index=True, help_text='Badge/RFID identifier')
+    rfid_tag_id = models.CharField(max_length=100, blank=True, null=True, db_index=True, help_text='RFID tag identifier')
     pin_code_hash = models.CharField(max_length=128, blank=True, null=True, help_text='Hashed kiosk PIN')
+    pin_hash = models.CharField(max_length=128, blank=True, null=True, help_text='Normalized hashed kiosk PIN (preferred)')
     first_name = models.CharField(max_length=100)  # Required by employer
     last_name = models.CharField(max_length=100)  # Required by employer
     middle_name = models.CharField(max_length=100, blank=True, null=True)
@@ -444,6 +453,12 @@ class Employee(models.Model):
     job_title = models.CharField(max_length=255)  # Required by employer
     department = models.ForeignKey(Department, on_delete=models.SET_NULL, null=True, blank=True, related_name='employees')
     branch = models.ForeignKey(Branch, on_delete=models.SET_NULL, null=True, blank=True, related_name='employees')
+    working_schedule_id = models.UUIDField(
+        null=True,
+        blank=True,
+        db_index=True,
+        help_text='Attendance working schedule identifier (from attendance_working_schedules)',
+    )
     manager = models.ForeignKey('self', on_delete=models.SET_NULL, null=True, blank=True, related_name='direct_reports')
     employment_type = models.CharField(max_length=20, choices=EMPLOYMENT_TYPE_CHOICES)  # Required by employer
     employment_status = models.CharField(max_length=20, choices=EMPLOYMENT_STATUS_CHOICES, default='PENDING')
@@ -496,6 +511,18 @@ class Employee(models.Model):
         verbose_name = 'Employee'
         verbose_name_plural = 'Employees'
         unique_together = [['employer_id', 'employee_id']]
+        constraints = [
+            models.UniqueConstraint(
+                fields=['badge_id'],
+                condition=Q(badge_id__isnull=False) & ~Q(badge_id=""),
+                name='uniq_employee_badge_id',
+            ),
+            models.UniqueConstraint(
+                fields=['rfid_tag_id'],
+                condition=Q(rfid_tag_id__isnull=False) & ~Q(rfid_tag_id=""),
+                name='uniq_employee_rfid_tag_id',
+            ),
+        ]
         indexes = [
             models.Index(fields=['employer_id', 'employment_status']),
             models.Index(fields=['national_id_number']),
@@ -522,12 +549,17 @@ class Employee(models.Model):
 
     def set_pin_code(self, raw_pin: str) -> None:
         if raw_pin:
-            self.pin_code_hash = make_password(raw_pin)
+            hashed = make_password(raw_pin)
+            self.pin_code_hash = hashed
+            self.pin_hash = hashed
 
     def check_pin_code(self, raw_pin: str) -> bool:
-        if not raw_pin or not self.pin_code_hash:
+        if not raw_pin:
             return False
-        return check_password(raw_pin, self.pin_code_hash)
+        candidate_hash = self.pin_hash or self.pin_code_hash
+        if not candidate_hash:
+            return False
+        return check_password(raw_pin, candidate_hash)
 
 
 class EmployeeDocument(models.Model):

@@ -625,6 +625,40 @@ class UpdateEmployeeSerializer(serializers.ModelSerializer):
         return super().update(instance, validated_data)
 
 
+class AttendanceCredentialsSerializer(serializers.Serializer):
+    """Serializer for assigning attendance identifiers and schedule to an employee."""
+
+    badge_id = serializers.CharField(required=False, allow_blank=True, allow_null=True)
+    rfid_tag_id = serializers.CharField(required=False, allow_blank=True, allow_null=True)
+    pin_code = serializers.CharField(required=False, allow_blank=True, allow_null=True)
+    working_schedule_id = serializers.UUIDField(required=False, allow_null=True)
+
+    def validate_working_schedule_id(self, value):
+        if value is None:
+            return value
+        request = self.context.get("request")
+        if not request or not hasattr(request.user, "employer_profile"):
+            return value
+        from accounts.database_utils import get_tenant_database_alias
+        from attendance.models import WorkingSchedule
+
+        tenant_db = get_tenant_database_alias(request.user.employer_profile)
+        exists = WorkingSchedule.objects.using(tenant_db).filter(
+            id=value, employer_id=request.user.employer_profile.id
+        ).exists()
+        if not exists:
+            raise serializers.ValidationError("Working schedule not found for this employer.")
+        return value
+
+    def validate(self, attrs):
+        if not any(
+            key in attrs and attrs.get(key) not in [None, ""]
+            for key in ("badge_id", "rfid_tag_id", "pin_code", "working_schedule_id")
+        ):
+            raise serializers.ValidationError("Provide at least one attendance credential to update.")
+        return attrs
+
+
 class TerminateEmployeeSerializer(serializers.Serializer):
     """Serializer for employee termination"""
     

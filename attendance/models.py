@@ -1,532 +1,367 @@
 import uuid
+from datetime import datetime
+from typing import Optional
 
-from django.contrib.postgres.fields import ArrayField
+from django.core.validators import MinValueValidator
 from django.db import models
+from django.db.models import F, Q
 from django.utils import timezone
 
-from employees.models import Branch, Department, Employee
-from .defaults import ATTENDANCE_DEFAULTS
+from employees.models import Employee
 
 
-class AttendancePolicy(models.Model):
-    """Hierarchical attendance policy overrides (global -> branch -> department -> employee)."""
+class AttendanceConfiguration(models.Model):
+    """
+    Tenant-scoped attendance configuration (one active row per employer).
+    Stored as columns only (no JSON).
+    """
 
-    SCOPE_GLOBAL = "GLOBAL"
-    SCOPE_BRANCH = "BRANCH"
-    SCOPE_DEPARTMENT = "DEPARTMENT"
-    SCOPE_EMPLOYEE = "EMPLOYEE"
+    KIOSK_MODE_MANUAL = "manual"
+    KIOSK_MODE_BARCODE = "barcode_rfid"
+    KIOSK_MODE_COMBINED = "barcode_rfid_and_manual"
+    KIOSK_MODE_CHOICES = [
+        (KIOSK_MODE_MANUAL, "Manual Selection"),
+        (KIOSK_MODE_BARCODE, "Barcode/RFID Only"),
+        (KIOSK_MODE_COMBINED, "Barcode/RFID + Manual"),
+    ]
 
-    SCOPE_CHOICES = [
-        (SCOPE_GLOBAL, "Global"),
-        (SCOPE_BRANCH, "Branch"),
-        (SCOPE_DEPARTMENT, "Department"),
-        (SCOPE_EMPLOYEE, "Employee"),
+    BARCODE_SOURCE_SCANNER = "scanner"
+    BARCODE_SOURCE_FRONT_CAMERA = "front_camera"
+    BARCODE_SOURCE_BACK_CAMERA = "back_camera"
+    BARCODE_SOURCE_CHOICES = [
+        (BARCODE_SOURCE_SCANNER, "Scanner"),
+        (BARCODE_SOURCE_FRONT_CAMERA, "Front Camera"),
+        (BARCODE_SOURCE_BACK_CAMERA, "Back Camera"),
     ]
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    employer_id = models.IntegerField(db_index=True, help_text="Employer ID from main database")
-    scope_type = models.CharField(max_length=20, choices=SCOPE_CHOICES, default=SCOPE_GLOBAL)
-    branch = models.ForeignKey(Branch, on_delete=models.CASCADE, null=True, blank=True)
-    department = models.ForeignKey(Department, on_delete=models.CASCADE, null=True, blank=True)
-    employee = models.ForeignKey(Employee, on_delete=models.CASCADE, null=True, blank=True)
-    schema_version = models.IntegerField(default=1)
+    employer_id = models.IntegerField(db_index=True, help_text="Employer/company id from main database")
+    is_enabled = models.BooleanField(default=True)
+    allow_systray_portal = models.BooleanField(default=True)
+    allow_kiosk = models.BooleanField(default=True)
+    kiosk_mode = models.CharField(max_length=40, choices=KIOSK_MODE_CHOICES, default=KIOSK_MODE_COMBINED)
+    barcode_source = models.CharField(max_length=20, choices=BARCODE_SOURCE_CHOICES, blank=True, null=True)
+    kiosk_display_seconds = models.IntegerField(default=5, validators=[MinValueValidator(1)])
+    require_pin_for_kiosk = models.BooleanField(default=False)
+    require_pin_for_portal = models.BooleanField(default=False)
+    enforce_geofence = models.BooleanField(default=True)
+    enforce_wifi = models.BooleanField(default=False)
+    enforce_geofence_on_checkout = models.BooleanField(default=True)
+    enforce_wifi_on_checkout = models.BooleanField(default=False)
+    allow_mobile_gps = models.BooleanField(default=True)
+    allow_ip_logging = models.BooleanField(default=True)
+    allow_gps_logging = models.BooleanField(default=True)
+    timezone = models.CharField(max_length=64, default="UTC")
+    auto_flag_anomalies = models.BooleanField(default=True)
+    max_daily_work_minutes_before_flag = models.IntegerField(blank=True, null=True)
+    kiosk_bypass_geofence = models.BooleanField(default=True)
+    kiosk_bypass_wifi = models.BooleanField(default=True)
+    kiosk_access_token = models.CharField(
+        max_length=64,
+        default="",
+        blank=True,
+        help_text="Opaque token to protect kiosk endpoints",
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
 
-    working_timezone = models.CharField(max_length=50, null=True, blank=True)
-    working_days = ArrayField(models.CharField(max_length=10), null=True, blank=True)
-    weekend_days = ArrayField(models.CharField(max_length=10), null=True, blank=True)
-    holiday_calendar_source = models.CharField(max_length=20, null=True, blank=True)
-    holiday_dates = ArrayField(models.DateField(), null=True, blank=True)
-    special_days = ArrayField(models.DateField(), null=True, blank=True)
+    class Meta:
+        db_table = "attendance_configurations"
+        verbose_name = "Attendance Configuration"
+        verbose_name_plural = "Attendance Configurations"
+        constraints = [
+            models.UniqueConstraint(
+                fields=["employer_id"],
+                condition=Q(is_enabled=True),
+                name="uniq_attendance_config_active_per_employer",
+            )
+        ]
 
-    allow_self_check_in = models.BooleanField(null=True, blank=True)
-    allow_manual_edits = models.BooleanField(null=True, blank=True)
-    allow_device_only = models.BooleanField(null=True, blank=True)
-    max_early_check_in_minutes = models.IntegerField(null=True, blank=True)
-    max_late_check_out_minutes = models.IntegerField(null=True, blank=True)
-    duplicate_punch_handling = models.CharField(max_length=20, null=True, blank=True)
-    missing_punch_handling = models.CharField(max_length=20, null=True, blank=True)
-    allow_employee_correction = models.BooleanField(null=True, blank=True)
-    late_grace_minutes = models.IntegerField(null=True, blank=True)
-    early_grace_minutes = models.IntegerField(null=True, blank=True)
-    rounding_unit = models.CharField(max_length=20, null=True, blank=True)
-    rounding_increment = models.IntegerField(null=True, blank=True)
-    rounding_method = models.CharField(max_length=10, null=True, blank=True)
-    rounding_in_rounding = models.CharField(max_length=10, null=True, blank=True)
-    rounding_out_rounding = models.CharField(max_length=10, null=True, blank=True)
-    require_edit_reason = models.BooleanField(null=True, blank=True)
-    edit_approval_after_days = models.IntegerField(null=True, blank=True)
+    def save(self, *args, **kwargs):
+        if not self.kiosk_access_token:
+            self.kiosk_access_token = uuid.uuid4().hex
+        super().save(*args, **kwargs)
 
-    overtime_starts_after_minutes = models.IntegerField(null=True, blank=True)
-    overtime_minimum_minutes = models.IntegerField(null=True, blank=True)
-    overtime_require_approval = models.BooleanField(null=True, blank=True)
-    overtime_rate_weekday = models.DecimalField(max_digits=6, decimal_places=2, null=True, blank=True)
-    overtime_rate_weekend = models.DecimalField(max_digits=6, decimal_places=2, null=True, blank=True)
-    overtime_rate_holiday = models.DecimalField(max_digits=6, decimal_places=2, null=True, blank=True)
-    max_overtime_minutes_per_day = models.IntegerField(null=True, blank=True)
+    def __str__(self):
+        return f"Attendance Config for employer {self.employer_id}"
 
-    shift_assignment_strategy = models.CharField(max_length=20, null=True, blank=True)
-    default_shift_template = models.ForeignKey(
-        "ShiftTemplate",
+
+class AttendanceLocationSite(models.Model):
+    """
+    Allowed physical sites for attendance geofencing.
+    """
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    employer_id = models.IntegerField(db_index=True)
+    branch = models.ForeignKey(
+        "employees.Branch",
         on_delete=models.SET_NULL,
         null=True,
         blank=True,
-        related_name="default_policy_for",
+        related_name="attendance_sites",
+        help_text="Branch this site belongs to (optional for global sites).",
     )
+    name = models.CharField(max_length=255)
+    address = models.TextField(blank=True, null=True)
+    latitude = models.DecimalField(max_digits=10, decimal_places=7)
+    longitude = models.DecimalField(max_digits=10, decimal_places=7)
+    radius_meters = models.IntegerField(validators=[MinValueValidator(1)])
+    is_active = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
 
-    payroll_count_worked_minutes = models.BooleanField(null=True, blank=True)
-    payroll_count_approved_overtime_only = models.BooleanField(null=True, blank=True)
-    payroll_late_penalty_mode = models.CharField(max_length=30, null=True, blank=True)
-    payroll_absence_penalty_mode = models.CharField(max_length=30, null=True, blank=True)
+    class Meta:
+        db_table = "attendance_location_sites"
+        verbose_name = "Attendance Location Site"
+        verbose_name_plural = "Attendance Location Sites"
+        unique_together = [["employer_id", "branch", "name"]]
+        indexes = [
+            models.Index(fields=["employer_id", "is_active"]),
+            models.Index(fields=["latitude", "longitude"]),
+            models.Index(fields=["employer_id", "branch"]),
+        ]
 
-    geo_enabled = models.BooleanField(null=True, blank=True)
-    geo_radius_meters = models.IntegerField(null=True, blank=True)
-    geo_allowed_locations = ArrayField(
-        models.CharField(max_length=100),
+    def __str__(self):
+        return f"{self.name} ({self.employer_id})"
+
+
+class AttendanceAllowedWifi(models.Model):
+    """
+    Allowed Wi-Fi networks for check-in/out validation.
+    """
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    employer_id = models.IntegerField(db_index=True)
+    branch = models.ForeignKey(
+        "employees.Branch",
+        on_delete=models.SET_NULL,
         null=True,
         blank=True,
-        help_text="List of allowed coordinates or location identifiers.",
+        related_name="attendance_wifi_networks",
+        help_text="Branch this Wi-Fi is restricted to (optional for global).",
     )
+    site = models.ForeignKey(
+        AttendanceLocationSite,
+        on_delete=models.CASCADE,
+        related_name="wifi_networks",
+        blank=True,
+        null=True,
+    )
+    ssid = models.CharField(max_length=255)
+    bssid = models.CharField(max_length=64, blank=True, null=True)
     is_active = models.BooleanField(default=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
     class Meta:
-        db_table = "attendance_policies"
-        verbose_name = "Attendance Policy"
-        verbose_name_plural = "Attendance Policies"
+        db_table = "attendance_allowed_wifi"
+        verbose_name = "Attendance Allowed Wi-Fi"
+        verbose_name_plural = "Attendance Allowed Wi-Fi"
+        constraints = [
+            models.UniqueConstraint(
+                fields=["employer_id", "branch", "ssid", "bssid"], name="uniq_attendance_wifi_entry"
+            ),
+        ]
         indexes = [
-            models.Index(fields=["employer_id", "scope_type"]),
+            models.Index(fields=["employer_id", "ssid"]),
+            models.Index(fields=["employer_id", "bssid"]),
             models.Index(fields=["employer_id", "branch"]),
-            models.Index(fields=["employer_id", "department"]),
-            models.Index(fields=["employer_id", "employee"]),
         ]
 
     def __str__(self):
-        return f"Attendance Policy {self.scope_type} (Employer {self.employer_id})"
-
-    @staticmethod
-    def _set_if(target: dict, key: str, value, include_null: bool) -> None:
-        if value is None and not include_null:
-            return
-        target[key] = value
-
-    @classmethod
-    def build_defaults(cls, employer_id: int) -> dict:
-        defaults = ATTENDANCE_DEFAULTS
-        calendar = defaults.get("working_calendar") or {}
-        attendance_policy = defaults.get("attendance_policy") or {}
-        rounding = attendance_policy.get("rounding") or {}
-        overtime_policy = defaults.get("overtime_policy") or {}
-        rates = overtime_policy.get("rate_categories") or {}
-        shift_policy = defaults.get("shift_policy") or {}
-        payroll_mapping = defaults.get("payroll_mapping") or {}
-        geo_rules = defaults.get("geo_rules") or {}
-
-        return {
-            "employer_id": employer_id,
-            "schema_version": defaults.get("schema_version", 1),
-            "working_timezone": calendar.get("timezone"),
-            "working_days": calendar.get("working_days"),
-            "weekend_days": calendar.get("weekend_days"),
-            "holiday_calendar_source": calendar.get("holiday_calendar_source"),
-            "holiday_dates": calendar.get("holiday_dates"),
-            "special_days": calendar.get("special_days"),
-            "allow_self_check_in": attendance_policy.get("allow_self_check_in"),
-            "allow_manual_edits": attendance_policy.get("allow_manual_edits"),
-            "allow_device_only": attendance_policy.get("allow_device_only"),
-            "max_early_check_in_minutes": attendance_policy.get("max_early_check_in_minutes"),
-            "max_late_check_out_minutes": attendance_policy.get("max_late_check_out_minutes"),
-            "duplicate_punch_handling": attendance_policy.get("duplicate_punch_handling"),
-            "missing_punch_handling": attendance_policy.get("missing_punch_handling"),
-            "allow_employee_correction": attendance_policy.get("allow_employee_correction"),
-            "late_grace_minutes": attendance_policy.get("late_grace_minutes"),
-            "early_grace_minutes": attendance_policy.get("early_grace_minutes"),
-            "rounding_unit": rounding.get("unit"),
-            "rounding_increment": rounding.get("increment"),
-            "rounding_method": rounding.get("method"),
-            "rounding_in_rounding": rounding.get("in_rounding"),
-            "rounding_out_rounding": rounding.get("out_rounding"),
-            "require_edit_reason": attendance_policy.get("require_edit_reason"),
-            "edit_approval_after_days": attendance_policy.get("edit_approval_after_days"),
-            "overtime_starts_after_minutes": overtime_policy.get("starts_after_minutes"),
-            "overtime_minimum_minutes": overtime_policy.get("minimum_minutes"),
-            "overtime_require_approval": overtime_policy.get("require_approval"),
-            "overtime_rate_weekday": rates.get("WEEKDAY"),
-            "overtime_rate_weekend": rates.get("WEEKEND"),
-            "overtime_rate_holiday": rates.get("HOLIDAY"),
-            "max_overtime_minutes_per_day": overtime_policy.get("max_overtime_minutes_per_day"),
-            "shift_assignment_strategy": shift_policy.get("assignment_strategy"),
-            "payroll_count_worked_minutes": payroll_mapping.get("count_worked_minutes"),
-            "payroll_count_approved_overtime_only": payroll_mapping.get("count_approved_overtime_only"),
-            "payroll_late_penalty_mode": payroll_mapping.get("late_penalty_mode"),
-            "payroll_absence_penalty_mode": payroll_mapping.get("absence_penalty_mode"),
-            "geo_enabled": geo_rules.get("enabled"),
-            "geo_radius_meters": geo_rules.get("radius_meters"),
-            "geo_allowed_locations": geo_rules.get("allowed_locations"),
-        }
-
-    def to_policy_dict(self, include_null: bool = False) -> dict:
-        policy: dict = {}
-
-        working_calendar: dict = {}
-        self._set_if(working_calendar, "timezone", self.working_timezone, include_null)
-        self._set_if(working_calendar, "working_days", self.working_days, include_null)
-        self._set_if(working_calendar, "weekend_days", self.weekend_days, include_null)
-        self._set_if(working_calendar, "holiday_calendar_source", self.holiday_calendar_source, include_null)
-        self._set_if(working_calendar, "holiday_dates", self.holiday_dates, include_null)
-        self._set_if(working_calendar, "special_days", self.special_days, include_null)
-        if working_calendar or include_null:
-            policy["working_calendar"] = working_calendar
-
-        attendance_policy: dict = {}
-        self._set_if(attendance_policy, "allow_self_check_in", self.allow_self_check_in, include_null)
-        self._set_if(attendance_policy, "allow_manual_edits", self.allow_manual_edits, include_null)
-        self._set_if(attendance_policy, "allow_device_only", self.allow_device_only, include_null)
-        self._set_if(attendance_policy, "max_early_check_in_minutes", self.max_early_check_in_minutes, include_null)
-        self._set_if(attendance_policy, "max_late_check_out_minutes", self.max_late_check_out_minutes, include_null)
-        self._set_if(attendance_policy, "duplicate_punch_handling", self.duplicate_punch_handling, include_null)
-        self._set_if(attendance_policy, "missing_punch_handling", self.missing_punch_handling, include_null)
-        self._set_if(attendance_policy, "allow_employee_correction", self.allow_employee_correction, include_null)
-        self._set_if(attendance_policy, "late_grace_minutes", self.late_grace_minutes, include_null)
-        self._set_if(attendance_policy, "early_grace_minutes", self.early_grace_minutes, include_null)
-        self._set_if(attendance_policy, "require_edit_reason", self.require_edit_reason, include_null)
-        self._set_if(attendance_policy, "edit_approval_after_days", self.edit_approval_after_days, include_null)
-
-        rounding: dict = {}
-        self._set_if(rounding, "unit", self.rounding_unit, include_null)
-        self._set_if(rounding, "increment", self.rounding_increment, include_null)
-        self._set_if(rounding, "method", self.rounding_method, include_null)
-        self._set_if(rounding, "in_rounding", self.rounding_in_rounding, include_null)
-        self._set_if(rounding, "out_rounding", self.rounding_out_rounding, include_null)
-        if rounding or include_null:
-            attendance_policy["rounding"] = rounding
-
-        if attendance_policy or include_null:
-            policy["attendance_policy"] = attendance_policy
-
-        overtime_policy: dict = {}
-        self._set_if(overtime_policy, "starts_after_minutes", self.overtime_starts_after_minutes, include_null)
-        self._set_if(overtime_policy, "minimum_minutes", self.overtime_minimum_minutes, include_null)
-        self._set_if(overtime_policy, "require_approval", self.overtime_require_approval, include_null)
-        self._set_if(overtime_policy, "max_overtime_minutes_per_day", self.max_overtime_minutes_per_day, include_null)
-
-        rate_categories: dict = {}
-        self._set_if(rate_categories, "WEEKDAY", self.overtime_rate_weekday, include_null)
-        self._set_if(rate_categories, "WEEKEND", self.overtime_rate_weekend, include_null)
-        self._set_if(rate_categories, "HOLIDAY", self.overtime_rate_holiday, include_null)
-        if rate_categories or include_null:
-            overtime_policy["rate_categories"] = rate_categories
-
-        if overtime_policy or include_null:
-            policy["overtime_policy"] = overtime_policy
-
-        shift_policy: dict = {}
-        self._set_if(shift_policy, "assignment_strategy", self.shift_assignment_strategy, include_null)
-        self._set_if(
-            shift_policy,
-            "default_shift_template_id",
-            str(self.default_shift_template_id) if self.default_shift_template_id else None,
-            include_null,
-        )
-        if shift_policy or include_null:
-            policy["shift_policy"] = shift_policy
-
-        payroll_mapping: dict = {}
-        self._set_if(payroll_mapping, "count_worked_minutes", self.payroll_count_worked_minutes, include_null)
-        self._set_if(
-            payroll_mapping,
-            "count_approved_overtime_only",
-            self.payroll_count_approved_overtime_only,
-            include_null,
-        )
-        self._set_if(payroll_mapping, "late_penalty_mode", self.payroll_late_penalty_mode, include_null)
-        self._set_if(payroll_mapping, "absence_penalty_mode", self.payroll_absence_penalty_mode, include_null)
-        if payroll_mapping or include_null:
-            policy["payroll_mapping"] = payroll_mapping
-
-        geo_rules: dict = {}
-        self._set_if(geo_rules, "enabled", self.geo_enabled, include_null)
-        self._set_if(geo_rules, "radius_meters", self.geo_radius_meters, include_null)
-        self._set_if(geo_rules, "allowed_locations", self.geo_allowed_locations, include_null)
-        if geo_rules or include_null:
-            policy["geo_rules"] = geo_rules
-
-        return policy
+        return f"{self.ssid} ({self.bssid or 'no bssid'})"
 
 
-class ShiftTemplate(models.Model):
-    """Reusable shift template with rules for lateness and overtime."""
+class AttendanceKioskStation(models.Model):
+    """
+    Branch-scoped kiosk stations with their own access token/slug.
+    """
 
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    employer_id = models.IntegerField(db_index=True, help_text="Employer ID from main database")
-    branch = models.ForeignKey(Branch, on_delete=models.SET_NULL, null=True, blank=True)
-    name = models.CharField(max_length=200)
+    employer_id = models.IntegerField(db_index=True)
+    branch = models.ForeignKey(
+        "employees.Branch",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="attendance_kiosk_stations",
+    )
+    name = models.CharField(max_length=255)
+    kiosk_token = models.CharField(max_length=64, unique=True, db_index=True)
+    is_active = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "attendance_kiosk_stations"
+        verbose_name = "Attendance Kiosk Station"
+        verbose_name_plural = "Attendance Kiosk Stations"
+        indexes = [
+            models.Index(fields=["employer_id", "branch", "is_active"]),
+        ]
+
+    def save(self, *args, **kwargs):
+        if not self.kiosk_token:
+            self.kiosk_token = uuid.uuid4().hex
+        super().save(*args, **kwargs)
+
+    def __str__(self):
+        return f"{self.name} ({self.branch_id or 'no branch'})"
+
+
+class WorkingSchedule(models.Model):
+    """
+    Simplified working schedule (per employer).
+    """
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    employer_id = models.IntegerField(db_index=True)
+    name = models.CharField(max_length=255)
+    timezone = models.CharField(max_length=64, default="UTC")
+    default_daily_minutes = models.IntegerField(default=480, validators=[MinValueValidator(1)])
+    is_default = models.BooleanField(default=False)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "attendance_working_schedules"
+        verbose_name = "Working Schedule"
+        verbose_name_plural = "Working Schedules"
+        unique_together = [["employer_id", "name"]]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["employer_id"],
+                condition=Q(is_default=True),
+                name="uniq_default_working_schedule_per_employer",
+            )
+        ]
+        indexes = [
+            models.Index(fields=["employer_id", "is_default"]),
+        ]
+
+    def __str__(self):
+        return f"{self.name} ({self.employer_id})"
+
+
+class WorkingScheduleDay(models.Model):
+    """
+    Weekday-specific rules for a working schedule.
+    """
+
+    WEEKDAY_CHOICES = [
+        (0, "Monday"),
+        (1, "Tuesday"),
+        (2, "Wednesday"),
+        (3, "Thursday"),
+        (4, "Friday"),
+        (5, "Saturday"),
+        (6, "Sunday"),
+    ]
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    schedule = models.ForeignKey(WorkingSchedule, on_delete=models.CASCADE, related_name="days")
+    weekday = models.IntegerField(choices=WEEKDAY_CHOICES)
     start_time = models.TimeField()
     end_time = models.TimeField()
-    break_minutes = models.IntegerField(default=0)
-    late_grace_minutes = models.IntegerField(default=0)
-    early_grace_minutes = models.IntegerField(default=0)
-    overtime_starts_after_minutes = models.IntegerField(default=0)
-    requires_checkout = models.BooleanField(default=True)
-    is_active = models.BooleanField(default=True)
+    break_minutes = models.IntegerField(default=0, validators=[MinValueValidator(0)])
+    expected_minutes = models.IntegerField(default=0)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
     class Meta:
-        db_table = "attendance_shift_templates"
-        verbose_name = "Shift Template"
-        verbose_name_plural = "Shift Templates"
-        unique_together = [["employer_id", "name"]]
-        ordering = ["name"]
-
-    def __str__(self):
-        return f"{self.name} ({self.start_time}-{self.end_time})"
-
-    @property
-    def is_overnight(self):
-        return self.end_time <= self.start_time
-
-
-class EmployeeSchedule(models.Model):
-    """Assign shift templates to employees over date ranges."""
-
-    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    employer_id = models.IntegerField(db_index=True, help_text="Employer ID from main database")
-    employee = models.ForeignKey(Employee, on_delete=models.CASCADE, related_name="schedules")
-    shift_template = models.ForeignKey(ShiftTemplate, on_delete=models.PROTECT, related_name="assignments")
-    date_from = models.DateField()
-    date_to = models.DateField(null=True, blank=True)
-    weekdays = models.JSONField(
-        default=list,
-        blank=True,
-        help_text="List of weekday numbers (0=Mon..6=Sun); empty means all days.",
-    )
-    created_at = models.DateTimeField(auto_now_add=True)
-    updated_at = models.DateTimeField(auto_now=True)
-
-    class Meta:
-        db_table = "attendance_employee_schedules"
-        verbose_name = "Employee Schedule"
-        verbose_name_plural = "Employee Schedules"
-        indexes = [
-            models.Index(fields=["employer_id", "employee"]),
-            models.Index(fields=["date_from", "date_to"]),
+        db_table = "attendance_working_schedule_days"
+        verbose_name = "Working Schedule Day"
+        verbose_name_plural = "Working Schedule Days"
+        unique_together = [["schedule", "weekday"]]
+        constraints = [
+            models.CheckConstraint(
+                check=Q(end_time__gt=F("start_time")),
+                name="working_schedule_day_end_after_start",
+            )
         ]
 
-    def __str__(self):
-        return f"{self.employee.full_name} -> {self.shift_template.name}"
-
-
-class AttendanceDevice(models.Model):
-    """Registered devices for attendance event ingestion."""
-
-    DEVICE_TYPES = [
-        ("RFID", "RFID"),
-        ("BIOMETRIC", "Biometric"),
-        ("KIOSK", "Kiosk"),
-    ]
-
-    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    employer_id = models.IntegerField(db_index=True, help_text="Employer ID from main database")
-    branch = models.ForeignKey(Branch, on_delete=models.SET_NULL, null=True, blank=True)
-    name = models.CharField(max_length=255)
-    device_type = models.CharField(max_length=20, choices=DEVICE_TYPES)
-    auth_token = models.CharField(max_length=255, blank=True, null=True)
-    public_key = models.TextField(blank=True, null=True)
-    is_active = models.BooleanField(default=True)
-    last_seen_at = models.DateTimeField(null=True, blank=True)
-    created_at = models.DateTimeField(auto_now_add=True)
-    updated_at = models.DateTimeField(auto_now=True)
-
-    class Meta:
-        db_table = "attendance_devices"
-        verbose_name = "Attendance Device"
-        verbose_name_plural = "Attendance Devices"
-        unique_together = [["employer_id", "name"]]
+    def save(self, *args, **kwargs):
+        start_dt = datetime.combine(datetime.today(), self.start_time)
+        end_dt = datetime.combine(datetime.today(), self.end_time)
+        delta = end_dt - start_dt
+        total_minutes = int(delta.total_seconds() // 60)
+        total_minutes = max(total_minutes - int(self.break_minutes or 0), 0)
+        self.expected_minutes = total_minutes
+        super().save(*args, **kwargs)
 
     def __str__(self):
-        return f"{self.name} ({self.device_type})"
-
-
-def _generate_kiosk_token() -> str:
-    return uuid.uuid4().hex
-
-
-class AttendanceKioskSettings(models.Model):
-    """Tenant-scoped kiosk configuration."""
-
-    MODE_BARCODE = "BARCODE_RFID"
-    MODE_MANUAL = "MANUAL"
-    MODE_BOTH = "BOTH"
-
-    MODE_CHOICES = [
-        (MODE_BARCODE, "Barcode/RFID"),
-        (MODE_MANUAL, "Manual"),
-        (MODE_BOTH, "Both"),
-    ]
-
-    BARCODE_SCANNER = "SCANNER"
-    BARCODE_FRONT = "FRONT_CAMERA"
-    BARCODE_BACK = "BACK_CAMERA"
-
-    BARCODE_CHOICES = [
-        (BARCODE_SCANNER, "Scanner"),
-        (BARCODE_FRONT, "Front Camera"),
-        (BARCODE_BACK, "Back Camera"),
-    ]
-
-    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    employer_id = models.IntegerField(db_index=True, help_text="Employer ID from main database")
-    kiosk_mode = models.CharField(max_length=20, choices=MODE_CHOICES, default=MODE_BOTH)
-    barcode_source = models.CharField(max_length=20, choices=BARCODE_CHOICES, default=BARCODE_SCANNER)
-    display_time_seconds = models.IntegerField(default=3)
-    pin_required = models.BooleanField(default=False)
-    kiosk_url_token = models.CharField(max_length=64, default=_generate_kiosk_token, unique=True)
-    is_active = models.BooleanField(default=True)
-    created_at = models.DateTimeField(auto_now_add=True)
-    updated_at = models.DateTimeField(auto_now=True)
-
-    class Meta:
-        db_table = "attendance_kiosk_settings"
-        verbose_name = "Attendance Kiosk Settings"
-        verbose_name_plural = "Attendance Kiosk Settings"
-        unique_together = [["employer_id"]]
-
-    def __str__(self):
-        return f"Kiosk Settings (Employer {self.employer_id})"
-
-    def regenerate_token(self):
-        self.kiosk_url_token = _generate_kiosk_token()
-
-
-class DeviceEventIngestLog(models.Model):
-    """Audit log for device pushes."""
-
-    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    device = models.ForeignKey(AttendanceDevice, on_delete=models.CASCADE, related_name="ingest_logs")
-    received_at = models.DateTimeField(auto_now_add=True)
-    raw_payload = models.JSONField(default=dict, blank=True)
-    parsed_ok = models.BooleanField(default=False)
-    error_message = models.TextField(blank=True, null=True)
-
-    class Meta:
-        db_table = "attendance_device_ingest_logs"
-        verbose_name = "Device Event Ingest Log"
-        verbose_name_plural = "Device Event Ingest Logs"
-        ordering = ["-received_at"]
-
-    def __str__(self):
-        status = "OK" if self.parsed_ok else "FAILED"
-        return f"{self.device.name} ingest ({status})"
-
-
-class AttendanceEvent(models.Model):
-    """Immutable raw attendance events."""
-
-    EVENT_IN = "IN"
-    EVENT_OUT = "OUT"
-    EVENT_BREAK_START = "BREAK_START"
-    EVENT_BREAK_END = "BREAK_END"
-
-    EVENT_CHOICES = [
-        (EVENT_IN, "Check In"),
-        (EVENT_OUT, "Check Out"),
-        (EVENT_BREAK_START, "Break Start"),
-        (EVENT_BREAK_END, "Break End"),
-    ]
-
-    SOURCE_MANUAL = "MANUAL"
-    SOURCE_MOBILE = "MOBILE"
-    SOURCE_WEB = "WEB"
-    SOURCE_DEVICE = "DEVICE"
-    SOURCE_IMPORT = "IMPORT"
-    SOURCE_KIOSK = "KIOSK"
-
-    SOURCE_CHOICES = [
-        (SOURCE_MANUAL, "Manual"),
-        (SOURCE_MOBILE, "Mobile"),
-        (SOURCE_WEB, "Web"),
-        (SOURCE_DEVICE, "Device"),
-        (SOURCE_IMPORT, "Import"),
-        (SOURCE_KIOSK, "Kiosk"),
-    ]
-
-    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    employer_id = models.IntegerField(db_index=True, help_text="Employer ID from main database")
-    employee = models.ForeignKey(Employee, on_delete=models.CASCADE, related_name="attendance_events")
-    attendance_date = models.DateField(db_index=True, help_text="Shift start date for this event")
-    timestamp = models.DateTimeField()
-    event_type = models.CharField(max_length=20, choices=EVENT_CHOICES)
-    source = models.CharField(max_length=20, choices=SOURCE_CHOICES)
-    device = models.ForeignKey(AttendanceDevice, on_delete=models.SET_NULL, null=True, blank=True)
-    location_lat = models.FloatField(null=True, blank=True)
-    location_lng = models.FloatField(null=True, blank=True)
-    ip_address = models.GenericIPAddressField(null=True, blank=True)
-    metadata = models.JSONField(default=dict, blank=True)
-    created_by_id = models.IntegerField(null=True, blank=True, db_index=True)
-    created_at = models.DateTimeField(auto_now_add=True)
-
-    class Meta:
-        db_table = "attendance_events"
-        verbose_name = "Attendance Event"
-        verbose_name_plural = "Attendance Events"
-        ordering = ["timestamp"]
-        indexes = [
-            models.Index(fields=["employer_id", "employee", "attendance_date"]),
-            models.Index(fields=["timestamp"]),
-        ]
-
-    def __str__(self):
-        return f"{self.employee.full_name} {self.event_type} @ {self.timestamp}"
+        return f"{self.get_weekday_display()} - {self.schedule.name}"
 
 
 class AttendanceRecord(models.Model):
-    """Odoo-style interval record (check in/out)."""
+    """
+    Clock-in/out records with geofence and Wi-Fi context.
+    """
 
-    MODE_SYSTRAY = "SYSTRAY"
-    MODE_KIOSK = "KIOSK"
-    MODE_MANUAL = "MANUAL"
-
-    MODE_CHOICES = [
-        (MODE_SYSTRAY, "Systray"),
-        (MODE_KIOSK, "Kiosk"),
-        (MODE_MANUAL, "Manual"),
-    ]
-
-    STATUS_TO_APPROVE = "TO_APPROVE"
-    STATUS_APPROVED = "APPROVED"
-    STATUS_REFUSED = "REFUSED"
-
+    STATUS_TO_APPROVE = "to_approve"
+    STATUS_APPROVED = "approved"
+    STATUS_REFUSED = "refused"
     STATUS_CHOICES = [
         (STATUS_TO_APPROVE, "To Approve"),
         (STATUS_APPROVED, "Approved"),
         (STATUS_REFUSED, "Refused"),
     ]
 
+    MODE_PORTAL = "portal_systray"
+    MODE_KIOSK = "kiosk"
+    MODE_MANUAL = "manual"
+    MODE_CHOICES = [
+        (MODE_PORTAL, "Portal/Systray"),
+        (MODE_KIOSK, "Kiosk"),
+        (MODE_MANUAL, "Manual"),
+    ]
+
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    employer_id = models.IntegerField(db_index=True, help_text="Employer ID from main database")
-    employee = models.ForeignKey(Employee, on_delete=models.CASCADE, related_name="attendance_records")
+    employer_id = models.IntegerField(db_index=True)
+    employee = models.ForeignKey(Employee, on_delete=models.PROTECT, related_name="attendance_records")
     check_in_at = models.DateTimeField()
-    check_out_at = models.DateTimeField(null=True, blank=True)
+    check_out_at = models.DateTimeField(blank=True, null=True)
     worked_minutes = models.IntegerField(default=0)
-    extra_minutes = models.IntegerField(default=0)
-    overtime_status = models.CharField(max_length=20, choices=STATUS_CHOICES, default=STATUS_TO_APPROVE)
-    overtime_reason = models.TextField(blank=True, null=True)
-    mode = models.CharField(max_length=20, choices=MODE_CHOICES, default=MODE_SYSTRAY)
-    ip_check_in = models.GenericIPAddressField(null=True, blank=True)
-    ip_check_out = models.GenericIPAddressField(null=True, blank=True)
-    gps_check_in_lat = models.FloatField(null=True, blank=True)
-    gps_check_in_lng = models.FloatField(null=True, blank=True)
-    gps_check_out_lat = models.FloatField(null=True, blank=True)
-    gps_check_out_lng = models.FloatField(null=True, blank=True)
-    kiosk_device = models.ForeignKey(
-        AttendanceDevice,
+    expected_minutes = models.IntegerField(blank=True, null=True)
+    overtime_worked_minutes = models.IntegerField(default=0)
+    overtime_approved_minutes = models.IntegerField(default=0)
+    status = models.CharField(max_length=12, choices=STATUS_CHOICES, default=STATUS_APPROVED, db_index=True)
+    mode = models.CharField(max_length=20, choices=MODE_CHOICES, default=MODE_PORTAL, db_index=True)
+    check_in_ip = models.GenericIPAddressField(blank=True, null=True)
+    check_in_latitude = models.DecimalField(max_digits=10, decimal_places=7, blank=True, null=True)
+    check_in_longitude = models.DecimalField(max_digits=10, decimal_places=7, blank=True, null=True)
+    check_in_site = models.ForeignKey(
+        AttendanceLocationSite,
+        on_delete=models.SET_NULL,
+        related_name="check_in_records",
+        blank=True,
+        null=True,
+    )
+    check_in_wifi_ssid = models.CharField(max_length=255, blank=True, null=True)
+    check_in_wifi_bssid = models.CharField(max_length=64, blank=True, null=True)
+    check_out_ip = models.GenericIPAddressField(blank=True, null=True)
+    check_out_latitude = models.DecimalField(max_digits=10, decimal_places=7, blank=True, null=True)
+    check_out_longitude = models.DecimalField(max_digits=10, decimal_places=7, blank=True, null=True)
+    check_out_site = models.ForeignKey(
+        AttendanceLocationSite,
+        on_delete=models.SET_NULL,
+        related_name="check_out_records",
+        blank=True,
+        null=True,
+    )
+    check_out_wifi_ssid = models.CharField(max_length=255, blank=True, null=True)
+    check_out_wifi_bssid = models.CharField(max_length=64, blank=True, null=True)
+    anomaly_reason = models.CharField(max_length=255, blank=True, null=True)
+    created_by_id = models.IntegerField(blank=True, null=True, db_index=True)
+    kiosk_session_reference = models.CharField(max_length=100, blank=True, null=True)
+    kiosk_station = models.ForeignKey(
+        "AttendanceKioskStation",
         on_delete=models.SET_NULL,
         null=True,
         blank=True,
         related_name="attendance_records",
+        help_text="Branch kiosk station used for this record.",
     )
-    created_by_id = models.IntegerField(null=True, blank=True, db_index=True)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -534,151 +369,38 @@ class AttendanceRecord(models.Model):
         db_table = "attendance_records"
         verbose_name = "Attendance Record"
         verbose_name_plural = "Attendance Records"
+        ordering = ["-check_in_at"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["employee"],
+                condition=Q(check_out_at__isnull=True),
+                name="uniq_open_attendance_record_per_employee",
+            ),
+            models.CheckConstraint(
+                check=Q(check_out_at__gt=F("check_in_at")) | Q(check_out_at__isnull=True),
+                name="attendance_checkout_after_checkin",
+            ),
+        ]
         indexes = [
             models.Index(fields=["employer_id", "employee"]),
+            models.Index(fields=["status"]),
+            models.Index(fields=["mode"]),
             models.Index(fields=["check_in_at"]),
-            models.Index(fields=["overtime_status"]),
         ]
 
-    def __str__(self):
-        return f"{self.employee.full_name} {self.check_in_at} ({self.mode})"
+    def compute_worked_minutes(self) -> int:
+        end_time = self.check_out_at or timezone.now()
+        delta = end_time - self.check_in_at
+        minutes = int(delta.total_seconds() // 60)
+        return max(minutes, 0)
 
-    def update_worked_minutes(self):
-        if self.check_out_at and self.check_in_at:
-            delta = self.check_out_at - self.check_in_at
-            self.worked_minutes = max(0, int(delta.total_seconds() // 60))
-
-
-class AttendanceDay(models.Model):
-    """Daily attendance summary derived from events."""
-
-    STATUS_PRESENT = "PRESENT"
-    STATUS_ABSENT = "ABSENT"
-    STATUS_PARTIAL = "PARTIAL"
-    STATUS_ON_LEAVE = "ON_LEAVE"
-    STATUS_HOLIDAY = "HOLIDAY"
-    STATUS_WEEKEND = "WEEKEND"
-    STATUS_REST_DAY = "REST_DAY"
-
-    STATUS_CHOICES = [
-        (STATUS_PRESENT, "Present"),
-        (STATUS_ABSENT, "Absent"),
-        (STATUS_PARTIAL, "Partial"),
-        (STATUS_ON_LEAVE, "On Leave"),
-        (STATUS_HOLIDAY, "Holiday"),
-        (STATUS_WEEKEND, "Weekend"),
-        (STATUS_REST_DAY, "Rest Day"),
-    ]
-
-    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    employer_id = models.IntegerField(db_index=True, help_text="Employer ID from main database")
-    employee = models.ForeignKey(Employee, on_delete=models.CASCADE, related_name="attendance_days")
-    date = models.DateField(db_index=True)
-    expected_shift = models.ForeignKey(ShiftTemplate, on_delete=models.SET_NULL, null=True, blank=True)
-    first_in_at = models.DateTimeField(null=True, blank=True)
-    last_out_at = models.DateTimeField(null=True, blank=True)
-    worked_minutes = models.IntegerField(default=0)
-    late_minutes = models.IntegerField(default=0)
-    early_leave_minutes = models.IntegerField(default=0)
-    overtime_minutes = models.IntegerField(default=0)
-    approved_overtime_minutes = models.IntegerField(default=0)
-    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default=STATUS_ABSENT)
-    anomaly_flags = models.JSONField(default=list, blank=True)
-    locked_for_payroll = models.BooleanField(default=False)
-    notes = models.TextField(blank=True, null=True)
-    updated_at = models.DateTimeField(auto_now=True)
-    created_at = models.DateTimeField(auto_now_add=True)
-
-    class Meta:
-        db_table = "attendance_days"
-        verbose_name = "Attendance Day"
-        verbose_name_plural = "Attendance Days"
-        unique_together = [["employee", "date"]]
-        indexes = [
-            models.Index(fields=["employer_id", "date"]),
-            models.Index(fields=["employer_id", "employee"]),
-            models.Index(fields=["status"]),
-        ]
+    def mark_checkout(self, checkout_time: Optional[datetime] = None) -> None:
+        self.check_out_at = checkout_time or timezone.now()
+        self.worked_minutes = self.compute_worked_minutes()
+        overtime = 0
+        if self.expected_minutes:
+            overtime = max(self.worked_minutes - int(self.expected_minutes), 0)
+        self.overtime_worked_minutes = overtime
 
     def __str__(self):
-        return f"{self.employee.full_name} - {self.date} ({self.status})"
-
-
-class AttendanceDayAuditLog(models.Model):
-    """Audit log for manual edits to attendance days."""
-
-    ACTION_CHOICES = [
-        ("CREATED", "Created"),
-        ("UPDATED", "Updated"),
-        ("LOCKED", "Locked for Payroll"),
-        ("UNLOCKED", "Unlocked for Payroll"),
-    ]
-
-    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    attendance_day = models.ForeignKey(AttendanceDay, on_delete=models.CASCADE, related_name="audit_logs")
-    action = models.CharField(max_length=20, choices=ACTION_CHOICES)
-    performed_by_id = models.IntegerField(null=True, blank=True, db_index=True)
-    timestamp = models.DateTimeField(auto_now_add=True)
-    changes = models.JSONField(default=dict, blank=True)
-    reason = models.TextField(blank=True, null=True)
-    ip_address = models.GenericIPAddressField(null=True, blank=True)
-
-    class Meta:
-        db_table = "attendance_day_audit_logs"
-        verbose_name = "Attendance Day Audit Log"
-        verbose_name_plural = "Attendance Day Audit Logs"
-        ordering = ["-timestamp"]
-
-    def __str__(self):
-        return f"{self.attendance_day.employee.full_name} {self.action} @ {self.timestamp}"
-
-
-class OvertimeRequest(models.Model):
-    """Overtime approvals per day."""
-
-    STATUS_PENDING = "PENDING"
-    STATUS_APPROVED = "APPROVED"
-    STATUS_REJECTED = "REJECTED"
-
-    STATUS_CHOICES = [
-        (STATUS_PENDING, "Pending"),
-        (STATUS_APPROVED, "Approved"),
-        (STATUS_REJECTED, "Rejected"),
-    ]
-
-    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    employer_id = models.IntegerField(db_index=True, help_text="Employer ID from main database")
-    employee = models.ForeignKey(Employee, on_delete=models.CASCADE, related_name="overtime_requests")
-    date = models.DateField(db_index=True)
-    minutes = models.IntegerField(default=0)
-    reason = models.TextField(blank=True, null=True)
-    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default=STATUS_PENDING)
-    approved_by_id = models.IntegerField(null=True, blank=True, db_index=True)
-    approved_at = models.DateTimeField(null=True, blank=True)
-    created_by_id = models.IntegerField(null=True, blank=True, db_index=True)
-    created_at = models.DateTimeField(auto_now_add=True)
-
-    class Meta:
-        db_table = "attendance_overtime_requests"
-        verbose_name = "Overtime Request"
-        verbose_name_plural = "Overtime Requests"
-        unique_together = [["employee", "date"]]
-        indexes = [
-            models.Index(fields=["employer_id", "employee", "date"]),
-            models.Index(fields=["status"]),
-        ]
-
-    def __str__(self):
-        return f"OT {self.employee.full_name} {self.date} ({self.status})"
-
-    def approve(self, approver_id):
-        self.status = self.STATUS_APPROVED
-        self.approved_by_id = approver_id
-        self.approved_at = timezone.now()
-
-    def reject(self, approver_id):
-        self.status = self.STATUS_REJECTED
-        self.approved_by_id = approver_id
-        self.approved_at = timezone.now()
-
-# Create your models here.
+        return f"{self.employee_id} @ {self.check_in_at}"

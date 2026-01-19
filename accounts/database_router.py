@@ -128,9 +128,6 @@ class TenantDatabaseRouter:
         """
         # Default database gets everything
         if db == 'default':
-            if app_label == 'attendance':
-                # Attendance data lives only in tenant databases.
-                return False
             return True
         
         # Tenant databases skip auth and admin related migrations

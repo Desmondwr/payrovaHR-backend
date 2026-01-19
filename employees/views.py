@@ -24,7 +24,7 @@ from .serializers import (
     CreateEmployeeWithDetectionSerializer, EmployeeDocumentUploadSerializer,
     AcceptInvitationSerializer, EmployeeProfileCompletionSerializer,
     EmployeeSelfProfileSerializer, EmployeePrefillRequestSerializer,
-    EmployeePrefillSerializer
+    EmployeePrefillSerializer, AttendanceCredentialsSerializer
 )
 from .utils import (
     detect_duplicate_employees, generate_employee_invitation_token,
@@ -243,6 +243,44 @@ class EmployeeViewSet(viewsets.ModelViewSet):
             }
         
         return Response(response_data, status=status.HTTP_201_CREATED)
+
+    @action(detail=True, methods=["post", "patch"], url_path="attendance-credentials")
+    def attendance_credentials(self, request, pk=None):
+        """Assign or update badge/RFID/PIN/working schedule for an employee."""
+        employee = self.get_object()
+        serializer = AttendanceCredentialsSerializer(data=request.data, context={"request": request})
+        serializer.is_valid(raise_exception=True)
+        data = serializer.validated_data
+
+        from accounts.database_utils import get_tenant_database_alias
+        tenant_db = get_tenant_database_alias(request.user.employer_profile)
+
+        def _normalize(value):
+            return None if value == "" else value
+
+        update_fields = []
+        for field in ["badge_id", "rfid_tag_id", "working_schedule_id"]:
+            if field in data:
+                setattr(employee, field, _normalize(data[field]))
+                update_fields.append(field)
+
+        if "pin_code" in data:
+            pin_code = data.get("pin_code")
+            if pin_code:
+                employee.set_pin_code(pin_code)
+                update_fields.extend(["pin_code_hash", "pin_hash"])
+            else:
+                employee.pin_code_hash = None
+                employee.pin_hash = None
+                update_fields.extend(["pin_code_hash", "pin_hash"])
+
+        if not update_fields:
+            return Response({"detail": "No attendance credential changes provided."}, status=status.HTTP_400_BAD_REQUEST)
+
+        # Ensure timestamp updates when update_fields is used
+        update_fields.append("updated_at")
+        employee.save(using=tenant_db, update_fields=update_fields)
+        return Response(EmployeeDetailSerializer(employee).data, status=status.HTTP_200_OK)
     
     def _send_invitation(self, employee, tenant_db=None):
         """Helper method to send employee invitation"""

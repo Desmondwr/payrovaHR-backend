@@ -1,285 +1,392 @@
-from datetime import datetime
-
 from rest_framework import serializers
-from django.utils import timezone
 
-from accounts.database_utils import get_tenant_database_alias
-from employees.models import Employee
-
+from employees.models import Branch
 from .models import (
-    AttendanceDay,
-    AttendanceDevice,
-    AttendanceEvent,
-    AttendanceKioskSettings,
-    AttendancePolicy,
+    AttendanceAllowedWifi,
+    AttendanceConfiguration,
+    AttendanceKioskStation,
+    AttendanceLocationSite,
     AttendanceRecord,
-    EmployeeSchedule,
-    OvertimeRequest,
-    ShiftTemplate,
+    WorkingSchedule,
+    WorkingScheduleDay,
 )
-from .services import assign_attendance_date, compute_overtime_minutes, create_manual_record, resolve_attendance_policy
 
 
-class TenantBoundModelSerializer(serializers.ModelSerializer):
-    def _resolve_tenant_db(self) -> str:
+class AttendanceConfigurationSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = AttendanceConfiguration
+        fields = "__all__"
+        read_only_fields = ["id", "employer_id", "created_at", "updated_at", "kiosk_access_token"]
+
+
+class AttendanceLocationSiteSerializer(serializers.ModelSerializer):
+    branch = serializers.PrimaryKeyRelatedField(required=False, allow_null=True, queryset=Branch.objects.none())
+    branch_name = serializers.SerializerMethodField(read_only=True)
+
+    class Meta:
+        model = AttendanceLocationSite
+        fields = [
+            "id",
+            "employer_id",
+            "branch",
+            "branch_name",
+            "name",
+            "address",
+            "latitude",
+            "longitude",
+            "radius_meters",
+            "is_active",
+            "created_at",
+            "updated_at",
+        ]
+        read_only_fields = ["id", "employer_id", "created_at", "updated_at"]
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
         request = self.context.get("request")
-        user = getattr(request, "user", None)
-        if not user:
-            return "default"
-        if hasattr(user, "employer_profile") and user.employer_profile:
-            return get_tenant_database_alias(user.employer_profile)
-        if hasattr(user, "employee_profile") and user.employee_profile:
-            return user.employee_profile._state.db or "default"
-        return "default"
+        if request and hasattr(request.user, "employer_profile"):
+            from accounts.database_utils import get_tenant_database_alias
 
-    def create(self, validated_data):
-        tenant_db = self.context.get("tenant_db") or self._resolve_tenant_db()
-        return self.Meta.model.objects.using(tenant_db).create(**validated_data)
+            tenant_db = get_tenant_database_alias(request.user.employer_profile)
+            self.fields["branch"].queryset = Branch.objects.using(tenant_db).filter(
+                employer_id=request.user.employer_profile.id
+            )
 
-    def update(self, instance, validated_data):
-        tenant_db = instance._state.db or self.context.get("tenant_db") or self._resolve_tenant_db()
-        for key, value in validated_data.items():
-            setattr(instance, key, value)
-        instance.save(using=tenant_db)
-        return instance
-
-
-class AttendancePolicySerializer(TenantBoundModelSerializer):
-    class Meta:
-        model = AttendancePolicy
-        fields = "__all__"
-        read_only_fields = ("id", "employer_id", "created_at", "updated_at")
-
-
-class ShiftTemplateSerializer(TenantBoundModelSerializer):
-    class Meta:
-        model = ShiftTemplate
-        fields = "__all__"
-        read_only_fields = ("id", "employer_id", "created_at", "updated_at")
-
-
-class EmployeeScheduleSerializer(TenantBoundModelSerializer):
-    class Meta:
-        model = EmployeeSchedule
-        fields = "__all__"
-        read_only_fields = ("id", "employer_id", "created_at", "updated_at")
-
-
-class AttendanceEventSerializer(serializers.ModelSerializer):
-    class Meta:
-        model = AttendanceEvent
-        fields = "__all__"
-        read_only_fields = ("id", "attendance_date", "employer_id", "created_at")
-
-
-class AttendanceEventCreateSerializer(serializers.ModelSerializer):
-    employee_id = serializers.UUIDField(write_only=True, required=False)
-    timestamp = serializers.DateTimeField(required=False)
-
-    class Meta:
-        model = AttendanceEvent
-        fields = (
-            "employee_id",
-            "timestamp",
-            "event_type",
-            "source",
-            "device",
-            "location_lat",
-            "location_lng",
-            "ip_address",
-            "metadata",
-        )
-
-    def validate(self, attrs):
-        request = self.context.get("request")
-        user = getattr(request, "user", None)
-        if not user:
-            raise serializers.ValidationError({"detail": "User context required."})
-
-        tenant_db = "default"
-        employee = None
-
-        if hasattr(user, "employer_profile") and user.employer_profile:
-            tenant_db = get_tenant_database_alias(user.employer_profile)
-            employee_id = attrs.get("employee_id") or self.initial_data.get("employee_id")
-            if not employee_id:
-                raise serializers.ValidationError({"employee_id": ["employee_id is required."]})
-            employee = Employee.objects.using(tenant_db).filter(id=employee_id).first()
-            if not employee:
-                raise serializers.ValidationError({"employee_id": ["Employee not found for this tenant."]})
-        elif hasattr(user, "employee_profile") and user.employee_profile:
-            employee = user.employee_profile
-            tenant_db = employee._state.db or tenant_db
-        else:
-            raise serializers.ValidationError({"detail": "Unable to resolve tenant."})
-
-        timestamp = attrs.get("timestamp") or datetime.now()
-        if timezone.is_naive(timestamp):
-            timestamp = timezone.make_aware(timestamp, timezone.get_current_timezone())
-
-        shift, attendance_date = assign_attendance_date(employee, timestamp, tenant_db)
-
-        attrs["timestamp"] = timestamp
-        attrs["employee"] = employee
-        attrs["employer_id"] = employee.employer_id
-        attrs["attendance_date"] = attendance_date
-        attrs["created_by_id"] = user.id
-        attrs["tenant_db"] = tenant_db
-        attrs["expected_shift"] = shift
-        return attrs
-
-    def create(self, validated_data):
-        tenant_db = validated_data.pop("tenant_db")
-        validated_data.pop("expected_shift", None)
-        return AttendanceEvent.objects.using(tenant_db).create(**validated_data)
-
-
-class AttendanceDaySerializer(serializers.ModelSerializer):
-    class Meta:
-        model = AttendanceDay
-        fields = "__all__"
-        read_only_fields = ("id", "employer_id", "created_at", "updated_at")
-
-
-class AttendanceDayManualMarkSerializer(serializers.Serializer):
-    employee_id = serializers.UUIDField()
-    date = serializers.DateField()
-    status = serializers.ChoiceField(choices=AttendanceDay.STATUS_CHOICES)
-    first_in_at = serializers.DateTimeField(required=False, allow_null=True)
-    last_out_at = serializers.DateTimeField(required=False, allow_null=True)
-    worked_minutes = serializers.IntegerField(required=False, default=0)
-    reason = serializers.CharField(required=False, allow_blank=True, allow_null=True)
-
-    def validate(self, attrs):
+    def validate_branch(self, value):
+        if value is None:
+            return value
         request = self.context.get("request")
         if not request or not hasattr(request.user, "employer_profile"):
-            raise serializers.ValidationError({"detail": "Employer context required."})
-        tenant_db = get_tenant_database_alias(request.user.employer_profile)
-        employee = Employee.objects.using(tenant_db).filter(id=attrs["employee_id"]).first()
-        if not employee:
-            raise serializers.ValidationError({"employee_id": ["Employee not found for this tenant."]})
-        attrs["employee"] = employee
-        attrs["tenant_db"] = tenant_db
+            return value
+        if value.employer_id != request.user.employer_profile.id:
+            raise serializers.ValidationError("Branch not found for this employer.")
+        return value
+
+    def get_branch_name(self, obj):
+        return getattr(obj.branch, "name", None)
+
+    def validate(self, attrs):
+        attrs = super().validate(attrs)
+        # Default to the single branch if only one exists for the employer
+        if not attrs.get("branch"):
+            request = self.context.get("request")
+            if request and hasattr(request.user, "employer_profile"):
+                qs = self.fields["branch"].queryset
+                if qs is not None and qs.count() == 1:
+                    attrs["branch"] = qs.first()
         return attrs
 
 
-class AttendanceDeviceSerializer(TenantBoundModelSerializer):
+class AttendanceAllowedWifiSerializer(serializers.ModelSerializer):
+    branch = serializers.PrimaryKeyRelatedField(required=False, allow_null=True, queryset=Branch.objects.none())
+    branch_name = serializers.SerializerMethodField(read_only=True)
+
     class Meta:
-        model = AttendanceDevice
-        fields = "__all__"
-        read_only_fields = ("id", "employer_id", "created_at", "updated_at")
+        model = AttendanceAllowedWifi
+        fields = [
+            "id",
+            "employer_id",
+            "branch",
+            "branch_name",
+            "site",
+            "ssid",
+            "bssid",
+            "is_active",
+            "created_at",
+            "updated_at",
+        ]
+        read_only_fields = ["id", "employer_id", "created_at", "updated_at"]
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        request = self.context.get("request")
+        if request and hasattr(request.user, "employer_profile"):
+            from accounts.database_utils import get_tenant_database_alias
+
+            tenant_db = get_tenant_database_alias(request.user.employer_profile)
+            self.fields["branch"].queryset = Branch.objects.using(tenant_db).filter(
+                employer_id=request.user.employer_profile.id
+            )
+
+    def validate_branch(self, value):
+        if value is None:
+            return value
+        request = self.context.get("request")
+        if not request or not hasattr(request.user, "employer_profile"):
+            return value
+        if value.employer_id != request.user.employer_profile.id:
+            raise serializers.ValidationError("Branch not found for this employer.")
+        return value
+
+    def get_branch_name(self, obj):
+        return getattr(obj.branch, "name", None)
+
+    def validate(self, attrs):
+        attrs = super().validate(attrs)
+        site = attrs.get("site")
+        branch = attrs.get("branch")
+        if site and branch and site.branch_id and site.branch_id != branch.id:
+            raise serializers.ValidationError({"branch": "Wi-Fi branch must match the site branch."})
+        if site and site.branch_id and branch is None:
+            attrs["branch"] = site.branch
+            branch = site.branch
+        # Default to the single branch if none provided and no site branch
+        if branch is None:
+            request = self.context.get("request")
+            if request and hasattr(request.user, "employer_profile"):
+                qs = self.fields["branch"].queryset
+                if qs is not None and qs.count() == 1:
+                    attrs["branch"] = qs.first()
+        return attrs
 
 
-class AttendanceKioskSettingsSerializer(TenantBoundModelSerializer):
+class AttendanceKioskStationSerializer(serializers.ModelSerializer):
+    branch = serializers.PrimaryKeyRelatedField(required=False, allow_null=True, queryset=Branch.objects.none())
+    branch_name = serializers.SerializerMethodField(read_only=True)
+
     class Meta:
-        model = AttendanceKioskSettings
-        fields = "__all__"
-        read_only_fields = ("id", "employer_id", "kiosk_url_token", "created_at", "updated_at")
+        model = AttendanceKioskStation
+        fields = [
+            "id",
+            "employer_id",
+            "name",
+            "branch",
+            "branch_name",
+            "kiosk_token",
+            "is_active",
+            "created_at",
+            "updated_at",
+        ]
+        read_only_fields = ["id", "employer_id", "kiosk_token", "created_at", "updated_at"]
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        request = self.context.get("request")
+        if request and hasattr(request.user, "employer_profile"):
+            from accounts.database_utils import get_tenant_database_alias
+
+            tenant_db = get_tenant_database_alias(request.user.employer_profile)
+            self.fields["branch"].queryset = Branch.objects.using(tenant_db).filter(
+                employer_id=request.user.employer_profile.id
+            )
+
+    def validate_branch(self, value):
+        if value is None:
+            return value
+        request = self.context.get("request")
+        if not request or not hasattr(request.user, "employer_profile"):
+            return value
+        if value.employer_id != request.user.employer_profile.id:
+            raise serializers.ValidationError("Branch not found for this employer.")
+        return value
+
+    def get_branch_name(self, obj):
+        return getattr(obj.branch, "name", None)
+
+    def validate(self, attrs):
+        attrs = super().validate(attrs)
+        if not attrs.get("branch"):
+            request = self.context.get("request")
+            if request and hasattr(request.user, "employer_profile"):
+                qs = self.fields["branch"].queryset
+                if qs is not None and qs.count() == 1:
+                    attrs["branch"] = qs.first()
+        return attrs
 
 
-class AttendanceRecordSerializer(TenantBoundModelSerializer):
+class AttendanceRecordSerializer(serializers.ModelSerializer):
+    employee_full_name = serializers.CharField(source="employee.full_name", read_only=True)
+
     class Meta:
         model = AttendanceRecord
-        fields = "__all__"
-        read_only_fields = ("id", "employer_id", "worked_minutes", "created_at", "updated_at")
+        fields = [
+            "id",
+            "employer_id",
+            "employee",
+            "employee_full_name",
+            "check_in_at",
+            "check_out_at",
+            "worked_minutes",
+            "expected_minutes",
+            "overtime_worked_minutes",
+            "overtime_approved_minutes",
+            "status",
+            "mode",
+            "check_in_ip",
+            "check_in_latitude",
+            "check_in_longitude",
+            "check_in_site",
+            "check_in_wifi_ssid",
+            "check_in_wifi_bssid",
+            "check_out_ip",
+            "check_out_latitude",
+            "check_out_longitude",
+            "check_out_site",
+            "check_out_wifi_ssid",
+            "check_out_wifi_bssid",
+            "anomaly_reason",
+            "created_by_id",
+            "kiosk_session_reference",
+            "kiosk_station",
+            "created_at",
+            "updated_at",
+        ]
+        read_only_fields = [
+            "id",
+            "employer_id",
+            "worked_minutes",
+            "expected_minutes",
+            "overtime_worked_minutes",
+            "status",
+            "anomaly_reason",
+            "created_at",
+            "updated_at",
+        ]
 
 
-class AttendanceRecordCreateSerializer(serializers.Serializer):
+class AttendanceCheckInSerializer(serializers.Serializer):
+    employee_id = serializers.UUIDField(required=False)
+    latitude = serializers.DecimalField(max_digits=10, decimal_places=7, required=False)
+    longitude = serializers.DecimalField(max_digits=10, decimal_places=7, required=False)
+    wifi_ssid = serializers.CharField(required=False, allow_blank=True, allow_null=True)
+    wifi_bssid = serializers.CharField(required=False, allow_blank=True, allow_null=True)
+    device_time = serializers.DateTimeField(required=False)
+    timezone = serializers.CharField(required=False, allow_blank=True, allow_null=True)
+
+
+class AttendanceCheckOutSerializer(serializers.Serializer):
+    employee_id = serializers.UUIDField(required=False)
+    latitude = serializers.DecimalField(max_digits=10, decimal_places=7, required=False)
+    longitude = serializers.DecimalField(max_digits=10, decimal_places=7, required=False)
+    wifi_ssid = serializers.CharField(required=False, allow_blank=True, allow_null=True)
+    wifi_bssid = serializers.CharField(required=False, allow_blank=True, allow_null=True)
+    device_time = serializers.DateTimeField(required=False)
+
+
+class AttendanceManualCreateSerializer(serializers.Serializer):
     employee_id = serializers.UUIDField()
     check_in_at = serializers.DateTimeField()
     check_out_at = serializers.DateTimeField()
-    extra_minutes = serializers.IntegerField(required=False, allow_null=True)
-    overtime_reason = serializers.CharField(required=False, allow_blank=True, allow_null=True)
+    overtime_approved_minutes = serializers.IntegerField(required=False, min_value=0, default=0)
 
     def validate(self, attrs):
-        request = self.context.get("request")
-        if not request or not hasattr(request.user, "employer_profile"):
-            raise serializers.ValidationError({"detail": "Employer context required."})
-        tenant_db = get_tenant_database_alias(request.user.employer_profile)
-        employee = Employee.objects.using(tenant_db).filter(id=attrs["employee_id"]).first()
-        if not employee:
-            raise serializers.ValidationError({"employee_id": ["Employee not found for this tenant."]})
         if attrs["check_out_at"] <= attrs["check_in_at"]:
-            raise serializers.ValidationError({"check_out_at": ["Check-out must be after check-in."]})
-        policy = resolve_attendance_policy(employee, tenant_db)
-        overtime_minutes, _, _ = compute_overtime_minutes(
-            employee,
-            attrs["check_in_at"],
-            attrs["check_out_at"],
-            tenant_db,
-            policy=policy,
-        )
-        requested_extra = attrs.get("extra_minutes")
-        if requested_extra is not None:
-            overtime_minutes = max(0, int(requested_extra))
-        require_approval = (policy.get("overtime_policy") or {}).get("require_approval", True)
-        if require_approval and overtime_minutes > 0 and not attrs.get("overtime_reason"):
-            raise serializers.ValidationError({"overtime_reason": ["Overtime reason is required."]})
-        attrs["employee"] = employee
-        attrs["tenant_db"] = tenant_db
-        attrs["policy"] = policy
+            raise serializers.ValidationError({"check_out_at": "check_out_at must be after check_in_at"})
         return attrs
 
-    def create(self, validated_data):
-        employee = validated_data["employee"]
-        tenant_db = validated_data["tenant_db"]
-        return create_manual_record(
-            employee=employee,
-            tenant_db=tenant_db,
-            check_in_at=validated_data["check_in_at"],
-            check_out_at=validated_data["check_out_at"],
-            extra_minutes=validated_data.get("extra_minutes"),
-            overtime_reason=validated_data.get("overtime_reason"),
-            created_by_id=self.context["request"].user.id,
-        )
+
+class KioskCheckSerializer(serializers.Serializer):
+    employee_identifier = serializers.CharField()
+    pin = serializers.CharField(required=False, allow_blank=True, allow_null=True)
+    kiosk_token = serializers.CharField(required=False, allow_blank=True, allow_null=True)
+    latitude = serializers.DecimalField(max_digits=10, decimal_places=7, required=False)
+    longitude = serializers.DecimalField(max_digits=10, decimal_places=7, required=False)
+    wifi_ssid = serializers.CharField(required=False, allow_blank=True, allow_null=True)
+    wifi_bssid = serializers.CharField(required=False, allow_blank=True, allow_null=True)
 
 
-class OvertimeRequestSerializer(serializers.ModelSerializer):
-    class Meta:
-        model = OvertimeRequest
-        fields = "__all__"
-        read_only_fields = ("id", "employer_id", "status", "approved_by_id", "approved_at", "created_at")
+class PartialApproveSerializer(serializers.Serializer):
+    overtime_approved_minutes = serializers.IntegerField(min_value=0)
 
 
-class OvertimeRequestCreateSerializer(serializers.ModelSerializer):
-    employee_id = serializers.UUIDField(write_only=True, required=False)
-
-    class Meta:
-        model = OvertimeRequest
-        fields = ("employee_id", "date", "minutes", "reason")
+class AttendanceReportQuerySerializer(serializers.Serializer):
+    date_from = serializers.DateField(required=False)
+    date_to = serializers.DateField(required=False)
+    employee_id = serializers.UUIDField(required=False)
+    department_id = serializers.UUIDField(required=False)
+    group_by = serializers.CharField(required=False, allow_blank=True, allow_null=True)
+    measures = serializers.ListField(
+        child=serializers.CharField(),
+        allow_empty=True,
+        required=False,
+    )
 
     def validate(self, attrs):
-        request = self.context.get("request")
-        user = getattr(request, "user", None)
-        if not user:
-            raise serializers.ValidationError({"detail": "User context required."})
+        if attrs.get("date_from") and attrs.get("date_to") and attrs["date_to"] < attrs["date_from"]:
+            raise serializers.ValidationError({"date_to": "date_to must be on/after date_from"})
 
-        tenant_db = "default"
-        employee = None
-
-        if hasattr(user, "employer_profile") and user.employer_profile:
-            tenant_db = get_tenant_database_alias(user.employer_profile)
-            employee_id = attrs.get("employee_id") or self.initial_data.get("employee_id")
-            if not employee_id:
-                raise serializers.ValidationError({"employee_id": ["employee_id is required."]})
-            employee = Employee.objects.using(tenant_db).filter(id=employee_id).first()
-            if not employee:
-                raise serializers.ValidationError({"employee_id": ["Employee not found for this tenant."]})
-        elif hasattr(user, "employee_profile") and user.employee_profile:
-            employee = user.employee_profile
-            tenant_db = employee._state.db or tenant_db
+        group_raw = attrs.get("group_by")
+        if group_raw is None or group_raw == "":
+            attrs["group_by"] = []
         else:
-            raise serializers.ValidationError({"detail": "Unable to resolve tenant."})
+            parts = [p.strip() for p in str(group_raw).split(",") if p.strip()]
+            allowed = {"month", "employee", "department"}
+            invalid = [p for p in parts if p not in allowed]
+            if invalid:
+                raise serializers.ValidationError({"group_by": f"Invalid group(s): {', '.join(invalid)}"})
+            attrs["group_by"] = parts
 
-        if attrs.get("minutes") is None or attrs["minutes"] <= 0:
-            raise serializers.ValidationError({"minutes": ["Minutes must be greater than zero."]})
-
-        attrs["employee"] = employee
-        attrs["employer_id"] = employee.employer_id
-        attrs["created_by_id"] = user.id
-        attrs["tenant_db"] = tenant_db
+        measures_raw = attrs.get("measures")
+        allowed_measures = {
+            "worked": "worked",
+            "worked_minutes": "worked",
+            "worked_hours": "worked",
+            "expected": "expected",
+            "expected_minutes": "expected",
+            "expected_hours": "expected",
+            "difference": "difference",
+            "balance": "balance",
+            "overtime_balance": "balance",
+        }
+        if measures_raw is None:
+            attrs["measures"] = ["worked", "expected", "difference", "balance"]
+        else:
+            if isinstance(measures_raw, str):
+                measures_list = [m.strip() for m in measures_raw.split(",") if m.strip()]
+            else:
+                measures_list = measures_raw
+            normalized = []
+            invalid = []
+            for m in measures_list:
+                key = allowed_measures.get(str(m).strip())
+                if key:
+                    normalized.append(key)
+                else:
+                    invalid.append(m)
+            if invalid:
+                raise serializers.ValidationError({"measures": f"Invalid measure(s): {', '.join(invalid)}"})
+            attrs["measures"] = normalized or ["worked", "expected", "difference", "balance"]
         return attrs
 
-    def create(self, validated_data):
-        tenant_db = validated_data.pop("tenant_db")
-        return OvertimeRequest.objects.using(tenant_db).create(**validated_data)
+
+class WorkingScheduleDaySerializer(serializers.ModelSerializer):
+    class Meta:
+        model = WorkingScheduleDay
+        fields = [
+            "id",
+            "schedule",
+            "weekday",
+            "start_time",
+            "end_time",
+            "break_minutes",
+            "expected_minutes",
+            "created_at",
+            "updated_at",
+        ]
+        read_only_fields = ["id", "schedule", "expected_minutes", "created_at", "updated_at"]
+
+    def validate(self, attrs):
+        start = attrs.get("start_time") or getattr(self.instance, "start_time", None)
+        end = attrs.get("end_time") or getattr(self.instance, "end_time", None)
+        if start and end and end <= start:
+            raise serializers.ValidationError({"end_time": "end_time must be after start_time"})
+        return attrs
+
+
+class WorkingScheduleSerializer(serializers.ModelSerializer):
+    days = WorkingScheduleDaySerializer(many=True, read_only=True)
+
+    class Meta:
+        model = WorkingSchedule
+        fields = [
+            "id",
+            "employer_id",
+            "name",
+            "timezone",
+            "default_daily_minutes",
+            "is_default",
+            "days",
+            "created_at",
+            "updated_at",
+        ]
+        read_only_fields = ["id", "employer_id", "created_at", "updated_at", "days"]
