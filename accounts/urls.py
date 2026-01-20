@@ -6,7 +6,7 @@ from .views import (
     EmployerProfileView, CompleteEmployerProfileView, UserProfileView,
     ListEmployersView, EmployerStatusView, UserSignatureView,
     RequestPasswordResetView, VerifyResetCodeView, ResendResetCodeView,
-    ChangePasswordView
+    ChangePasswordView, MyEmployersView, SetActiveEmployerView
 )
 
 app_name = 'accounts'
@@ -40,5 +40,7 @@ urlpatterns = [
     path('profile/signature/', UserSignatureView.as_view(), name='user-signature'),
     path('employer/profile/', EmployerProfileView.as_view(), name='employer-profile'),
     path('employer/profile/complete/', CompleteEmployerProfileView.as_view(), name='complete-employer-profile'),
+    path('accounts/my-employers/', MyEmployersView.as_view(), name='my-employers'),
+    path('accounts/set-active-employer/', SetActiveEmployerView.as_view(), name='set-active-employer'),
 ]
 

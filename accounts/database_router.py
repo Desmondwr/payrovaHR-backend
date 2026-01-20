@@ -19,6 +19,7 @@ class TenantDatabaseRouter:
         'activationtoken',
         'employerprofile',
         'employeeregistry',  # Central employee registry for cross-institutional tracking
+        'employeemembership',
         'session',
         'contenttype',
         'permission',
@@ -132,14 +133,12 @@ class TenantDatabaseRouter:
         
         # Tenant databases skip auth and admin related migrations
         if db.startswith('tenant_'):
+            # Never apply accounts app migrations to tenant databases (accounts models live in default DB)
+            if app_label == 'accounts':
+                return False
             if app_label in ['auth', 'admin', 'sessions', 'contenttypes']:
                 # These tables should not be created in tenant databases
                 return False
-            
-            # Allow accounts app but only for tenant-specific models
-            if app_label == 'accounts':
-                if model_name and model_name.lower() in self.DEFAULT_DB_MODELS:
-                    return False
             
             # Allow all other app migrations
             return True

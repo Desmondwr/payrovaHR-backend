@@ -1159,35 +1159,58 @@ class EmployeeInvitationViewSet(viewsets.ReadOnlyModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST
             )
         
-        # Check if user already exists with this email
+        # Determine the user account to link
+        invitation_email = invitation_refresh.email
+        user = None
+
         if employee.user_id:
-            return Response(
-                {'error': 'This employee already has a user account'},
-                status=status.HTTP_400_BAD_REQUEST
-            )
-        
-        # Check if a user account exists with this email in main database
-        try:
-            user = User.objects.get(email=invitation_refresh.email)
-            user.is_employee = True
-            user.is_active = True
-            user.profile_completed = False
-            user.save(update_fields=['is_employee', 'is_active', 'profile_completed'])
-            # Link existing user to employee
-            employee.user_id = user.id
-            employee.save(using=tenant_db)
-        except User.DoesNotExist:
-            # Create new user account in main database
-            user = User.objects.create_user(
-                email=invitation_refresh.email,
-                password=password,
-                is_employee=True,
-                is_active=True
-            )
-            
-            # Link user to employee in tenant database
-            employee.user_id = user.id
-            employee.save(using=tenant_db)
+            # Reuse the existing linked user if the email matches the invitation
+            try:
+                user = User.objects.get(id=employee.user_id)
+                if user.email.lower() != invitation_email.lower():
+                    return Response(
+                        {'error': 'This employee is already linked to a different user account'},
+                        status=status.HTTP_400_BAD_REQUEST
+                    )
+            except User.DoesNotExist:
+                user = None
+        if not user:
+            # Check if a user account exists with this email in main database
+            try:
+                user = User.objects.get(email=invitation_email)
+            except User.DoesNotExist:
+                # Create new user account in main database
+                user = User.objects.create_user(
+                    email=invitation_email,
+                    password=password,
+                    is_employee=True,
+                    is_active=True
+                )
+            else:
+                # Ensure flags are correct for employees
+                user.is_employee = True
+                user.is_active = True
+                user.profile_completed = False
+                user.save(update_fields=['is_employee', 'is_active', 'profile_completed'])
+
+        # Link user to employee in tenant database
+        employee.user_id = user.id
+        employee.save(using=tenant_db)
+
+        # Ensure global membership is created/updated
+        from accounts.models import EmployeeMembership  # Local import to avoid missing reference
+        status_val = EmployeeMembership.STATUS_ACTIVE if employee.employment_status == 'ACTIVE' else EmployeeMembership.STATUS_INVITED
+        EmployeeMembership.objects.update_or_create(
+            user_id=employee.user_id,
+            employer_profile=employer_profile,
+            defaults={
+                'status': status_val,
+                'tenant_employee_id': employee.id,
+            },
+        )
+        User.objects.filter(id=employee.user_id, last_active_employer_id__isnull=True).update(
+            last_active_employer_id=employer_profile.id
+        )
         
         # Update invitation status in tenant database
         invitation_refresh.status = 'ACCEPTED'

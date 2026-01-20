@@ -301,3 +301,79 @@ def ensure_tenant_database_loaded(employer_profile):
         logger.info(f"Dynamically loaded tenant database: {alias} ({employer_profile.database_name})")
     
     return alias
+
+
+def get_employee_tenant_db_from_membership(request, require_context=None):
+    """
+    Resolve tenant database alias for an authenticated employee based on membership.
+    
+    Priority:
+    1) Explicit employer context via header X-Employer-Id (preferred) or ?employer_id= query param
+    2) last_active_employer_id stored on the user (if present)
+    3) Legacy fallback to request.user.employee_profile when feature flag is disabled
+    """
+    from accounts.models import EmployeeMembership, EmployerProfile  # Imported locally to avoid circular imports
+    from rest_framework.exceptions import PermissionDenied, ParseError
+
+    user = getattr(request, 'user', None)
+    if not user or not user.is_authenticated:
+        raise PermissionDenied("Authentication required.")
+
+    require_context = (
+        require_context
+        if require_context is not None
+        else getattr(settings, 'REQUIRE_EMPLOYER_CONTEXT_FOR_EMPLOYEE_ENDPOINTS', False)
+    )
+
+    employer_id = None
+    header_value = request.headers.get('X-Employer-Id') if hasattr(request, 'headers') else None
+    query_params = getattr(request, 'query_params', None) or getattr(request, 'GET', {})
+    query_value = query_params.get('employer_id') if query_params is not None else None
+
+    raw_employer_id = header_value or query_value
+    if raw_employer_id:
+        try:
+            employer_id = int(raw_employer_id)
+        except (TypeError, ValueError):
+            raise ParseError("Invalid employer id provided.")
+
+    membership = None
+    employer_profile = None
+
+    if employer_id is not None:
+        membership = EmployeeMembership.objects.filter(
+            user_id=user.id,
+            employer_profile_id=employer_id,
+        ).select_related('employer_profile').first()
+        if not membership:
+            raise PermissionDenied("You do not have access to the requested employer.")
+        if membership.status != EmployeeMembership.STATUS_ACTIVE:
+            raise PermissionDenied("Your membership with this employer is not active.")
+        employer_profile = membership.employer_profile
+    else:
+        # Allow implicit resolution only when the feature flag is disabled
+        if require_context:
+            raise ParseError("Employer context is required for this operation.")
+
+        # Prefer the last_active_employer_id marker if we have it
+        if getattr(user, 'last_active_employer_id', None):
+            membership = EmployeeMembership.objects.filter(
+                user_id=user.id,
+                employer_profile_id=user.last_active_employer_id,
+                status=EmployeeMembership.STATUS_ACTIVE,
+            ).select_related('employer_profile').first()
+            if membership:
+                employer_profile = membership.employer_profile
+
+        # Legacy fallback to old single-employer resolution
+        if not employer_profile:
+            employee = getattr(user, 'employee_profile', None)
+            if employee and getattr(employee, 'employer_id', None):
+                employer_profile = EmployerProfile.objects.filter(id=employee.employer_id).first()
+
+    if not employer_profile:
+        return None
+
+    alias = get_tenant_database_alias(employer_profile)
+    ensure_tenant_database_loaded(employer_profile)
+    return alias

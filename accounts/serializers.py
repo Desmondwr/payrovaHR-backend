@@ -3,7 +3,7 @@ from django.contrib.auth import authenticate
 from django.contrib.auth.password_validation import validate_password
 from django.utils import timezone
 
-from .models import User, ActivationToken, EmployerProfile, EmployeeRegistry
+from .models import User, ActivationToken, EmployerProfile, EmployeeRegistry, EmployeeMembership
 
 
 
@@ -53,8 +53,11 @@ class UserSerializer(serializers.ModelSerializer):
     
     class Meta:
         model = User
-        fields = ('id', 'email', 'first_name', 'last_name', 'is_admin', 'is_employer', 
-                  'profile_completed', 'two_factor_enabled', 'created_at')
+        fields = (
+            'id', 'email', 'first_name', 'last_name', 'is_admin', 'is_employer',
+            'is_employee', 'profile_completed', 'two_factor_enabled',
+            'last_active_employer_id', 'created_at'
+        )
         read_only_fields = ('id', 'created_at')
 
 
@@ -355,3 +358,39 @@ class SignatureUploadSerializer(serializers.Serializer):
         if not attrs.get('signature') and not attrs.get('signature_data_url'):
             raise serializers.ValidationError("Provide a signature file or signature_data_url.")
         return attrs
+
+
+class EmployeeMembershipSerializer(serializers.ModelSerializer):
+    """Lightweight serializer for user->employer memberships"""
+
+    employer_id = serializers.IntegerField(source='employer_profile.id', read_only=True)
+    employer_name = serializers.CharField(source='employer_profile.company_name', read_only=True)
+
+    class Meta:
+        model = EmployeeMembership
+        fields = ('employer_id', 'employer_name', 'role', 'status')
+        read_only_fields = fields
+
+
+class SetActiveEmployerSerializer(serializers.Serializer):
+    """Serializer to validate and store the user's active employer context"""
+
+    employer_id = serializers.IntegerField()
+
+    def validate_employer_id(self, value):
+        user = self.context['request'].user
+        membership = EmployeeMembership.objects.filter(
+            user=user,
+            employer_profile_id=value,
+            status=EmployeeMembership.STATUS_ACTIVE,
+        ).exists()
+        if not membership:
+            raise serializers.ValidationError("Active membership not found for this employer.")
+        return value
+
+    def save(self, **kwargs):
+        user = self.context['request'].user
+        employer_id = self.validated_data['employer_id']
+        user.last_active_employer_id = employer_id
+        user.save(update_fields=['last_active_employer_id'])
+        return user

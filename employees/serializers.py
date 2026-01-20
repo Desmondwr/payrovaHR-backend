@@ -5,7 +5,7 @@ from .models import (
     EmployeeCrossInstitutionRecord, EmployeeAuditLog, EmployeeInvitation,
     EmployeeConfiguration, TerminationApproval, CrossInstitutionConsent
 )
-from accounts.models import EmployerProfile
+from accounts.models import EmployerProfile, EmployeeMembership
 
 User = get_user_model()
 
@@ -535,12 +535,41 @@ class CreateEmployeeSerializer(serializers.ModelSerializer):
                 # No registry exists, profile needs completion
                 validated_data['profile_completion_required'] = True
                 validated_data['profile_completion_state'] = 'INCOMPLETE_BLOCKING'
+        else:
+            # Only auto-create/link a user when we are not sending an invitation
+            if not send_invitation:
+                email = validated_data.get('email')
+                if email:
+                    user, _ = User.objects.get_or_create(
+                        email=email,
+                        defaults={
+                            'is_employee': True,
+                            'is_active': True,
+                        },
+                    )
+                    validated_data['user_id'] = user.id
         
         # Create employee in tenant database
         employee = Employee.objects.using(tenant_db).create(**validated_data)
         if pin_code:
             employee.set_pin_code(pin_code)
             employee.save(using=tenant_db, update_fields=["pin_code_hash"])
+
+        # Create or refresh global membership mapping when a user is linked
+        if employee.user_id:
+            status_val = EmployeeMembership.STATUS_ACTIVE if employee.employment_status == 'ACTIVE' else EmployeeMembership.STATUS_INVITED
+            EmployeeMembership.objects.update_or_create(
+                user_id=employee.user_id,
+                employer_profile=request.user.employer_profile,
+                defaults={
+                    'status': status_val,
+                    'tenant_employee_id': employee.id,
+                },
+            )
+            # Seed last_active_employer_id once for convenience
+            User.objects.filter(id=employee.user_id, last_active_employer_id__isnull=True).update(
+                last_active_employer_id=request.user.employer_profile.id
+            )
         
         # Store invitation flag and tenant_db for view to handle
         employee._send_invitation = send_invitation
@@ -881,6 +910,8 @@ class CreateEmployeeWithDetectionSerializer(serializers.ModelSerializer):
         help_text='Force create even if duplicates detected (with warn action)')
     link_existing_user = serializers.IntegerField(required=False, allow_null=True, write_only=True,
         help_text='ID of existing user account to link (from main database)')
+    user_id = serializers.IntegerField(required=False, allow_null=True, write_only=True,
+        help_text='Explicit user account ID to link (from main database)')
     acknowledge_cross_institution = serializers.BooleanField(default=False, write_only=True,
         help_text='Acknowledge concurrent employment in other institutions')
     
@@ -931,7 +962,7 @@ class CreateEmployeeWithDetectionSerializer(serializers.ModelSerializer):
             'emergency_contact_phone',
             
             # Additional
-            'send_invitation', 'force_create', 'link_existing_user',
+            'send_invitation', 'force_create', 'link_existing_user', 'user_id',
             'acknowledge_cross_institution'
         ]
         extra_kwargs = {
@@ -973,6 +1004,7 @@ class CreateEmployeeWithDetectionSerializer(serializers.ModelSerializer):
             'job_title': {'required': True},
             'employment_type': {'required': True},
             'hire_date': {'required': True},
+            'user_id': {'required': False},
         }
 
     
@@ -1147,6 +1179,7 @@ class CreateEmployeeWithDetectionSerializer(serializers.ModelSerializer):
         send_invitation = validated_data.pop('send_invitation', False)
         force_create = validated_data.pop('force_create', False)
         link_existing_user = validated_data.pop('link_existing_user', None)
+        explicit_user_id = validated_data.pop('user_id', None)
         acknowledge_cross_institution = validated_data.pop('acknowledge_cross_institution', False)
         duplicate_info = validated_data.pop('_duplicate_info', None)
         
@@ -1200,12 +1233,25 @@ class CreateEmployeeWithDetectionSerializer(serializers.ModelSerializer):
         validated_data['created_by_id'] = request.user.id
         
         # Link existing user if provided (user is in main DB)
-        if link_existing_user:
+        chosen_user_id = explicit_user_id or link_existing_user
+        if chosen_user_id:
             try:
-                user = User.objects.get(id=link_existing_user)
+                user = User.objects.get(id=chosen_user_id)
                 validated_data['user_id'] = user.id
             except User.DoesNotExist:
                 pass
+        elif not validated_data.get('user_id') and not send_invitation:
+            # Auto-create/link by email only when not sending invitation
+            email = validated_data.get('email')
+            if email:
+                user, _ = User.objects.get_or_create(
+                    email=email,
+                    defaults={
+                        'is_employee': True,
+                        'is_active': True,
+                    },
+                )
+                validated_data['user_id'] = user.id
         
         # Mark as concurrent employment if cross-institution matches found
         if duplicate_info and duplicate_info.get('cross_institution_matches'):
@@ -1254,6 +1300,20 @@ class CreateEmployeeWithDetectionSerializer(serializers.ModelSerializer):
                 import logging
                 logger = logging.getLogger(__name__)
                 logger.error(f"Failed to sync EmployeeRegistry for employee {employee.id}: {str(e)}")
+
+            # Create or refresh global membership mapping
+            status_val = EmployeeMembership.STATUS_ACTIVE if employee.employment_status == 'ACTIVE' else EmployeeMembership.STATUS_INVITED
+            EmployeeMembership.objects.update_or_create(
+                user_id=employee.user_id,
+                employer_profile=employer,
+                defaults={
+                    'status': status_val,
+                    'tenant_employee_id': employee.id,
+                },
+            )
+            User.objects.filter(id=employee.user_id, last_active_employer_id__isnull=True).update(
+                last_active_employer_id=employer.id
+            )
         
         # Create audit log in tenant database
         create_employee_audit_log(
@@ -1268,13 +1328,31 @@ class CreateEmployeeWithDetectionSerializer(serializers.ModelSerializer):
         # Handle cross-institution records if detected
         if duplicate_info and duplicate_info.get('cross_institution_matches'):
             for match in duplicate_info['cross_institution_matches']:
+                employer_id = match.get('employer_id')
+                data = match.get('data')
+                detected_employee_id = None
+                status_val = 'PENDING'
+
+                if isinstance(data, dict):
+                    detected_employee_id = data.get('id') or data.get('employee_id')
+                    status_val = data.get('employment_status', status_val)
+                else:
+                    detected_employee_id = getattr(data, 'id', None) or getattr(data, 'employee_id', None)
+                    status_val = getattr(data, 'employment_status', status_val)
+
+                match_key = None
+                if isinstance(data, dict):
+                    match_key = data.get('id') or data.get('employee_id')
+                else:
+                    match_key = getattr(data, 'id', None) or getattr(data, 'pk', None)
+
                 EmployeeCrossInstitutionRecord.objects.using(tenant_db).create(
                     employee=employee,
-                    detected_employer_id=match.employer_id,
-                    detected_employee_id=match.employee_id,
-                    status=match.employment_status,
+                    detected_employer_id=employer_id,
+                    detected_employee_id=str(detected_employee_id) if detected_employee_id is not None else '',
+                    status=status_val or 'PENDING',
                     consent_status='PENDING' if config and config.require_employee_consent_cross_institution else 'NOT_REQUIRED',
-                    notes=f"Detected during employee creation. Match reasons: {', '.join(duplicate_info['match_reasons'].get(str(match.id), []))}"
+                    notes=f"Detected during employee creation. Match reasons: {', '.join(duplicate_info['match_reasons'].get(str(match_key), []))}"
                 )
         
         # Store flags for view to handle

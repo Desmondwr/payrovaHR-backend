@@ -7,12 +7,13 @@ from django.contrib.auth import get_user_model
 from django_ratelimit.decorators import ratelimit
 from django.utils.decorators import method_decorator
 from django.core.files.base import ContentFile
-from .models import ActivationToken, EmployerProfile, EmployeeRegistry
+from .models import ActivationToken, EmployerProfile, EmployeeRegistry, EmployeeMembership
 from .serializers import (
     UserSerializer, CreateEmployerSerializer, ActivateAccountSerializer,
     LoginSerializer, EmployerProfileSerializer, Enable2FASerializer,
     Disable2FASerializer, EmployeeRegistrySerializer,
-    EmployerListSerializer, SignatureUploadSerializer
+    EmployerListSerializer, SignatureUploadSerializer, EmployeeMembershipSerializer,
+    SetActiveEmployerSerializer
 )
 from .utils import (
     api_response, send_activation_email, generate_totp_secret,
@@ -716,4 +717,53 @@ class UserSignatureView(APIView):
             message='Signature saved successfully.',
             data={'signature_url': signature_url},
             status=status.HTTP_201_CREATED
+        )
+
+
+class MyEmployersView(APIView):
+    """List employers the authenticated user is actively linked to."""
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request):
+        memberships = EmployeeMembership.objects.filter(
+            user=request.user,
+            status=EmployeeMembership.STATUS_ACTIVE,
+        ).select_related('employer_profile')
+        serializer = EmployeeMembershipSerializer(memberships, many=True)
+        return api_response(
+            success=True,
+            message='Active employer memberships retrieved.',
+            data=serializer.data,
+            status=status.HTTP_200_OK,
+        )
+
+
+class SetActiveEmployerView(APIView):
+    """Persist the active employer context for the authenticated user."""
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request):
+        serializer = SetActiveEmployerSerializer(data=request.data, context={'request': request})
+        if serializer.is_valid():
+            user = serializer.save()
+            membership = EmployeeMembership.objects.filter(
+                user=user,
+                employer_profile_id=user.last_active_employer_id,
+            ).select_related('employer_profile').first()
+            employer_name = membership.employer_profile.company_name if membership else None
+            return api_response(
+                success=True,
+                message='Active employer updated.',
+                data={
+                    'last_active_employer_id': user.last_active_employer_id,
+                    'employer_name': employer_name,
+                },
+                status=status.HTTP_200_OK,
+            )
+
+        return api_response(
+            success=False,
+            message='Failed to update active employer.',
+            errors=serializer.errors,
+            status=status.HTTP_400_BAD_REQUEST,
         )

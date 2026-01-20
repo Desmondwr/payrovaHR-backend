@@ -44,6 +44,12 @@ class User(AbstractUser):
     profile_completed = models.BooleanField(default=False, help_text='Designates whether the user has completed their profile')
     two_factor_enabled = models.BooleanField(default=False, help_text='Designates whether 2FA is enabled')
     two_factor_secret = models.CharField(max_length=32, blank=True, null=True, help_text='TOTP secret for 2FA')
+    last_active_employer_id = models.IntegerField(
+        null=True,
+        blank=True,
+        db_index=True,
+        help_text='EmployerProfile ID most recently used by the user'
+    )
     signature = models.ImageField(upload_to='user_signatures/', blank=True, null=True, help_text='Stored user signature image')
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
@@ -73,14 +79,40 @@ class User(AbstractUser):
         
         # Search for employee record in tenant databases
         from employees.models import Employee
-        from accounts.database_utils import get_tenant_database_alias
+        from accounts.database_utils import (
+            get_tenant_database_alias,
+            ensure_tenant_database_loaded,
+        )
         
         try:
+            # Prefer the last active employer when available
+            if self.last_active_employer_id:
+                membership = EmployeeMembership.objects.filter(
+                    user_id=self.id,
+                    employer_profile_id=self.last_active_employer_id,
+                    status=EmployeeMembership.STATUS_ACTIVE,
+                ).select_related('employer_profile').first()
+                if membership and membership.employer_profile:
+                    employer = membership.employer_profile
+                    tenant_db = get_tenant_database_alias(employer)
+                    ensure_tenant_database_loaded(employer)
+                    try:
+                        employee = Employee.objects.using(tenant_db).get(
+                            id=membership.tenant_employee_id
+                        ) if membership.tenant_employee_id else Employee.objects.using(tenant_db).get(
+                            user_id=self.id
+                        )
+                        self._employee_profile_cache = employee
+                        return employee
+                    except Employee.DoesNotExist:
+                        pass
+
             # Get all active employers
             employers = EmployerProfile.objects.filter(user__is_active=True).select_related('user')
             
             for employer in employers:
                 tenant_db = get_tenant_database_alias(employer)
+                ensure_tenant_database_loaded(employer)
                 try:
                     employee = Employee.objects.using(tenant_db).get(user_id=self.id)
                     # Cache it
@@ -186,6 +218,67 @@ class EmployerProfile(models.Model):
     def get_database_alias(self):
         """Get the database alias for this employer's tenant database"""
         return f"tenant_{self.id}" if self.database_name else 'default'
+
+
+class EmployeeMembership(models.Model):
+    """Global mapping between a user and an employer tenant"""
+
+    STATUS_INVITED = 'INVITED'
+    STATUS_ACTIVE = 'ACTIVE'
+    STATUS_TERMINATED = 'TERMINATED'
+
+    STATUS_CHOICES = [
+        (STATUS_INVITED, 'Invited'),
+        (STATUS_ACTIVE, 'Active'),
+        (STATUS_TERMINATED, 'Terminated'),
+    ]
+
+    ROLE_EMPLOYEE = 'EMPLOYEE'
+    ROLE_MANAGER = 'MANAGER'
+    ROLE_HR = 'HR'
+    ROLE_ADMIN = 'ADMIN'
+
+    ROLE_CHOICES = [
+        (ROLE_EMPLOYEE, 'Employee'),
+        (ROLE_MANAGER, 'Manager'),
+        (ROLE_HR, 'HR'),
+        (ROLE_ADMIN, 'Admin'),
+    ]
+
+    user = models.ForeignKey(
+        User,
+        on_delete=models.CASCADE,
+        related_name='memberships'
+    )
+    employer_profile = models.ForeignKey(
+        EmployerProfile,
+        on_delete=models.CASCADE,
+        related_name='employee_memberships'
+    )
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default=STATUS_INVITED)
+    role = models.CharField(max_length=30, choices=ROLE_CHOICES, blank=True, null=True, help_text='Optional role label')
+    permissions = models.JSONField(blank=True, null=True, help_text='Optional per-employer permissions')
+    tenant_employee_id = models.CharField(
+        max_length=64,
+        null=True,
+        blank=True,
+        help_text='Employee PK inside the employer tenant database (supports UUIDs)',
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = 'employee_memberships'
+        verbose_name = 'Employee Membership'
+        verbose_name_plural = 'Employee Memberships'
+        unique_together = ('user', 'employer_profile')
+        indexes = [
+            models.Index(fields=['user', 'status']),
+            models.Index(fields=['employer_profile', 'status']),
+        ]
+
+    def __str__(self):
+        return f"{self.user.email} -> {self.employer_profile.company_name} ({self.status})"
 
 
 class EmployeeRegistry(models.Model):
