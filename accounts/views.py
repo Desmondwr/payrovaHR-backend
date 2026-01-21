@@ -7,6 +7,8 @@ from django.contrib.auth import get_user_model
 from django_ratelimit.decorators import ratelimit
 from django.utils.decorators import method_decorator
 from django.core.files.base import ContentFile
+from django.utils import timezone
+from accounts.notifications import create_notification
 from .models import ActivationToken, EmployerProfile, EmployeeRegistry, EmployeeMembership
 from .serializers import (
     UserSerializer, CreateEmployerSerializer, ActivateAccountSerializer,
@@ -280,6 +282,13 @@ class Verify2FAView(APIView):
             user = request.user
             user.two_factor_enabled = True
             user.save()
+            create_notification(
+                user=user,
+                title='2FA enabled',
+                body='Two-factor authentication has been enabled on your account.',
+                type='ALERT',
+                data={'event': '2fa_enabled'},
+            )
             
             return api_response(
                 success=True,
@@ -309,6 +318,13 @@ class Disable2FAView(APIView):
             user.two_factor_enabled = False
             user.two_factor_secret = None
             user.save()
+            create_notification(
+                user=user,
+                title='2FA disabled',
+                body='Two-factor authentication has been disabled on your account.',
+                type='ALERT',
+                data={'event': '2fa_disabled'},
+            )
             
             return api_response(
                 success=True,
@@ -626,6 +642,13 @@ class ChangePasswordView(APIView):
         
         # Save new password
         serializer.save()
+        create_notification(
+            user=request.user,
+            title='Password changed',
+            body='Your account password was changed.',
+            type='ALERT',
+            data={'event': 'password_changed'},
+        )
         
         return api_response(
             success=True,

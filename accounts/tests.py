@@ -111,3 +111,4 @@ class EmployeeMembershipSignalTests(TestCase):
         self.assertIsNotNone(membership)
         self.assertEqual(membership.tenant_employee_id, emp.id)
         self.assertEqual(membership.status, EmployeeMembership.STATUS_ACTIVE)
+

@@ -360,6 +360,8 @@ class SignatureUploadSerializer(serializers.Serializer):
         return attrs
 
 
+
+
 class EmployeeMembershipSerializer(serializers.ModelSerializer):
     """Lightweight serializer for user->employer memberships"""
 

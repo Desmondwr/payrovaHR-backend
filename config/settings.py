@@ -54,6 +54,7 @@ INSTALLED_APPS = [
     'timeoff',
     'frontdesk',
     'attendance',
+    'notifications',
 ]
 
 MIDDLEWARE = [

@@ -4,8 +4,11 @@ from rest_framework.decorators import action
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
+from accounts.notifications import create_notification
+from accounts.models import EmployerProfile
 from accounts.database_utils import get_tenant_database_alias
 from accounts.permissions import IsAuthenticated, IsEmployer
+from django.contrib.auth import get_user_model
 from .models import FrontdeskStation, StationResponsible, Visitor, Visit
 from .serializers import (
     FrontdeskStationSerializer,
@@ -16,6 +19,8 @@ from .serializers import (
     KioskStationSerializer,
     KioskHostSerializer,
 )
+
+User = get_user_model()
 from employees.models import Employee
 
 
@@ -127,6 +132,17 @@ class VisitViewSet(viewsets.ModelViewSet):
         kiosk_reference = request.data.get("kiosk_reference")
         visit.check_in(method=method, kiosk_reference=kiosk_reference)
         serializer = self.get_serializer(visit)
+        if visit.host and visit.host.user_id:
+            employer_profile = EmployerProfile.objects.filter(id=visit.employer_id).first()
+            target_user = User.objects.filter(id=visit.host.user_id).first()
+            create_notification(
+                user=target_user,
+                title="Visitor arrived",
+                body=f"{visit.visitor.full_name} has checked in.",
+                type="ACTION",
+                employer_profile=employer_profile,
+                data={"visit_id": str(visit.id), "visitor": visit.visitor.full_name},
+            )
         return Response(serializer.data, status=status.HTTP_200_OK)
 
     @action(detail=True, methods=["post"])

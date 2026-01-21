@@ -7,7 +7,12 @@ from rest_framework.response import Response
 
 from accounts.database_utils import get_tenant_database_alias
 from accounts.permissions import IsEmployer
+from accounts.notifications import create_notification
+from accounts.models import EmployerProfile
 from employees.models import Employee
+from django.contrib.auth import get_user_model
+
+User = get_user_model()
 
 from .models import (
     TimeOffAccrualSubscription,
@@ -185,6 +190,30 @@ class TimeOffRequestViewSet(viewsets.ModelViewSet):
         context["tenant_db"] = tenant_db
         return context
 
+    def perform_create(self, serializer):
+        req_obj = serializer.save()
+        employer_profile = EmployerProfile.objects.filter(id=req_obj.employer_id).first()
+        employee = req_obj.employee
+        if employee and employee.user_id:
+            target_user = User.objects.filter(id=employee.user_id).first()
+            create_notification(
+                user=target_user,
+                title="Time-off request submitted",
+                body=f"{employee.full_name} submitted a time-off request.",
+                type="ACTION",
+                employer_profile=employer_profile,
+                data={"request_id": str(req_obj.id), "status": req_obj.status},
+            )
+        if hasattr(self.request.user, "employer_profile"):
+            create_notification(
+                user=self.request.user,
+                title="New time-off request",
+                body=f"Time-off request created for {employee.full_name if employee else 'employee'}.",
+                type="ACTION",
+                employer_profile=employer_profile,
+                data={"request_id": str(req_obj.id), "status": req_obj.status},
+            )
+
     def get_queryset(self):
         user = self.request.user
         params = self.request.query_params
@@ -284,6 +313,18 @@ class TimeOffRequestViewSet(viewsets.ModelViewSet):
             effective_date=req_obj.start_at.date(),
         )
         serializer = TimeOffRequestSerializer(req_obj, context=self.get_serializer_context())
+        employer_profile = EmployerProfile.objects.filter(id=req_obj.employer_id).first()
+        employee = req_obj.employee
+        if employee and employee.user_id:
+            target_user = User.objects.filter(id=employee.user_id).first()
+            create_notification(
+                user=target_user,
+                title="Time-off request approved",
+                body="Your time-off request was approved.",
+                type="INFO",
+                employer_profile=employer_profile,
+                data={"request_id": str(req_obj.id), "status": req_obj.status},
+            )
         return Response(serializer.data)
 
     @action(detail=True, methods=["post"], url_path="reject")
@@ -302,6 +343,18 @@ class TimeOffRequestViewSet(viewsets.ModelViewSet):
             cancelled=False,
         )
         serializer = TimeOffRequestSerializer(req_obj, context=self.get_serializer_context())
+        employer_profile = EmployerProfile.objects.filter(id=req_obj.employer_id).first()
+        employee = req_obj.employee
+        if employee and employee.user_id:
+            target_user = User.objects.filter(id=employee.user_id).first()
+            create_notification(
+                user=target_user,
+                title="Time-off request rejected",
+                body="Your time-off request was rejected.",
+                type="ALERT",
+                employer_profile=employer_profile,
+                data={"request_id": str(req_obj.id), "status": req_obj.status},
+            )
         return Response(serializer.data)
 
     @action(detail=True, methods=["post"], url_path="cancel")

@@ -7,9 +7,13 @@ from rest_framework.decorators import action
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
+from accounts.notifications import create_notification
+from accounts.models import EmployerProfile
+from django.contrib.auth import get_user_model
 from accounts.database_utils import get_tenant_database_alias
 from accounts.permissions import IsAuthenticated, IsEmployer
 from employees.models import Employee
+User = get_user_model()
 
 from .models import (
     AttendanceAllowedWifi,
@@ -62,6 +66,53 @@ def _employee_from_request(request, tenant_db=None) -> Employee:
         db_alias = tenant_db or get_tenant_database_alias(employer)
         return Employee.objects.using(db_alias).filter(id=employee_id, employer_id=employer.id).first()
     return None
+
+
+def _send_attendance_notifications(
+    employee_user,
+    employer_user,
+    employee: Employee,
+    employer_profile: EmployerProfile,
+    record,
+    action: str,
+    mode: str,
+):
+    """Create employee and employer alerts for attendance events."""
+
+    if action not in ("check_in", "check_out"):
+        return
+
+    company_name = (getattr(employer_profile, "company_name", None) or "your company").strip()
+    employee_name = getattr(employee, "full_name", "").strip() or f"{employee.first_name} {employee.last_name}".strip()
+    action_title = "Checked in" if action == "check_in" else "Checked out"
+    preposition = "to" if action == "check_in" else "from"
+    employee_body = f"You {action_title.lower()} {preposition} {company_name}."
+    employer_body = f"{employee_name} {action_title.lower()} {preposition} {company_name}."
+    payload = {
+        "attendance_id": str(record.id),
+        "mode": mode,
+        "action": action,
+    }
+
+    if employee_user:
+        create_notification(
+            user=employee_user,
+            title=action_title,
+            body=employee_body,
+            type="INFO",
+            employer_profile=employer_profile,
+            data=payload,
+        )
+
+    if employer_user:
+        create_notification(
+            user=employer_user,
+            title=f"{employee_name} {action_title.lower()}",
+            body=employer_body,
+            type="ACTION",
+            employer_profile=employer_profile,
+            data=payload,
+        )
 
 
 class AttendanceConfigurationViewSet(viewsets.ModelViewSet):
@@ -405,6 +456,18 @@ class PortalCheckInView(APIView):
             mode=AttendanceRecord.MODE_PORTAL,
             created_by=request.user.id,
         )
+        employer_profile = EmployerProfile.objects.filter(id=employee.employer_id).first()
+        employee_user = User.objects.filter(id=employee.user_id).first() if employee.user_id else None
+        employer_user = getattr(employer_profile, "user", None)
+        _send_attendance_notifications(
+            employee_user=employee_user,
+            employer_user=employer_user,
+            employee=employee,
+            employer_profile=employer_profile,
+            record=record,
+            action="check_in",
+            mode=AttendanceRecord.MODE_PORTAL,
+        )
         output = AttendanceRecordSerializer(record)
         return Response(output.data, status=status.HTTP_201_CREATED)
 
@@ -429,6 +492,18 @@ class PortalCheckOutView(APIView):
             payload=payload,
             config=config,
             db_alias=tenant_db,
+            mode=AttendanceRecord.MODE_PORTAL,
+        )
+        employer_profile = EmployerProfile.objects.filter(id=employee.employer_id).first()
+        employee_user = User.objects.filter(id=employee.user_id).first() if employee.user_id else None
+        employer_user = getattr(employer_profile, "user", None)
+        _send_attendance_notifications(
+            employee_user=employee_user,
+            employer_user=employer_user,
+            employee=employee,
+            employer_profile=employer_profile,
+            record=record,
+            action="check_out",
             mode=AttendanceRecord.MODE_PORTAL,
         )
         output = AttendanceRecordSerializer(record)
@@ -485,6 +560,7 @@ class KioskCheckView(APIView):
             .order_by("-check_in_at")
             .first()
         )
+        action = "check_out" if existing else "check_in"
         if existing:
             record = perform_check_out(
                 employee=employee,
@@ -504,6 +580,18 @@ class KioskCheckView(APIView):
         record.kiosk_session_reference = kiosk_token
         record.kiosk_station = station
         record.save(using=tenant_db, update_fields=["kiosk_session_reference", "kiosk_station", "updated_at"])
+        employer_profile = EmployerProfile.objects.filter(id=employee.employer_id).first()
+        employee_user = User.objects.filter(id=employee.user_id).first() if employee.user_id else None
+        employer_user = getattr(employer_profile, "user", None)
+        _send_attendance_notifications(
+            employee_user=employee_user,
+            employer_user=employer_user,
+            employee=employee,
+            employer_profile=employer_profile,
+            record=record,
+            action=action,
+            mode="KIOSK",
+        )
         output = AttendanceRecordSerializer(record)
         return Response(output.data, status=status.HTTP_200_OK)
 

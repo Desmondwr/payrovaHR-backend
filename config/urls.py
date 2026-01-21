@@ -27,6 +27,7 @@ urlpatterns = [
     path('api/timeoff/', include('timeoff.urls')),
     path('api/frontdesk/', include('frontdesk.urls')),
     path('api/attendance/', include('attendance.urls')),
+    path('api/notifications/', include('notifications.urls')),
 ]
 
 # Serve media files in development
