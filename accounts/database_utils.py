@@ -165,6 +165,7 @@ def run_migrations_on_tenant_database(db_name, employer_id):
         call_command('migrate', 'timeoff', database=alias, verbosity=2)
         call_command('migrate', 'frontdesk', database=alias, verbosity=2)
         call_command('migrate', 'attendance', database=alias, verbosity=2)
+        call_command('migrate', 'treasury', database=alias, verbosity=2)
         
         logger.info(f"Successfully ran migrations on database: {db_name}")
         return True

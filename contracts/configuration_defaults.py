@@ -56,11 +56,6 @@ _DEFAULT_FLEET_CONFIGURATION = {
     "transport_allowance_eligible": False,
 }
 
-_DEFAULT_TREASURY_CONFIGURATION = {
-    "salary_payment_priority": None,
-    "preferred_payment_channel": None,
-}
-
 _DEFAULT_SIGNATURE_CONFIGURATION = {
     "contract_template_id": None,
     "signed_document_id": None,
@@ -101,10 +96,6 @@ def merge_fleet_configuration(value: Optional[Dict[str, Any]]) -> Dict[str, Any]
     return _merge_section(_DEFAULT_FLEET_CONFIGURATION, value)
 
 
-def merge_treasury_configuration(value: Optional[Dict[str, Any]]) -> Dict[str, Any]:
-    return _merge_section(_DEFAULT_TREASURY_CONFIGURATION, value)
-
-
 def merge_signature_configuration(value: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     return _merge_section(_DEFAULT_SIGNATURE_CONFIGURATION, value)
 
@@ -119,7 +110,6 @@ CONFIGURATION_MERGE_FUNCTIONS = {
     "payroll_configuration": merge_payroll_configuration,
     "expense_configuration": merge_expense_configuration,
     "fleet_configuration": merge_fleet_configuration,
-    "treasury_configuration": merge_treasury_configuration,
     "signature_configuration": merge_signature_configuration,
     "governance_configuration": merge_governance_configuration,
 }

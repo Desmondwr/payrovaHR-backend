@@ -103,11 +103,11 @@ class TenantDatabaseRouter:
         
         # Both models are from the same tenant app (e.g., employees app, contracts app)
         # Allow relations within the same app (like Employee -> Employee for manager)
-        if app1 == app2 and app1 in ['employees', 'contracts', 'frontdesk', 'timeoff', 'attendance']:
+        if app1 == app2 and app1 in ['employees', 'contracts', 'frontdesk', 'timeoff', 'attendance', 'treasury']:
             return True
         
         # Allow relations between tenant apps (e.g., Contract -> Employee)
-        if app1 in ['employees', 'contracts', 'frontdesk', 'timeoff', 'attendance'] and app2 in ['employees', 'contracts', 'frontdesk', 'timeoff', 'attendance']:
+        if app1 in ['employees', 'contracts', 'frontdesk', 'timeoff', 'attendance', 'treasury'] and app2 in ['employees', 'contracts', 'frontdesk', 'timeoff', 'attendance', 'treasury']:
             return True
         
         # If both databases are explicitly set, they must match
@@ -130,6 +130,8 @@ class TenantDatabaseRouter:
         """
         # Default database gets everything
         if db == 'default':
+            if app_label == 'treasury' and (model_name or '').lower() == 'treasuryconfiguration':
+                return False
             return True
         
         # Tenant databases skip auth and admin related migrations
@@ -137,7 +139,7 @@ class TenantDatabaseRouter:
             # Never apply accounts app migrations to tenant databases (accounts models live in default DB)
             if app_label == 'accounts':
                 return False
-            if app_label in ['auth', 'admin', 'sessions', 'contenttypes']:
+            if app_label in ['auth', 'admin', 'sessions', 'contenttypes', 'notifications']:
                 # These tables should not be created in tenant databases
                 return False
             

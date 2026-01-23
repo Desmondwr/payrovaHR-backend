@@ -87,7 +87,6 @@ Note: job-specific metadata (e.g., `job_position`) is now captured via `recruitm
 | `payroll_configuration` | `JSONField` | Payroll inputs (tax profile, CNPS, probation, proration). |
 | `expense_configuration` | `JSONField` | Expense routing (policy, cost center, reimbursement). |
 | `fleet_configuration` | `JSONField` | Fleet entitlements (vehicle, transport allowance). |
-| `treasury_configuration` | `JSONField` | Treasury preferences (payment priority/channel). |
 | `signature_configuration` | `JSONField` | Document & signature defaults (template, method, hash). |
 | `governance_configuration` | `JSONField` | Governance/audit defaults (approval/activation ownership). |
 | `created_at` | `DateTimeField(auto_now_add=True)` | Creation timestamp. |
@@ -145,12 +144,6 @@ Note: job-specific metadata (e.g., `job_position`) is now captured via `recruitm
 | `fleet_eligible` | `BooleanField` | Indicates whether the employee can be assigned a fleet vehicle. |
 | `vehicle_grade_id` | `IntegerField` | Vehicle grade used when allocating cars. |
 | `transport_allowance_eligible` | `BooleanField` | Enables transport allowance payments. |
-
-### Treasury configuration (`treasury_configuration`)
-| Field | Type | Description |
-| --- | --- | --- |
-| `salary_payment_priority` | `IntegerField` | Priority ordering used when routing salary payments. |
-| `preferred_payment_channel` | `CharField` | Fallback payment channel for treasury. |
 
 ### Signature configuration (`signature_configuration`)
 | Field | Type | Description |

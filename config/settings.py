@@ -55,6 +55,7 @@ INSTALLED_APPS = [
     'frontdesk',
     'attendance',
     'notifications',
+    'treasury.apps.TreasuryConfig',
 ]
 
 MIDDLEWARE = [

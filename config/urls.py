@@ -28,6 +28,8 @@ urlpatterns = [
     path('api/frontdesk/', include('frontdesk.urls')),
     path('api/attendance/', include('attendance.urls')),
     path('api/notifications/', include('notifications.urls')),
+    path('api/config/treasury/', include('treasury.config_urls')),
+    path('api/treasury/', include('treasury.urls')),
 ]
 
 # Serve media files in development

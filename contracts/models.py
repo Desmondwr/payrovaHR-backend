@@ -834,7 +834,6 @@ class ContractConfiguration(models.Model):
     payroll_configuration = models.JSONField(default=dict, blank=True, help_text='Payroll inputs (tax profile, CNPS, probation, proration)')
     expense_configuration = models.JSONField(default=dict, blank=True, help_text='Expense routing (policy, cost center, reimbursement)')
     fleet_configuration = models.JSONField(default=dict, blank=True, help_text='Fleet entitlements (vehicle, transport allowance)')
-    treasury_configuration = models.JSONField(default=dict, blank=True, help_text='Treasury preferences (payment priority/channel)')
     signature_configuration = models.JSONField(default=dict, blank=True, help_text='Document & signature defaults (template, method, document hash)')
     governance_configuration = models.JSONField(default=dict, blank=True, help_text='Governance/audit defaults (approval/activation ownership)')
     
