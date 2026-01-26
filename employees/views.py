@@ -1200,7 +1200,7 @@ class EmployeeInvitationViewSet(viewsets.ReadOnlyModelViewSet):
         # Ensure global membership is created/updated
         from accounts.models import EmployeeMembership  # Local import to avoid missing reference
         status_val = EmployeeMembership.STATUS_ACTIVE if employee.employment_status == 'ACTIVE' else EmployeeMembership.STATUS_INVITED
-        EmployeeMembership.objects.update_or_create(
+        EmployeeMembership.objects.using('default').update_or_create(
             user_id=employee.user_id,
             employer_profile=employer_profile,
             defaults={

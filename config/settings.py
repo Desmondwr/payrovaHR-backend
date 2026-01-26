@@ -56,6 +56,7 @@ INSTALLED_APPS = [
     'attendance',
     'notifications',
     'treasury.apps.TreasuryConfig',
+    'income_expense.apps.IncomeExpenseConfig',
 ]
 
 MIDDLEWARE = [

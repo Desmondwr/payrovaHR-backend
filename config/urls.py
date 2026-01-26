@@ -30,6 +30,7 @@ urlpatterns = [
     path('api/notifications/', include('notifications.urls')),
     path('api/config/treasury/', include('treasury.config_urls')),
     path('api/treasury/', include('treasury.urls')),
+    path('api/income-expense/', include('income_expense.urls')),
 ]
 
 # Serve media files in development

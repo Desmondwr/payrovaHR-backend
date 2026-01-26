@@ -558,7 +558,7 @@ class CreateEmployeeSerializer(serializers.ModelSerializer):
         # Create or refresh global membership mapping when a user is linked
         if employee.user_id:
             status_val = EmployeeMembership.STATUS_ACTIVE if employee.employment_status == 'ACTIVE' else EmployeeMembership.STATUS_INVITED
-            EmployeeMembership.objects.update_or_create(
+            EmployeeMembership.objects.using('default').update_or_create(
                 user_id=employee.user_id,
                 employer_profile=request.user.employer_profile,
                 defaults={
@@ -1303,7 +1303,7 @@ class CreateEmployeeWithDetectionSerializer(serializers.ModelSerializer):
 
             # Create or refresh global membership mapping
             status_val = EmployeeMembership.STATUS_ACTIVE if employee.employment_status == 'ACTIVE' else EmployeeMembership.STATUS_INVITED
-            EmployeeMembership.objects.update_or_create(
+            EmployeeMembership.objects.using('default').update_or_create(
                 user_id=employee.user_id,
                 employer_profile=employer,
                 defaults={

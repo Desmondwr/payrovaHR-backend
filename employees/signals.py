@@ -28,7 +28,7 @@ def sync_employee_membership(sender, instance: Employee, **kwargs):
         else EmployeeMembership.STATUS_INVITED
     )
 
-    EmployeeMembership.objects.update_or_create(
+    EmployeeMembership.objects.using('default').update_or_create(
         user_id=instance.user_id,
         employer_profile=employer,
         defaults={
