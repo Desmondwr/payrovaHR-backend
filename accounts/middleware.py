@@ -3,7 +3,11 @@ Middleware for multi-tenant database routing
 """
 from django.conf import settings
 from django.utils.deprecation import MiddlewareMixin
-from accounts.database_utils import get_tenant_database_alias, ensure_tenant_database_loaded
+from rest_framework.exceptions import ParseError, PermissionDenied
+from accounts.database_utils import (
+    ensure_tenant_database_loaded,
+    get_employee_tenant_db_from_membership,
+)
 import threading
 
 # Thread-local storage for tenant context
@@ -37,22 +41,36 @@ class TenantDatabaseMiddleware(MiddlewareMixin):
         """Set tenant context at the start of request"""
         # Default to main database
         tenant_db = 'default'
-        
-        # Check if user is authenticated
-        if hasattr(request, 'user') and request.user.is_authenticated:
-            # If user is an employer, use their tenant database
-            if hasattr(request.user, 'employer_profile') and request.user.employer_profile:
-                employer_profile = request.user.employer_profile
+        user = getattr(request, 'user', None)
+        header_value = request.headers.get('x-employer-id') if hasattr(request, 'headers') else None
+
+        # If we have an authenticated user, resolve their tenant context
+        if user and user.is_authenticated:
+            # Employer users go straight to their tenant DB
+            if getattr(user, 'employer_profile', None):
+                employer_profile = user.employer_profile
                 if employer_profile.database_name:
-                    # Ensure the tenant database is loaded before using it
                     tenant_db = ensure_tenant_database_loaded(employer_profile)
-            
-            # If user is an employee, we need to find their employer's database
-            # This is done by querying the employees app for their record
-            elif request.user.is_employee:
-                # We'll handle this in the views where we have more context
-                # For now, we'll try to determine from the request path or headers
-                pass
+            # Staff/superusers can pick a tenant via the header
+            elif header_value and (user.is_staff or user.is_superuser):
+                try:
+                    employer_id = int(header_value)
+                except (TypeError, ValueError):
+                    employer_id = None
+                if employer_id:
+                    from accounts.models import EmployerProfile
+
+                    header_employer = EmployerProfile.objects.filter(id=employer_id).first()
+                    if header_employer and header_employer.database_name:
+                        tenant_db = ensure_tenant_database_loaded(header_employer)
+            # Employees resolve their tenant via membership/header lookup
+            elif getattr(user, 'is_employee', False):
+                try:
+                    tenant_alias = get_employee_tenant_db_from_membership(request)
+                except (PermissionDenied, ParseError):
+                    tenant_alias = None
+                if tenant_alias:
+                    tenant_db = tenant_alias
         
         # Set the tenant context
         set_current_tenant_db(tenant_db)

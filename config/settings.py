@@ -52,6 +52,7 @@ INSTALLED_APPS = [
     'employees.apps.EmployeesConfig',
     'contracts',
     'timeoff',
+    'fleets.apps.FleetsConfig',
     'frontdesk',
     'attendance',
     'notifications',
