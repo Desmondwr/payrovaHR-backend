@@ -2,6 +2,7 @@
 from rest_framework import viewsets, status, permissions
 from rest_framework.decorators import action
 from rest_framework.response import Response
+from rest_framework.exceptions import PermissionDenied
 from django.utils import timezone
 from django.db.models import Q
 from django.shortcuts import get_object_or_404
@@ -32,27 +33,42 @@ from .utils import (
     create_employee_audit_log, check_required_documents,
     check_expiring_documents, get_cross_institution_summary
 )
-from accounts.permissions import IsEmployer, IsEmployee, IsAuthenticated
+from accounts.permissions import (
+    IsEmployee,
+    IsAuthenticated,
+    EmployerAccessPermission,
+    EmployerOrEmployeeAccessPermission,
+)
+from accounts.rbac import get_active_employer, is_delegate_user, get_delegate_scope, apply_scope_filter
 
 
 class DepartmentViewSet(viewsets.ModelViewSet):
     """ViewSet for managing departments"""
     
-    permission_classes = [IsAuthenticated, IsEmployer]
+    permission_classes = [IsAuthenticated, EmployerAccessPermission]
+    permission_map = {"*": ["employees.manage"]}
     serializer_class = DepartmentSerializer
     
     def get_queryset(self):
         """Return departments for the employer's organization from tenant database"""
         from accounts.database_utils import get_tenant_database_alias
-        tenant_db = get_tenant_database_alias(self.request.user.employer_profile)
-        
-        return Department.objects.using(tenant_db).filter(
-            employer_id=self.request.user.employer_profile.id
+        employer = get_active_employer(self.request, require_context=True)
+        tenant_db = get_tenant_database_alias(employer)
+
+        qs = Department.objects.using(tenant_db).filter(
+            employer_id=employer.id
         ).select_related('parent_department')
+
+        if is_delegate_user(self.request.user, employer.id):
+            scope = get_delegate_scope(self.request.user, employer.id)
+            qs = apply_scope_filter(qs, scope, branch_field="branch_id", department_field="id")
+
+        return qs
     
     def perform_create(self, serializer):
         """Set employer when creating department in tenant database"""
-        serializer.save(employer_id=self.request.user.employer_profile.id)
+        employer = get_active_employer(self.request, require_context=True)
+        serializer.save(employer_id=employer.id)
     
     def perform_update(self, serializer):
         """Update department in tenant database"""
@@ -61,7 +77,8 @@ class DepartmentViewSet(viewsets.ModelViewSet):
     def perform_destroy(self, instance):
         """Delete department from tenant database"""
         from accounts.database_utils import get_tenant_database_alias
-        tenant_db = get_tenant_database_alias(self.request.user.employer_profile)
+        employer = get_active_employer(self.request, require_context=True)
+        tenant_db = get_tenant_database_alias(employer)
         
         instance.delete(using=tenant_db)
 
@@ -69,21 +86,30 @@ class DepartmentViewSet(viewsets.ModelViewSet):
 class BranchViewSet(viewsets.ModelViewSet):
     """ViewSet for managing branches"""
     
-    permission_classes = [IsAuthenticated, IsEmployer]
+    permission_classes = [IsAuthenticated, EmployerAccessPermission]
+    permission_map = {"*": ["employees.configure"]}
     serializer_class = BranchSerializer
     
     def get_queryset(self):
         """Return branches for the employer's organization from tenant database"""
         from accounts.database_utils import get_tenant_database_alias
-        tenant_db = get_tenant_database_alias(self.request.user.employer_profile)
-        
-        return Branch.objects.using(tenant_db).filter(
-            employer_id=self.request.user.employer_profile.id
+        employer = get_active_employer(self.request, require_context=True)
+        tenant_db = get_tenant_database_alias(employer)
+
+        qs = Branch.objects.using(tenant_db).filter(
+            employer_id=employer.id
         )
+
+        if is_delegate_user(self.request.user, employer.id):
+            scope = get_delegate_scope(self.request.user, employer.id)
+            qs = apply_scope_filter(qs, scope, branch_field="id")
+
+        return qs
     
     def perform_create(self, serializer):
         """Set employer when creating branch in tenant database"""
-        serializer.save(employer_id=self.request.user.employer_profile.id)
+        employer = get_active_employer(self.request, require_context=True)
+        serializer.save(employer_id=employer.id)
     
     def perform_update(self, serializer):
         """Update branch in tenant database"""
@@ -92,7 +118,8 @@ class BranchViewSet(viewsets.ModelViewSet):
     def perform_destroy(self, instance):
         """Delete branch from tenant database"""
         from accounts.database_utils import get_tenant_database_alias
-        tenant_db = get_tenant_database_alias(self.request.user.employer_profile)
+        employer = get_active_employer(self.request, require_context=True)
+        tenant_db = get_tenant_database_alias(employer)
         
         instance.delete(using=tenant_db)
 
@@ -100,7 +127,8 @@ class BranchViewSet(viewsets.ModelViewSet):
 class EmployeeViewSet(viewsets.ModelViewSet):
     """ViewSet for managing employees"""
     
-    permission_classes = [IsAuthenticated, IsEmployer]
+    permission_classes = [IsAuthenticated, EmployerAccessPermission]
+    permission_map = {"*": ["employees.manage"]}
     
     def get_serializer_class(self):
         """Return appropriate serializer based on action"""
@@ -118,8 +146,8 @@ class EmployeeViewSet(viewsets.ModelViewSet):
     def get_queryset(self):
         """Return employees for the employer's organization from tenant database"""
         from accounts.database_utils import get_tenant_database_alias
-        
-        employer = self.request.user.employer_profile
+
+        employer = get_active_employer(self.request, require_context=True)
         tenant_db = get_tenant_database_alias(employer)
         
         queryset = Employee.objects.using(tenant_db).filter(
@@ -127,6 +155,16 @@ class EmployeeViewSet(viewsets.ModelViewSet):
         ).select_related(
             'department', 'branch', 'manager'
         ).prefetch_related('documents', 'cross_institution_records')
+
+        if is_delegate_user(self.request.user, employer.id):
+            scope = get_delegate_scope(self.request.user, employer.id)
+            queryset = apply_scope_filter(
+                queryset,
+                scope,
+                branch_field="branch_id",
+                department_field="department_id",
+                self_field="id",
+            )
         
         # Filter by status if provided
         status_filter = self.request.query_params.get('status')
@@ -217,7 +255,8 @@ class EmployeeViewSet(viewsets.ModelViewSet):
             
             tenant_db = getattr(employee, '_tenant_db', None)
             if not tenant_db:
-                tenant_db = get_tenant_database_alias(request.user.employer_profile)
+                employer = get_active_employer(request, require_context=True)
+                tenant_db = get_tenant_database_alias(employer)
             
             config = get_or_create_employee_config(employee.employer_id, tenant_db)
             missing_fields_info = check_missing_fields_against_config(employee, config)
@@ -225,7 +264,7 @@ class EmployeeViewSet(viewsets.ModelViewSet):
             send_profile_completion_notification(
                 employee,
                 missing_fields_info,
-                request.user.employer_profile,
+                get_active_employer(request, require_context=True),
                 tenant_db
             )
         
@@ -253,7 +292,8 @@ class EmployeeViewSet(viewsets.ModelViewSet):
         data = serializer.validated_data
 
         from accounts.database_utils import get_tenant_database_alias
-        tenant_db = get_tenant_database_alias(request.user.employer_profile)
+        employer = get_active_employer(request, require_context=True)
+        tenant_db = get_tenant_database_alias(employer)
 
         def _normalize(value):
             return None if value == "" else value
@@ -281,7 +321,7 @@ class EmployeeViewSet(viewsets.ModelViewSet):
         update_fields.append("updated_at")
         employee.save(using=tenant_db, update_fields=update_fields)
         return Response(EmployeeDetailSerializer(employee).data, status=status.HTTP_200_OK)
-    
+
     def _send_invitation(self, employee, tenant_db=None):
         """Helper method to send employee invitation"""
         # If tenant_db not provided, get it from employer
@@ -333,7 +373,7 @@ class EmployeeViewSet(viewsets.ModelViewSet):
         employee = self.get_object()
         
         # Get tenant database
-        employer = request.user.employer_profile
+        employer = get_active_employer(request, require_context=True)
         tenant_db = get_tenant_database_alias(employer)
         
         # Check if employee already has a user account (use user_id not user)
@@ -385,7 +425,7 @@ class EmployeeViewSet(viewsets.ModelViewSet):
         from accounts.database_utils import get_tenant_database_alias
         from employees.utils import get_or_create_employee_config, create_termination_approval_request, revoke_employee_access
         
-        employer = request.user.employer_profile
+        employer = get_active_employer(request, require_context=True)
         tenant_db = get_tenant_database_alias(employer)
         config = get_or_create_employee_config(employer.id, tenant_db)
         
@@ -482,7 +522,7 @@ class EmployeeViewSet(viewsets.ModelViewSet):
         # Check if reactivation is allowed
         from accounts.database_utils import get_tenant_database_alias
         from employees.utils import get_or_create_employee_config
-        employer = request.user.employer_profile
+        employer = get_active_employer(request, require_context=True)
         tenant_db = get_tenant_database_alias(employer)
         config = get_or_create_employee_config(employee.employer_id, tenant_db)
         if not config.allow_employee_reactivation:
@@ -522,7 +562,7 @@ class EmployeeViewSet(viewsets.ModelViewSet):
         """Delete employee from tenant database ONLY (not from default database)"""
         from accounts.database_utils import get_tenant_database_alias
         
-        employer = self.request.user.employer_profile
+        employer = get_active_employer(self.request, require_context=True)
         tenant_db = get_tenant_database_alias(employer)
         
         employee_id = instance.id
@@ -555,7 +595,7 @@ class EmployeeViewSet(viewsets.ModelViewSet):
         employee = self.get_object()
         
         # Get tenant database
-        employer = request.user.employer_profile
+        employer = get_active_employer(request, require_context=True)
         tenant_db = get_tenant_database_alias(employer)
         
         # Fetch documents from tenant database
@@ -584,7 +624,7 @@ class EmployeeViewSet(viewsets.ModelViewSet):
         
         from accounts.database_utils import get_tenant_database_alias
         from employees.utils import get_or_create_employee_config
-        employer = request.user.employer_profile
+        employer = get_active_employer(request, require_context=True)
         tenant_db = get_tenant_database_alias(employer)
         config = get_or_create_employee_config(employee.employer_id, tenant_db)
         
@@ -600,7 +640,7 @@ class EmployeeViewSet(viewsets.ModelViewSet):
         employee = self.get_object()
         
         # Get tenant database
-        employer = request.user.employer_profile
+        employer = get_active_employer(request, require_context=True)
         tenant_db = get_tenant_database_alias(employer)
         
         # Fetch audit logs from tenant database
@@ -616,7 +656,7 @@ class EmployeeViewSet(viewsets.ModelViewSet):
         from accounts.database_utils import get_tenant_database_alias
         
         employee = self.get_object()
-        employer = request.user.employer_profile
+        employer = get_active_employer(request, require_context=True)
         tenant_db = get_tenant_database_alias(employer)
         
         approvals = TerminationApproval.objects.using(tenant_db).filter(
@@ -634,7 +674,7 @@ class EmployeeViewSet(viewsets.ModelViewSet):
         from accounts.database_utils import get_tenant_database_alias
         from django.utils import timezone
         
-        employer = request.user.employer_profile
+        employer = get_active_employer(request, require_context=True)
         tenant_db = get_tenant_database_alias(employer)
         
         if request.method == 'GET':
@@ -642,6 +682,16 @@ class EmployeeViewSet(viewsets.ModelViewSet):
             approvals = TerminationApproval.objects.using(tenant_db).filter(
                 status='PENDING'
             ).select_related('employee')
+
+            if is_delegate_user(request.user, employer.id):
+                scope = get_delegate_scope(request.user, employer.id)
+                approvals = apply_scope_filter(
+                    approvals,
+                    scope,
+                    branch_field="employee__branch_id",
+                    department_field="employee__department_id",
+                    self_field="employee_id",
+                )
             
             serializer = TerminationApprovalSerializer(approvals, many=True)
             return Response(serializer.data)
@@ -652,9 +702,21 @@ class EmployeeViewSet(viewsets.ModelViewSet):
             return Response({'error': 'approval_id is required'}, status=status.HTTP_400_BAD_REQUEST)
         
         try:
-            approval = TerminationApproval.objects.using(tenant_db).get(id=approval_id)
+            approval = TerminationApproval.objects.using(tenant_db).select_related("employee").get(id=approval_id)
         except TerminationApproval.DoesNotExist:
             return Response({'error': 'Approval request not found'}, status=status.HTTP_404_NOT_FOUND)
+
+        if is_delegate_user(request.user, employer.id):
+            scope = get_delegate_scope(request.user, employer.id)
+            scoped = apply_scope_filter(
+                TerminationApproval.objects.using(tenant_db).filter(id=approval.id),
+                scope,
+                branch_field="employee__branch_id",
+                department_field="employee__department_id",
+                self_field="employee_id",
+            )
+            if not scoped.exists():
+                return Response({'error': 'Approval request not found'}, status=status.HTTP_404_NOT_FOUND)
         
         # Check if already processed
         if approval.status != 'PENDING':
@@ -754,12 +816,12 @@ class EmployeeViewSet(viewsets.ModelViewSet):
         
         from accounts.database_utils import get_tenant_database_alias
         from employees.utils import get_or_create_employee_config
-        employer = request.user.employer_profile
+        employer = get_active_employer(request, require_context=True)
         tenant_db = get_tenant_database_alias(employer)
         config = get_or_create_employee_config(employer.id, tenant_db)
         
         result = detect_duplicate_employees(
-            employer=request.user.employer_profile,
+            employer=employer,
             national_id=serializer.validated_data.get('national_id_number'),
             email=serializer.validated_data.get('email'),
             phone=serializer.validated_data.get('phone_number'),
@@ -799,13 +861,14 @@ class EmployeeViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_404_NOT_FOUND
             )
         
-        tenant_db = get_tenant_database_alias(request.user.employer_profile)
+        employer = get_active_employer(request, require_context=True)
+        tenant_db = get_tenant_database_alias(employer)
         existing_here = Employee.objects.using(tenant_db).filter(
             Q(user_id=match.user_id) | Q(national_id_number=match.national_id_number)
         ).first()
         
         # Get employer configuration to validate existing data
-        config = get_or_create_employee_config(request.user.employer_profile.id, tenant_db)
+        config = get_or_create_employee_config(employer.id, tenant_db)
         
         # Validate existing employee data against new employer's requirements
         validation_result = validate_existing_employee_against_new_config(match, config)
@@ -865,23 +928,50 @@ class EmployeeViewSet(viewsets.ModelViewSet):
 class EmployeeDocumentViewSet(viewsets.ModelViewSet):
     """ViewSet for managing employee documents"""
     
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticated, EmployerOrEmployeeAccessPermission]
+    permission_map = {"*": ["employees.manage"]}
     serializer_class = EmployeeDocumentSerializer
+
+    def _resolve_employer_context(self):
+        """Resolve employer context for employer owners or delegates."""
+        from accounts.database_utils import get_tenant_database_alias
+        user = self.request.user
+        employer = None
+
+        if getattr(user, "employer_profile", None):
+            employer = user.employer_profile
+        else:
+            resolved = get_active_employer(self.request, require_context=False)
+            if resolved and (user.is_admin or user.is_superuser or is_delegate_user(user, resolved.id)):
+                employer = resolved
+
+        tenant_db = get_tenant_database_alias(employer) if employer else None
+        return employer, tenant_db
     
     def get_queryset(self):
         """Return documents based on user type"""
         from accounts.database_utils import get_tenant_database_alias
         
         user = self.request.user
-        
-        # Employers can see all documents for their employees
-        if hasattr(user, 'employer_profile') and user.employer_profile:
-            employer = user.employer_profile
-            tenant_db = get_tenant_database_alias(employer)
-            
-            return EmployeeDocument.objects.using(tenant_db).filter(
+        employer, tenant_db = self._resolve_employer_context()
+
+        # Employers/delegates can see all documents for their employees
+        if employer and tenant_db:
+            qs = EmployeeDocument.objects.using(tenant_db).filter(
                 employee__employer_id=employer.id
             ).select_related('employee')
+
+            if is_delegate_user(user, employer.id):
+                scope = get_delegate_scope(user, employer.id)
+                qs = apply_scope_filter(
+                    qs,
+                    scope,
+                    branch_field="employee__branch_id",
+                    department_field="employee__department_id",
+                    self_field="employee_id",
+                )
+
+            return qs
         
         # Employees can only see their own documents
         elif user.is_employee:
@@ -914,9 +1004,9 @@ class EmployeeDocumentViewSet(viewsets.ModelViewSet):
         context = super().get_serializer_context()
         from accounts.database_utils import get_tenant_database_alias
         
-        if hasattr(self.request.user, 'employer_profile') and self.request.user.employer_profile:
-            employer = self.request.user.employer_profile
-            context['tenant_db'] = get_tenant_database_alias(employer)
+        employer, tenant_db = self._resolve_employer_context()
+        if employer and tenant_db:
+            context['tenant_db'] = tenant_db
         elif self.request.user.is_employee:
             # Find employee's employer
             from accounts.models import EmployerProfile
@@ -936,15 +1026,23 @@ class EmployeeDocumentViewSet(viewsets.ModelViewSet):
     
     def perform_create(self, serializer):
         """Save document to tenant database"""
-        from accounts.database_utils import get_tenant_database_alias
-        
         user = self.request.user
+        employer, tenant_db = self._resolve_employer_context()
         
-        # Determine tenant_db and handle document creation
-        if hasattr(user, 'employer_profile') and user.employer_profile:
-            # Employer uploading document
-            employer = user.employer_profile
-            tenant_db = get_tenant_database_alias(employer)
+        # Employer or delegate uploading document
+        if employer and tenant_db:
+            employee = serializer.validated_data.get("employee")
+            if is_delegate_user(user, employer.id) and employee:
+                scoped_employees = apply_scope_filter(
+                    Employee.objects.using(tenant_db).filter(employer_id=employer.id),
+                    get_delegate_scope(user, employer.id),
+                    branch_field="branch_id",
+                    department_field="department_id",
+                    self_field="id",
+                )
+                if not scoped_employees.filter(id=employee.id).exists():
+                    raise PermissionDenied("You do not have access to this employee.")
+
             serializer.save(using=tenant_db, uploaded_by_id=user.id)
         elif user.is_employee:
             # Employee uploading their own document
@@ -965,7 +1063,7 @@ class EmployeeDocumentViewSet(viewsets.ModelViewSet):
                 except Employee.DoesNotExist:
                     continue
     
-    @action(detail=True, methods=['post'])
+    @action(detail=True, methods=['post'], permission_classes=[IsAuthenticated, EmployerAccessPermission])
     def verify(self, request, pk=None):
         """Verify a document"""
         document = self.get_object()
@@ -998,14 +1096,15 @@ class EmployeeDocumentViewSet(viewsets.ModelViewSet):
 class EmployeeConfigurationViewSet(viewsets.ModelViewSet):
     """ViewSet for managing employee configuration"""
     
-    permission_classes = [IsAuthenticated, IsEmployer]
+    permission_classes = [IsAuthenticated, EmployerAccessPermission]
+    permission_map = {"*": ["employees.configure"]}
     serializer_class = EmployeeConfigurationSerializer
     http_method_names = ['get', 'post', 'patch', 'put']
     
     def get_queryset(self):
         """Return configuration for the employer from tenant database"""
         from accounts.database_utils import get_tenant_database_alias
-        employer = self.request.user.employer_profile
+        employer = get_active_employer(self.request, require_context=True)
         tenant_db = get_tenant_database_alias(employer)
         return EmployeeConfiguration.objects.using(tenant_db).filter(
             employer_id=employer.id
@@ -1014,7 +1113,7 @@ class EmployeeConfigurationViewSet(viewsets.ModelViewSet):
     def get_object(self):
         """Get or create configuration for employer in tenant database"""
         from accounts.database_utils import get_tenant_database_alias
-        employer = self.request.user.employer_profile
+        employer = get_active_employer(self.request, require_context=True)
         tenant_db = get_tenant_database_alias(employer)
         
         config, created = EmployeeConfiguration.objects.using(tenant_db).get_or_create(
@@ -1036,7 +1135,7 @@ class EmployeeConfigurationViewSet(viewsets.ModelViewSet):
     def create(self, request, *args, **kwargs):
         """Create or update configuration in tenant database"""
         from accounts.database_utils import get_tenant_database_alias
-        employer = request.user.employer_profile
+        employer = get_active_employer(request, require_context=True)
         tenant_db = get_tenant_database_alias(employer)
         
         instance = self.get_object()
@@ -1053,7 +1152,7 @@ class EmployeeConfigurationViewSet(viewsets.ModelViewSet):
     def update(self, request, *args, **kwargs):
         """Update configuration in tenant database"""
         from accounts.database_utils import get_tenant_database_alias
-        employer = request.user.employer_profile
+        employer = get_active_employer(request, require_context=True)
         tenant_db = get_tenant_database_alias(employer)
         
         partial = kwargs.pop('partial', False)
@@ -1078,7 +1177,7 @@ class EmployeeConfigurationViewSet(viewsets.ModelViewSet):
     def reset_to_defaults(self, request):
         """Reset configuration to default values in tenant database"""
         from accounts.database_utils import get_tenant_database_alias
-        employer = request.user.employer_profile
+        employer = get_active_employer(request, require_context=True)
         tenant_db = get_tenant_database_alias(employer)
         
         config = self.get_object()
@@ -1101,17 +1200,28 @@ class EmployeeConfigurationViewSet(viewsets.ModelViewSet):
 class EmployeeInvitationViewSet(viewsets.ReadOnlyModelViewSet):
     """ViewSet for viewing employee invitations"""
     
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticated, EmployerOrEmployeeAccessPermission]
+    permission_map = {"*": ["employees.manage"]}
     serializer_class = EmployeeInvitationSerializer
     
     def get_queryset(self):
         """Return invitations for the employer's employees"""
         user = self.request.user
         
-        if hasattr(user, 'employer_profile'):
-            # Employer can see all invitations for their employees
-            return EmployeeInvitation.objects.filter(
-                employee__employer=user.employer_profile
+        employer = None
+        if getattr(user, "employer_profile", None):
+            employer = user.employer_profile
+        else:
+            resolved = get_active_employer(self.request, require_context=False)
+            if resolved and is_delegate_user(user, resolved.id):
+                employer = resolved
+
+        if employer:
+            from accounts.database_utils import get_tenant_database_alias
+            tenant_db = get_tenant_database_alias(employer)
+            # Employer/delegate can see all invitations for their employees
+            return EmployeeInvitation.objects.using(tenant_db).filter(
+                employee__employer_id=employer.id
             ).select_related('employee')
         
         # Employee can see their own invitations

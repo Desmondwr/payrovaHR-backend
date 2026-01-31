@@ -7,7 +7,8 @@ from rest_framework.views import APIView
 from accounts.notifications import create_notification
 from accounts.models import EmployerProfile
 from accounts.database_utils import get_tenant_database_alias
-from accounts.permissions import IsAuthenticated, IsEmployer
+from accounts.permissions import IsAuthenticated, EmployerAccessPermission
+from accounts.rbac import get_active_employer, is_delegate_user, get_delegate_scope, apply_scope_filter
 from django.contrib.auth import get_user_model
 from .models import FrontdeskStation, StationResponsible, Visitor, Visit
 from .serializers import (
@@ -27,27 +28,32 @@ from employees.models import Employee
 class FrontdeskStationViewSet(viewsets.ModelViewSet):
     """Manage branch-based stations (one active per branch)."""
 
-    permission_classes = [IsAuthenticated, IsEmployer]
+    permission_classes = [IsAuthenticated, EmployerAccessPermission]
+    permission_map = {"*": ["frontdesk.manage"]}
     serializer_class = FrontdeskStationSerializer
 
     def get_queryset(self):
-        employer = self.request.user.employer_profile
+        employer = get_active_employer(self.request, require_context=True)
         tenant_db = get_tenant_database_alias(employer)
-        return (
+        qs = (
             FrontdeskStation.objects.using(tenant_db)
             .filter(employer_id=employer.id)
             .select_related("branch")
             .prefetch_related("responsibles")
         )
+        if is_delegate_user(self.request.user, employer.id):
+            scope = get_delegate_scope(self.request.user, employer.id)
+            qs = apply_scope_filter(qs, scope, branch_field="branch_id")
+        return qs
 
     def perform_destroy(self, instance):
-        tenant_db = get_tenant_database_alias(self.request.user.employer_profile)
+        tenant_db = get_tenant_database_alias(get_active_employer(self.request, require_context=True))
         instance.delete(using=tenant_db)
 
     @action(detail=True, methods=["delete"], url_path="delete")
     def delete_station(self, request, pk=None):
         station = self.get_object()
-        tenant_db = get_tenant_database_alias(request.user.employer_profile)
+        tenant_db = get_tenant_database_alias(get_active_employer(request, require_context=True))
         station.delete(using=tenant_db)
         return Response(status=status.HTTP_204_NO_CONTENT)
 
@@ -55,53 +61,63 @@ class FrontdeskStationViewSet(viewsets.ModelViewSet):
 class StationResponsibleViewSet(viewsets.ModelViewSet):
     """Manage station responsibles (HR/office admins scoped to branch)."""
 
-    permission_classes = [IsAuthenticated, IsEmployer]
+    permission_classes = [IsAuthenticated, EmployerAccessPermission]
+    permission_map = {"*": ["frontdesk.manage"]}
     serializer_class = StationResponsibleSerializer
 
     def get_queryset(self):
-        employer = self.request.user.employer_profile
+        employer = get_active_employer(self.request, require_context=True)
         tenant_db = get_tenant_database_alias(employer)
-        return (
+        qs = (
             StationResponsible.objects.using(tenant_db)
             .filter(station__employer_id=employer.id)
             .select_related("station", "employee")
         )
+        if is_delegate_user(self.request.user, employer.id):
+            scope = get_delegate_scope(self.request.user, employer.id)
+            qs = apply_scope_filter(qs, scope, branch_field="station__branch_id")
+        return qs
 
     def perform_destroy(self, instance):
-        tenant_db = get_tenant_database_alias(self.request.user.employer_profile)
+        tenant_db = get_tenant_database_alias(get_active_employer(self.request, require_context=True))
         instance.delete(using=tenant_db)
 
 
 class VisitorViewSet(viewsets.ModelViewSet):
     """CRUD for external visitors."""
 
-    permission_classes = [IsAuthenticated, IsEmployer]
+    permission_classes = [IsAuthenticated, EmployerAccessPermission]
+    permission_map = {"*": ["frontdesk.manage"]}
     serializer_class = VisitorSerializer
 
     def get_queryset(self):
-        employer = self.request.user.employer_profile
+        employer = get_active_employer(self.request, require_context=True)
         tenant_db = get_tenant_database_alias(employer)
         return Visitor.objects.using(tenant_db).filter(employer_id=employer.id)
 
     def perform_destroy(self, instance):
-        tenant_db = get_tenant_database_alias(self.request.user.employer_profile)
+        tenant_db = get_tenant_database_alias(get_active_employer(self.request, require_context=True))
         instance.delete(using=tenant_db)
 
 
 class VisitViewSet(viewsets.ModelViewSet):
     """Visitor lifecycle: planned/walk-in, check-in, manual check-out."""
 
-    permission_classes = [IsAuthenticated, IsEmployer]
+    permission_classes = [IsAuthenticated, EmployerAccessPermission]
+    permission_map = {"*": ["frontdesk.manage"]}
     serializer_class = VisitSerializer
 
     def get_queryset(self):
-        employer = self.request.user.employer_profile
+        employer = get_active_employer(self.request, require_context=True)
         tenant_db = get_tenant_database_alias(employer)
         qs = (
             Visit.objects.using(tenant_db)
             .filter(employer_id=employer.id)
             .select_related("branch", "station", "visitor", "host")
         )
+        if is_delegate_user(self.request.user, employer.id):
+            scope = get_delegate_scope(self.request.user, employer.id)
+            qs = apply_scope_filter(qs, scope, branch_field="branch_id")
 
         branch = self.request.query_params.get("branch")
         status_filter = self.request.query_params.get("status")
@@ -115,7 +131,7 @@ class VisitViewSet(viewsets.ModelViewSet):
         return qs
 
     def perform_destroy(self, instance):
-        tenant_db = get_tenant_database_alias(self.request.user.employer_profile)
+        tenant_db = get_tenant_database_alias(get_active_employer(self.request, require_context=True))
         instance.delete(using=tenant_db)
 
     @action(detail=True, methods=["post"])

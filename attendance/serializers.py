@@ -1,5 +1,7 @@
 from rest_framework import serializers
 
+from accounts.rbac import get_active_employer, is_delegate_user
+
 from employees.models import Branch
 from .models import (
     AttendanceAllowedWifi,
@@ -44,21 +46,40 @@ class AttendanceLocationSiteSerializer(serializers.ModelSerializer):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         request = self.context.get("request")
-        if request and hasattr(request.user, "employer_profile"):
+        if request:
             from accounts.database_utils import get_tenant_database_alias
 
-            tenant_db = get_tenant_database_alias(request.user.employer_profile)
-            self.fields["branch"].queryset = Branch.objects.using(tenant_db).filter(
-                employer_id=request.user.employer_profile.id
-            )
+            employer = None
+            if getattr(request.user, "employer_profile", None):
+                employer = request.user.employer_profile
+            else:
+                resolved = get_active_employer(request, require_context=False)
+                if resolved and is_delegate_user(request.user, resolved.id):
+                    employer = resolved
+
+            if employer:
+                tenant_db = get_tenant_database_alias(employer)
+                self.fields["branch"].queryset = Branch.objects.using(tenant_db).filter(
+                    employer_id=employer.id
+                )
 
     def validate_branch(self, value):
         if value is None:
             return value
         request = self.context.get("request")
-        if not request or not hasattr(request.user, "employer_profile"):
+        if not request:
             return value
-        if value.employer_id != request.user.employer_profile.id:
+
+        employer = None
+        if getattr(request.user, "employer_profile", None):
+            employer = request.user.employer_profile
+        else:
+            resolved = get_active_employer(request, require_context=False)
+            if resolved and is_delegate_user(request.user, resolved.id):
+                employer = resolved
+        if not employer:
+            return value
+        if value.employer_id != employer.id:
             raise serializers.ValidationError("Branch not found for this employer.")
         return value
 
@@ -70,7 +91,7 @@ class AttendanceLocationSiteSerializer(serializers.ModelSerializer):
         # Default to the single branch if only one exists for the employer
         if not attrs.get("branch"):
             request = self.context.get("request")
-            if request and hasattr(request.user, "employer_profile"):
+            if request:
                 qs = self.fields["branch"].queryset
                 if qs is not None and qs.count() == 1:
                     attrs["branch"] = qs.first()
@@ -100,21 +121,38 @@ class AttendanceAllowedWifiSerializer(serializers.ModelSerializer):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         request = self.context.get("request")
-        if request and hasattr(request.user, "employer_profile"):
+        if request:
             from accounts.database_utils import get_tenant_database_alias
 
-            tenant_db = get_tenant_database_alias(request.user.employer_profile)
-            self.fields["branch"].queryset = Branch.objects.using(tenant_db).filter(
-                employer_id=request.user.employer_profile.id
-            )
+            employer = None
+            if getattr(request.user, "employer_profile", None):
+                employer = request.user.employer_profile
+            else:
+                resolved = get_active_employer(request, require_context=False)
+                if resolved and is_delegate_user(request.user, resolved.id):
+                    employer = resolved
+            if employer:
+                tenant_db = get_tenant_database_alias(employer)
+                self.fields["branch"].queryset = Branch.objects.using(tenant_db).filter(
+                    employer_id=employer.id
+                )
 
     def validate_branch(self, value):
         if value is None:
             return value
         request = self.context.get("request")
-        if not request or not hasattr(request.user, "employer_profile"):
+        if not request:
             return value
-        if value.employer_id != request.user.employer_profile.id:
+        employer = None
+        if getattr(request.user, "employer_profile", None):
+            employer = request.user.employer_profile
+        else:
+            resolved = get_active_employer(request, require_context=False)
+            if resolved and is_delegate_user(request.user, resolved.id):
+                employer = resolved
+        if not employer:
+            return value
+        if value.employer_id != employer.id:
             raise serializers.ValidationError("Branch not found for this employer.")
         return value
 
@@ -133,7 +171,7 @@ class AttendanceAllowedWifiSerializer(serializers.ModelSerializer):
         # Default to the single branch if none provided and no site branch
         if branch is None:
             request = self.context.get("request")
-            if request and hasattr(request.user, "employer_profile"):
+            if request:
                 qs = self.fields["branch"].queryset
                 if qs is not None and qs.count() == 1:
                     attrs["branch"] = qs.first()
@@ -162,21 +200,38 @@ class AttendanceKioskStationSerializer(serializers.ModelSerializer):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         request = self.context.get("request")
-        if request and hasattr(request.user, "employer_profile"):
+        if request:
             from accounts.database_utils import get_tenant_database_alias
 
-            tenant_db = get_tenant_database_alias(request.user.employer_profile)
-            self.fields["branch"].queryset = Branch.objects.using(tenant_db).filter(
-                employer_id=request.user.employer_profile.id
-            )
+            employer = None
+            if getattr(request.user, "employer_profile", None):
+                employer = request.user.employer_profile
+            else:
+                resolved = get_active_employer(request, require_context=False)
+                if resolved and is_delegate_user(request.user, resolved.id):
+                    employer = resolved
+            if employer:
+                tenant_db = get_tenant_database_alias(employer)
+                self.fields["branch"].queryset = Branch.objects.using(tenant_db).filter(
+                    employer_id=employer.id
+                )
 
     def validate_branch(self, value):
         if value is None:
             return value
         request = self.context.get("request")
-        if not request or not hasattr(request.user, "employer_profile"):
+        if not request:
             return value
-        if value.employer_id != request.user.employer_profile.id:
+        employer = None
+        if getattr(request.user, "employer_profile", None):
+            employer = request.user.employer_profile
+        else:
+            resolved = get_active_employer(request, require_context=False)
+            if resolved and is_delegate_user(request.user, resolved.id):
+                employer = resolved
+        if not employer:
+            return value
+        if value.employer_id != employer.id:
             raise serializers.ValidationError("Branch not found for this employer.")
         return value
 
@@ -187,7 +242,7 @@ class AttendanceKioskStationSerializer(serializers.ModelSerializer):
         attrs = super().validate(attrs)
         if not attrs.get("branch"):
             request = self.context.get("request")
-            if request and hasattr(request.user, "employer_profile"):
+            if request:
                 qs = self.fields["branch"].queryset
                 if qs is not None and qs.count() == 1:
                     attrs["branch"] = qs.first()

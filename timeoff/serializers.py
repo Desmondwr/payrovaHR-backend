@@ -4,6 +4,12 @@ from decimal import Decimal
 from rest_framework import serializers
 
 from accounts.database_utils import get_tenant_database_alias
+from accounts.rbac import (
+    get_active_employer,
+    is_delegate_user,
+    get_delegate_scope,
+    apply_scope_filter,
+)
 from employees.models import Employee
 
 from .models import (
@@ -122,9 +128,17 @@ class TimeOffTypeSerializer(serializers.ModelSerializer):
 
     def validate(self, attrs):
         request = self.context.get("request")
-        if not request or not hasattr(request.user, "employer_profile"):
+        if not request:
             raise serializers.ValidationError({"detail": "Employer context required."})
-        employer = request.user.employer_profile
+        employer = None
+        if getattr(request.user, "employer_profile", None):
+            employer = request.user.employer_profile
+        else:
+            resolved = get_active_employer(request, require_context=False)
+            if resolved and is_delegate_user(request.user, resolved.id):
+                employer = resolved
+        if not employer:
+            raise serializers.ValidationError({"detail": "Employer context required."})
         tenant_db = get_tenant_database_alias(employer)
         config = ensure_timeoff_configuration(employer.id, tenant_db)
         attrs["configuration"] = config
@@ -321,8 +335,17 @@ class TimeOffRequestInputSerializer(serializers.ModelSerializer):
         tenant_db = self.context.get("tenant_db") or "default"
         employee_obj = None
 
-        if hasattr(user, "employer_profile") and user.employer_profile:
-            employer_id = user.employer_profile.id
+        employer = None
+        if getattr(user, "employer_profile", None):
+            employer = user.employer_profile
+        else:
+            request = self.context.get("request")
+            resolved = get_active_employer(request, require_context=False) if request else None
+            if resolved and is_delegate_user(user, resolved.id):
+                employer = resolved
+
+        if employer:
+            employer_id = employer.id
             employee_id = self.initial_data.get("employee") or self.initial_data.get("employee_id")
             if not employee_id and not self.instance:
                 raise serializers.ValidationError({"employee": ["employee is required."]})
@@ -333,6 +356,17 @@ class TimeOffRequestInputSerializer(serializers.ModelSerializer):
                 ).first()
             if not employee_obj:
                 raise serializers.ValidationError({"employee": ["Employee not found for this tenant."]})
+            if is_delegate_user(user, employer.id):
+                scope = get_delegate_scope(user, employer.id)
+                scoped = apply_scope_filter(
+                    Employee.objects.using(tenant_db).filter(id=employee_obj.id),
+                    scope,
+                    branch_field="branch_id",
+                    department_field="department_id",
+                    self_field="id",
+                )
+                if not scoped.exists():
+                    raise serializers.ValidationError({"employee": ["Employee not found for this tenant."]})
         elif hasattr(user, "employee_profile") and user.employee_profile:
             employee_obj = user.employee_profile
             tenant_db = employee_obj._state.db or tenant_db
@@ -637,9 +671,17 @@ class TimeOffAllocationCreateSerializer(serializers.ModelSerializer):
 
     def validate(self, attrs):
         request = self.context.get("request")
-        if not request or not hasattr(request.user, "employer_profile"):
+        if not request:
             raise serializers.ValidationError({"detail": "Employer context required."})
-        employer = request.user.employer_profile
+        employer = None
+        if getattr(request.user, "employer_profile", None):
+            employer = request.user.employer_profile
+        else:
+            resolved = get_active_employer(request, require_context=False)
+            if resolved and is_delegate_user(request.user, resolved.id):
+                employer = resolved
+        if not employer:
+            raise serializers.ValidationError({"detail": "Employer context required."})
         tenant_db = get_tenant_database_alias(employer)
         attrs["tenant_db"] = tenant_db
         attrs["employer_id"] = employer.id
@@ -668,6 +710,17 @@ class TimeOffAllocationCreateSerializer(serializers.ModelSerializer):
             ).first()
             if not employee_obj:
                 raise serializers.ValidationError({"employee_id": ["Employee not found in tenant."]})
+            if is_delegate_user(request.user, employer.id):
+                scope = get_delegate_scope(request.user, employer.id)
+                scoped = apply_scope_filter(
+                    Employee.objects.using(tenant_db).filter(id=employee_obj.id),
+                    scope,
+                    branch_field="branch_id",
+                    department_field="department_id",
+                    self_field="id",
+                )
+                if not scoped.exists():
+                    raise serializers.ValidationError({"employee_id": ["Employee not found in tenant."]})
         attrs["employee"] = employee_obj
         attrs["working_hours"] = int((config.get("global_settings") or {}).get("working_hours_per_day", 8) or 8)
         attrs["rounding"] = (config.get("global_settings") or {}).get("rounding") or {}
@@ -712,9 +765,17 @@ class TimeOffBulkAllocationSerializer(serializers.Serializer):
 
     def validate(self, attrs):
         request = self.context.get("request")
-        if not request or not hasattr(request.user, "employer_profile"):
+        if not request:
             raise serializers.ValidationError({"detail": "Employer context required."})
-        employer = request.user.employer_profile
+        employer = None
+        if getattr(request.user, "employer_profile", None):
+            employer = request.user.employer_profile
+        else:
+            resolved = get_active_employer(request, require_context=False)
+            if resolved and is_delegate_user(request.user, resolved.id):
+                employer = resolved
+        if not employer:
+            raise serializers.ValidationError({"detail": "Employer context required."})
         tenant_db = get_tenant_database_alias(employer)
         attrs["tenant_db"] = tenant_db
         attrs["employer_id"] = employer.id
@@ -730,6 +791,17 @@ class TimeOffBulkAllocationSerializer(serializers.Serializer):
         )
         if len(employees) != len(set(attrs["employee_ids"])):
             raise serializers.ValidationError({"employee_ids": ["One or more employees not found for this tenant."]})
+        if is_delegate_user(request.user, employer.id):
+            scope = get_delegate_scope(request.user, employer.id)
+            scoped = apply_scope_filter(
+                Employee.objects.using(tenant_db).filter(id__in=[emp.id for emp in employees]),
+                scope,
+                branch_field="branch_id",
+                department_field="department_id",
+                self_field="id",
+            )
+            if scoped.count() != len(employees):
+                raise serializers.ValidationError({"employee_ids": ["One or more employees not found for this tenant."]})
         attrs["employees"] = employees
         attrs["working_hours"] = int((config.get("global_settings") or {}).get("working_hours_per_day", 8) or 8)
         attrs["rounding"] = (config.get("global_settings") or {}).get("rounding") or {}

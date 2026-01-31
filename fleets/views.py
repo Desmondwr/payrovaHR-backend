@@ -13,6 +13,8 @@ from accounts.database_utils import (
     get_tenant_database_alias,
 )
 from accounts.middleware import get_current_tenant_db
+from accounts.permissions import EmployerAccessPermission
+from accounts.rbac import get_active_employer, is_delegate_user
 
 from .models import (
     AccidentEvent,
@@ -61,6 +63,9 @@ class EmployerContextMixin:
             return None
         if hasattr(user, "employer_profile") and user.employer_profile:
             return user.employer_profile.id
+        resolved = get_active_employer(self.request, require_context=False)
+        if resolved and (user.is_admin or user.is_superuser or is_delegate_user(user, resolved.id)):
+            return resolved.id
         employee = getattr(user, "employee_profile", None)
         if employee:
             return employee.employer_id
@@ -68,7 +73,8 @@ class EmployerContextMixin:
 
 
 class FleetTenantViewSet(EmployerContextMixin, viewsets.ModelViewSet):
-    permission_classes = [permissions.IsAuthenticated]
+    permission_classes = [permissions.IsAuthenticated, EmployerAccessPermission]
+    permission_map = {"*": ["fleets.manage"]}
 
     def initial(self, request, *args, **kwargs):
         super().initial(request, *args, **kwargs)

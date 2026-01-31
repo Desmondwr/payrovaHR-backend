@@ -9,7 +9,8 @@ from rest_framework.views import APIView
 
 from accounts.database_utils import get_tenant_database_alias
 from accounts.notifications import create_notification
-from accounts.permissions import IsAuthenticated, IsEmployer
+from accounts.permissions import IsAuthenticated, EmployerAccessPermission, EmployerOrEmployeeAccessPermission
+from accounts.rbac import get_active_employer, is_delegate_user, get_delegate_scope, apply_scope_filter
 from accounts.utils import api_response
 from accounts.models import EmployerProfile, User
 
@@ -55,7 +56,12 @@ from .services import (
 
 
 class IncomeExpenseConfigurationView(APIView):
-    permission_classes = [IsAuthenticated]
+    required_permissions = ["income_expense.manage"]
+
+    def get_permissions(self):
+        if self.request.method in ("GET", "HEAD", "OPTIONS"):
+            return [IsAuthenticated(), EmployerOrEmployeeAccessPermission()]
+        return [IsAuthenticated(), EmployerAccessPermission()]
 
     def get(self, request):
         institution = resolve_institution(request)
@@ -65,13 +71,6 @@ class IncomeExpenseConfigurationView(APIView):
         return api_response(success=True, message="Income/Expense config retrieved.", data=serializer.data)
 
     def put(self, request):
-        if not hasattr(request.user, "employer_profile"):
-            return api_response(
-                success=False,
-                message="Only employers can update configurations.",
-                status=status.HTTP_403_FORBIDDEN,
-            )
-
         institution = resolve_institution(request)
         tenant_db = get_tenant_database_alias(institution)
         config = ensure_income_expense_configuration(institution, tenant_db=tenant_db)
@@ -92,8 +91,15 @@ class IncomeExpenseTenantViewSet(viewsets.ModelViewSet):
         return context
 
     def _resolve_institution(self):
-        if hasattr(self.request.user, "employer_profile"):
-            institution = self.request.user.employer_profile
+        user = self.request.user
+        institution = None
+        if getattr(user, "employer_profile", None):
+            institution = user.employer_profile
+        else:
+            resolved = get_active_employer(self.request, require_context=False)
+            if resolved and (user.is_admin or user.is_superuser or is_delegate_user(user, resolved.id)):
+                institution = resolved
+        if institution:
             return institution, get_tenant_database_alias(institution)
         employee = getattr(self.request.user, "employee_profile", None)
         if employee and getattr(employee, "employer_id", None):
@@ -108,6 +114,14 @@ class IncomeExpenseTenantViewSet(viewsets.ModelViewSet):
             raise PermissionDenied("Institution context required.")
         return institution, tenant_db
 
+    def _is_employer_actor(self, request=None):
+        req = request or self.request
+        user = req.user
+        if getattr(user, "employer_profile", None) or user.is_admin or user.is_superuser:
+            return True
+        resolved = get_active_employer(req, require_context=False)
+        return bool(resolved and is_delegate_user(user, resolved.id))
+
 
 class SoftDeleteMixin:
     def perform_destroy(self, instance):
@@ -121,7 +135,8 @@ class SoftDeleteMixin:
 
 
 class ExpenseCategoryViewSet(SoftDeleteMixin, IncomeExpenseTenantViewSet):
-    permission_classes = [IsAuthenticated, IsEmployer]
+    permission_classes = [IsAuthenticated, EmployerOrEmployeeAccessPermission]
+    permission_map = {"*": ["income_expense.manage"]}
     serializer_class = ExpenseCategorySerializer
 
     def get_queryset(self):
@@ -142,7 +157,8 @@ class ExpenseCategoryViewSet(SoftDeleteMixin, IncomeExpenseTenantViewSet):
 
 
 class IncomeCategoryViewSet(SoftDeleteMixin, IncomeExpenseTenantViewSet):
-    permission_classes = [IsAuthenticated, IsEmployer]
+    permission_classes = [IsAuthenticated, EmployerAccessPermission]
+    permission_map = {"*": ["income_expense.manage"]}
     serializer_class = IncomeCategorySerializer
 
     def get_queryset(self):
@@ -163,7 +179,8 @@ class IncomeCategoryViewSet(SoftDeleteMixin, IncomeExpenseTenantViewSet):
 
 
 class BudgetPlanViewSet(SoftDeleteMixin, IncomeExpenseTenantViewSet):
-    permission_classes = [IsAuthenticated, IsEmployer]
+    permission_classes = [IsAuthenticated, EmployerAccessPermission]
+    permission_map = {"*": ["income_expense.manage"]}
     serializer_class = BudgetPlanSerializer
 
     def get_queryset(self):
@@ -257,7 +274,8 @@ class BudgetPlanViewSet(SoftDeleteMixin, IncomeExpenseTenantViewSet):
 
 
 class BudgetLineViewSet(SoftDeleteMixin, IncomeExpenseTenantViewSet):
-    permission_classes = [IsAuthenticated, IsEmployer]
+    permission_classes = [IsAuthenticated, EmployerAccessPermission]
+    permission_map = {"*": ["income_expense.manage"]}
     serializer_class = BudgetLineSerializer
 
     def get_queryset(self):
@@ -285,7 +303,8 @@ class BudgetLineViewSet(SoftDeleteMixin, IncomeExpenseTenantViewSet):
 
 
 class ExpenseClaimViewSet(SoftDeleteMixin, IncomeExpenseTenantViewSet):
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticated, EmployerOrEmployeeAccessPermission]
+    permission_map = {"*": ["income_expense.manage"]}
     serializer_class = ExpenseClaimSerializer
 
     def get_queryset(self):
@@ -298,8 +317,26 @@ class ExpenseClaimViewSet(SoftDeleteMixin, IncomeExpenseTenantViewSet):
             is_deleted=False,
         )
 
-        if hasattr(self.request.user, "employee_profile") and self.request.user.employee_profile:
-            qs = qs.filter(employee=self.request.user.employee_profile)
+        user = self.request.user
+        employer = None
+        if getattr(user, "employer_profile", None):
+            employer = user.employer_profile
+        else:
+            resolved = get_active_employer(self.request, require_context=False)
+            if resolved and (user.is_admin or user.is_superuser or is_delegate_user(user, resolved.id)):
+                employer = resolved
+
+        if employer and is_delegate_user(user, employer.id):
+            scope = get_delegate_scope(user, employer.id)
+            qs = apply_scope_filter(
+                qs,
+                scope,
+                branch_field="employee__branch_id",
+                department_field="employee__department_id",
+                self_field="employee_id",
+            )
+        elif hasattr(user, "employee_profile") and user.employee_profile:
+            qs = qs.filter(employee=user.employee_profile)
 
         status_param = self.request.query_params.get("status")
         employee_id = self.request.query_params.get("employee_id")
@@ -308,7 +345,7 @@ class ExpenseClaimViewSet(SoftDeleteMixin, IncomeExpenseTenantViewSet):
 
         if status_param:
             qs = qs.filter(status=status_param)
-        if employee_id and hasattr(self.request.user, "employer_profile"):
+        if employee_id and employer:
             qs = qs.filter(employee_id=employee_id)
         if date_from:
             qs = qs.filter(expense_date__gte=date_from)
@@ -324,7 +361,18 @@ class ExpenseClaimViewSet(SoftDeleteMixin, IncomeExpenseTenantViewSet):
             raise ValidationError("Expenses are disabled in configuration.")
 
         employee = getattr(self.request.user, "employee_profile", None)
-        if employee and not hasattr(self.request.user, "employer_profile"):
+        employer_actor = False
+        employer = None
+        if getattr(self.request.user, "employer_profile", None):
+            employer_actor = True
+            employer = self.request.user.employer_profile
+        else:
+            resolved = get_active_employer(self.request, require_context=False)
+            if resolved and is_delegate_user(self.request.user, resolved.id):
+                employer_actor = True
+                employer = resolved
+
+        if employee and not employer_actor:
             draft = serializer.save(
                 institution_id=institution.id,
                 employee=employee,
@@ -336,9 +384,22 @@ class ExpenseClaimViewSet(SoftDeleteMixin, IncomeExpenseTenantViewSet):
             draft.save()
             return
 
-        if hasattr(self.request.user, "employer_profile"):
+        if employer_actor:
             if not serializer.validated_data.get("employee"):
                 raise ValidationError("Employee is required for employer-created expense claims.")
+            if employer and is_delegate_user(self.request.user, employer.id):
+                scope = get_delegate_scope(self.request.user, employer.id)
+                employee_obj = serializer.validated_data.get("employee")
+                if employee_obj:
+                    scoped = apply_scope_filter(
+                        Employee.objects.using(tenant_db).filter(id=employee_obj.id),
+                        scope,
+                        branch_field="branch_id",
+                        department_field="department_id",
+                        self_field="id",
+                    )
+                    if not scoped.exists():
+                        raise PermissionDenied("Employee not found for this tenant.")
             draft = serializer.save(
                 institution_id=institution.id,
                 created_by_id=self.request.user.id,
@@ -362,10 +423,16 @@ class ExpenseClaimViewSet(SoftDeleteMixin, IncomeExpenseTenantViewSet):
         institution, tenant_db = self._require_institution()
         expense = self.get_object()
         config = ensure_income_expense_configuration(institution, tenant_db=tenant_db)
+        employer_actor = self._is_employer_actor(request)
 
         if expense.status not in [ExpenseClaim.STATUS_DRAFT, ExpenseClaim.STATUS_REJECTED]:
             raise ValidationError("Expense cannot be submitted from current status.")
-        if hasattr(request.user, "employee_profile") and expense.employee_id != request.user.employee_profile.id:
+        if (
+            hasattr(request.user, "employee_profile")
+            and request.user.employee_profile
+            and not employer_actor
+            and expense.employee_id != request.user.employee_profile.id
+        ):
             raise PermissionDenied("You can only submit your own expense.")
 
         validate_expense_submission(expense, config)
@@ -418,7 +485,7 @@ class ExpenseClaimViewSet(SoftDeleteMixin, IncomeExpenseTenantViewSet):
                 expense.mark_approval_pending()
             else:
                 expense.mark_approved()
-                if hasattr(request.user, "employer_profile") or config.expense_allow_self_approval:
+                if employer_actor or config.expense_allow_self_approval:
                     expense.approved_by_id = request.user.id
 
             expense.submitted_at = expense.submitted_at or timezone.now()
@@ -450,7 +517,7 @@ class ExpenseClaimViewSet(SoftDeleteMixin, IncomeExpenseTenantViewSet):
 
     @action(detail=True, methods=["post"], url_path="approve")
     def approve(self, request, pk=None):
-        if not (hasattr(request.user, "employer_profile") or request.user.is_admin):
+        if not self._is_employer_actor(request):
             raise PermissionDenied("Only employer/admin users can approve expenses.")
 
         institution, tenant_db = self._require_institution()
@@ -529,7 +596,7 @@ class ExpenseClaimViewSet(SoftDeleteMixin, IncomeExpenseTenantViewSet):
 
     @action(detail=True, methods=["post"], url_path="reject")
     def reject(self, request, pk=None):
-        if not (hasattr(request.user, "employer_profile") or request.user.is_admin):
+        if not self._is_employer_actor(request):
             raise PermissionDenied("Only employer/admin users can reject expenses.")
 
         institution, tenant_db = self._require_institution()
@@ -562,7 +629,7 @@ class ExpenseClaimViewSet(SoftDeleteMixin, IncomeExpenseTenantViewSet):
         if (
             config.expense_cancel_requires_approval
             and expense.status in [ExpenseClaim.STATUS_APPROVAL_PENDING, ExpenseClaim.STATUS_APPROVED]
-            and not hasattr(request.user, "employer_profile")
+            and not self._is_employer_actor(request)
         ):
             raise ValidationError("Cancellation requires approval for this expense.")
         if expense.status == ExpenseClaim.STATUS_APPROVED:
@@ -582,7 +649,7 @@ class ExpenseClaimViewSet(SoftDeleteMixin, IncomeExpenseTenantViewSet):
 
     @action(detail=True, methods=["post"], url_path="mark-paid")
     def mark_paid(self, request, pk=None):
-        if not (hasattr(request.user, "employer_profile") or request.user.is_admin):
+        if not self._is_employer_actor(request):
             raise PermissionDenied("Only employer/admin users can mark paid.")
 
         institution, tenant_db = self._require_institution()
@@ -685,7 +752,8 @@ class ExpenseClaimViewSet(SoftDeleteMixin, IncomeExpenseTenantViewSet):
 
 
 class IncomeRecordViewSet(SoftDeleteMixin, IncomeExpenseTenantViewSet):
-    permission_classes = [IsAuthenticated, IsEmployer]
+    permission_classes = [IsAuthenticated, EmployerAccessPermission]
+    permission_map = {"*": ["income_expense.manage"]}
     serializer_class = IncomeRecordSerializer
 
     def get_queryset(self):

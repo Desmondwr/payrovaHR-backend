@@ -2,6 +2,7 @@ from django.utils import timezone
 from rest_framework import serializers
 
 from accounts.database_utils import get_tenant_database_alias
+from accounts.rbac import get_active_employer, is_delegate_user
 from employees.models import Branch, Employee
 from .models import FrontdeskStation, StationResponsible, Visitor, Visit
 
@@ -10,6 +11,21 @@ DEFAULT_KIOSK_THEME = {
     "text_color": "#111827",
     "check_in_button_bg_color": "#2563eb",
 }
+
+
+def resolve_employer_context(request):
+    if not request:
+        return None, None
+    user = request.user
+    employer = None
+    if getattr(user, "employer_profile", None):
+        employer = user.employer_profile
+    else:
+        resolved = get_active_employer(request, require_context=False)
+        if resolved and is_delegate_user(user, resolved.id):
+            employer = resolved
+    tenant_db = get_tenant_database_alias(employer) if employer else None
+    return employer, tenant_db
 
 
 def normalize_kiosk_theme(theme):
@@ -55,9 +71,8 @@ class FrontdeskStationSerializer(serializers.ModelSerializer):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         request = self.context.get("request")
-        if request and hasattr(request.user, "employer_profile"):
-            employer = request.user.employer_profile
-            tenant_db = get_tenant_database_alias(employer)
+        employer, tenant_db = resolve_employer_context(request)
+        if employer and tenant_db:
             self.fields["branch"].queryset = Branch.objects.using(tenant_db).filter(employer_id=employer.id)
             self.fields["responsibles"].queryset = (
                 Employee.objects.using(tenant_db)
@@ -69,7 +84,8 @@ class FrontdeskStationSerializer(serializers.ModelSerializer):
         branch = attrs.get("branch") or getattr(self.instance, "branch", None)
         responsibles = attrs.get("responsibles")
         request = self.context.get("request")
-        employer_id = request.user.employer_profile.id if request and hasattr(request.user, "employer_profile") else None
+        employer, _ = resolve_employer_context(request)
+        employer_id = employer.id if employer else None
 
         if branch and employer_id and branch.employer_id != employer_id:
             raise serializers.ValidationError({"branch": "Branch must belong to the current employer."})
@@ -90,12 +106,9 @@ class FrontdeskStationSerializer(serializers.ModelSerializer):
     def create(self, validated_data):
         responsibles = validated_data.pop("responsibles", [])
         request = self.context.get("request")
-        employer_id = request.user.employer_profile.id if request and hasattr(request.user, "employer_profile") else None
-        tenant_db = (
-            get_tenant_database_alias(request.user.employer_profile)
-            if request and hasattr(request.user, "employer_profile")
-            else "default"
-        )
+        employer, tenant_db = resolve_employer_context(request)
+        employer_id = employer.id if employer else None
+        tenant_db = tenant_db or "default"
 
         station_name = validated_data.pop("name", None)
         if not station_name:
@@ -120,7 +133,7 @@ class FrontdeskStationSerializer(serializers.ModelSerializer):
             setattr(instance, attr, value)
 
         request = self.context.get("request")
-        tenant_db = get_tenant_database_alias(request.user.employer_profile) if request and hasattr(request.user, "employer_profile") else None
+        _, tenant_db = resolve_employer_context(request)
         instance.save(using=tenant_db)
 
         if responsibles is not None:
@@ -152,9 +165,8 @@ class StationResponsibleSerializer(serializers.ModelSerializer):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         request = self.context.get("request")
-        if request and hasattr(request.user, "employer_profile"):
-            employer = request.user.employer_profile
-            tenant_db = get_tenant_database_alias(employer)
+        employer, tenant_db = resolve_employer_context(request)
+        if employer and tenant_db:
             self.fields["station"].queryset = FrontdeskStation.objects.using(tenant_db).filter(employer_id=employer.id)
             self.fields["employee"].queryset = Employee.objects.using(tenant_db).filter(
                 employer_id=employer.id, employment_status="ACTIVE"
@@ -164,7 +176,8 @@ class StationResponsibleSerializer(serializers.ModelSerializer):
         station = attrs.get("station") or getattr(self.instance, "station", None)
         employee = attrs.get("employee") or getattr(self.instance, "employee", None)
         request = self.context.get("request")
-        employer_id = request.user.employer_profile.id if request and hasattr(request.user, "employer_profile") else None
+        employer, _ = resolve_employer_context(request)
+        employer_id = employer.id if employer else None
 
         errors = {}
         if station and employer_id and station.employer_id != employer_id:
@@ -180,20 +193,13 @@ class StationResponsibleSerializer(serializers.ModelSerializer):
 
     def create(self, validated_data):
         request = self.context.get("request")
-        tenant_db = (
-            get_tenant_database_alias(request.user.employer_profile)
-            if request and hasattr(request.user, "employer_profile")
-            else "default"
-        )
+        _, tenant_db = resolve_employer_context(request)
+        tenant_db = tenant_db or "default"
         return StationResponsible.objects.using(tenant_db).create(**validated_data)
 
     def update(self, instance, validated_data):
         request = self.context.get("request")
-        tenant_db = (
-            get_tenant_database_alias(request.user.employer_profile)
-            if request and hasattr(request.user, "employer_profile")
-            else None
-        )
+        _, tenant_db = resolve_employer_context(request)
         for attr, value in validated_data.items():
             setattr(instance, attr, value)
         instance.save(using=tenant_db)
@@ -220,17 +226,14 @@ class VisitorSerializer(serializers.ModelSerializer):
 
     def create(self, validated_data):
         request = self.context.get("request")
-        employer_id = request.user.employer_profile.id if request and hasattr(request.user, "employer_profile") else None
-        tenant_db = (
-            get_tenant_database_alias(request.user.employer_profile)
-            if request and hasattr(request.user, "employer_profile")
-            else "default"
-        )
+        employer, tenant_db = resolve_employer_context(request)
+        employer_id = employer.id if employer else None
+        tenant_db = tenant_db or "default"
         return Visitor.objects.using(tenant_db).create(employer_id=employer_id, **validated_data)
 
     def update(self, instance, validated_data):
         request = self.context.get("request")
-        tenant_db = get_tenant_database_alias(request.user.employer_profile) if request and hasattr(request.user, "employer_profile") else None
+        _, tenant_db = resolve_employer_context(request)
         for attr, value in validated_data.items():
             setattr(instance, attr, value)
         instance.save(using=tenant_db)
@@ -289,9 +292,8 @@ class VisitSerializer(serializers.ModelSerializer):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         request = self.context.get("request")
-        if request and hasattr(request.user, "employer_profile"):
-            employer = request.user.employer_profile
-            tenant_db = get_tenant_database_alias(employer)
+        employer, tenant_db = resolve_employer_context(request)
+        if employer and tenant_db:
             self.fields["branch"].queryset = Branch.objects.using(tenant_db).filter(employer_id=employer.id)
             self.fields["station"].queryset = FrontdeskStation.objects.using(tenant_db).filter(employer_id=employer.id)
             self.fields["visitor"].queryset = Visitor.objects.using(tenant_db).filter(employer_id=employer.id)
@@ -307,7 +309,8 @@ class VisitSerializer(serializers.ModelSerializer):
         visit_type = attrs.get("visit_type") or getattr(self.instance, "visit_type", None)
         status = attrs.get("status") or getattr(self.instance, "status", None)
         request = self.context.get("request")
-        employer_id = request.user.employer_profile.id if request and hasattr(request.user, "employer_profile") else None
+        employer, _ = resolve_employer_context(request)
+        employer_id = employer.id if employer else None
 
         if branch and station and branch.id != station.branch_id:
             raise serializers.ValidationError({"station": "Station must belong to the selected branch."})
@@ -329,12 +332,9 @@ class VisitSerializer(serializers.ModelSerializer):
 
     def create(self, validated_data):
         request = self.context.get("request")
-        employer_id = request.user.employer_profile.id if request and hasattr(request.user, "employer_profile") else None
-        tenant_db = (
-            get_tenant_database_alias(request.user.employer_profile)
-            if request and hasattr(request.user, "employer_profile")
-            else "default"
-        )
+        employer, tenant_db = resolve_employer_context(request)
+        employer_id = employer.id if employer else None
+        tenant_db = tenant_db or "default"
 
         status = validated_data.get("status")
         if status == "CHECKED_IN" and not validated_data.get("check_in_time"):
@@ -345,7 +345,7 @@ class VisitSerializer(serializers.ModelSerializer):
 
     def update(self, instance, validated_data):
         request = self.context.get("request")
-        tenant_db = get_tenant_database_alias(request.user.employer_profile) if request and hasattr(request.user, "employer_profile") else None
+        _, tenant_db = resolve_employer_context(request)
         status = validated_data.get("status", instance.status)
 
         for attr, value in validated_data.items():

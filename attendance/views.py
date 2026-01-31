@@ -11,7 +11,12 @@ from accounts.notifications import create_notification
 from accounts.models import EmployerProfile
 from django.contrib.auth import get_user_model
 from accounts.database_utils import get_tenant_database_alias
-from accounts.permissions import IsAuthenticated, IsEmployer
+from accounts.permissions import (
+    IsAuthenticated,
+    EmployerAccessPermission,
+    EmployerOrEmployeeAccessPermission,
+)
+from accounts.rbac import get_active_employer, is_delegate_user, get_delegate_scope, apply_scope_filter
 from employees.models import Employee
 User = get_user_model()
 
@@ -61,10 +66,29 @@ def _employee_from_request(request, tenant_db=None) -> Employee:
     if hasattr(request.user, "employee_profile") and request.user.employee_profile:
         return request.user.employee_profile
     employee_id = request.data.get("employee_id") or request.query_params.get("employee_id")
-    if hasattr(request.user, "employer_profile") and employee_id:
-        employer = request.user.employer_profile
-        db_alias = tenant_db or get_tenant_database_alias(employer)
-        return Employee.objects.using(db_alias).filter(id=employee_id, employer_id=employer.id).first()
+    if employee_id:
+        employer = None
+        if getattr(request.user, "employer_profile", None):
+            employer = request.user.employer_profile
+        else:
+            resolved = get_active_employer(request, require_context=False)
+            if resolved and (request.user.is_admin or request.user.is_superuser or is_delegate_user(request.user, resolved.id)):
+                employer = resolved
+        if employer:
+            db_alias = tenant_db or get_tenant_database_alias(employer)
+            employee = Employee.objects.using(db_alias).filter(id=employee_id, employer_id=employer.id).first()
+            if employee and is_delegate_user(request.user, employer.id):
+                scope = get_delegate_scope(request.user, employer.id)
+                scoped = apply_scope_filter(
+                    Employee.objects.using(db_alias).filter(id=employee.id),
+                    scope,
+                    branch_field="branch_id",
+                    department_field="department_id",
+                    self_field="id",
+                )
+                if not scoped.exists():
+                    return None
+            return employee
     return None
 
 
@@ -118,24 +142,17 @@ def _send_attendance_notifications(
 class AttendanceConfigurationViewSet(viewsets.ModelViewSet):
     """Tenant-scoped attendance configuration."""
 
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticated, EmployerAccessPermission]
+    permission_map = {"*": ["attendance.manage"]}
     serializer_class = AttendanceConfigurationSerializer
 
     def get_queryset(self):
-        user = self.request.user
-        if hasattr(user, "employer_profile"):
-            tenant_db = get_tenant_database_alias(user.employer_profile)
-            return AttendanceConfiguration.objects.using(tenant_db).filter(employer_id=user.employer_profile.id)
-        if hasattr(user, "employee_profile") and user.employee_profile:
-            employee = user.employee_profile
-            tenant_db = employee._state.db or "default"
-            return AttendanceConfiguration.objects.using(tenant_db).filter(employer_id=employee.employer_id)
-        return AttendanceConfiguration.objects.none()
+        employer = get_active_employer(self.request, require_context=True)
+        tenant_db = get_tenant_database_alias(employer)
+        return AttendanceConfiguration.objects.using(tenant_db).filter(employer_id=employer.id)
 
     def perform_create(self, serializer):
-        if not hasattr(self.request.user, "employer_profile"):
-            raise permissions.PermissionDenied("Only employer users can create configurations.")
-        employer = self.request.user.employer_profile
+        employer = get_active_employer(self.request, require_context=True)
         tenant_db = get_tenant_database_alias(employer)
         serializer.save(employer_id=employer.id)
         instance = serializer.instance
@@ -143,9 +160,7 @@ class AttendanceConfigurationViewSet(viewsets.ModelViewSet):
             instance.save(using=tenant_db)
 
     def perform_update(self, serializer):
-        if not hasattr(self.request.user, "employer_profile"):
-            raise permissions.PermissionDenied("Only employer users can update configurations.")
-        employer = self.request.user.employer_profile
+        employer = get_active_employer(self.request, require_context=True)
         tenant_db = get_tenant_database_alias(employer)
         serializer.save()
         instance = serializer.instance
@@ -156,10 +171,11 @@ class AttendanceConfigurationViewSet(viewsets.ModelViewSet):
 class KioskTokenRegenerateView(APIView):
     """Rotate kiosk access token for the employer."""
 
-    permission_classes = [permissions.IsAuthenticated, IsEmployer]
+    permission_classes = [permissions.IsAuthenticated, EmployerAccessPermission]
+    required_permissions = ["attendance.manage"]
 
     def post(self, request):
-        employer = request.user.employer_profile
+        employer = get_active_employer(request, require_context=True)
         tenant_db = get_tenant_database_alias(employer)
         config = ensure_attendance_configuration(employer.id, tenant_db)
         config.kiosk_access_token = uuid.uuid4().hex
@@ -175,72 +191,101 @@ class KioskTokenRegenerateView(APIView):
 class AttendanceLocationSiteViewSet(viewsets.ModelViewSet):
     """Manage allowed geofence sites."""
 
-    permission_classes = [IsAuthenticated, IsEmployer]
+    permission_classes = [IsAuthenticated, EmployerAccessPermission]
+    permission_map = {"*": ["attendance.manage"]}
     serializer_class = AttendanceLocationSiteSerializer
 
     def get_queryset(self):
-        employer = self.request.user.employer_profile
+        employer = get_active_employer(self.request, require_context=True)
         tenant_db = get_tenant_database_alias(employer)
-        return AttendanceLocationSite.objects.using(tenant_db).filter(employer_id=employer.id)
+        qs = AttendanceLocationSite.objects.using(tenant_db).filter(employer_id=employer.id)
+        if is_delegate_user(self.request.user, employer.id):
+            scope = get_delegate_scope(self.request.user, employer.id)
+            qs = apply_scope_filter(qs, scope, branch_field="branch_id")
+        return qs
 
     def perform_create(self, serializer):
-        employer = self.request.user.employer_profile
+        employer = get_active_employer(self.request, require_context=True)
         tenant_db = get_tenant_database_alias(employer)
+        if is_delegate_user(self.request.user, employer.id):
+            branch = serializer.validated_data.get("branch")
+            if branch and str(branch.id) not in get_delegate_scope(self.request.user, employer.id).get("branch_ids", set()):
+                raise permissions.PermissionDenied("You do not have access to this branch.")
         instance = AttendanceLocationSite.objects.using(tenant_db).create(
             employer_id=employer.id, **serializer.validated_data
         )
         serializer.instance = instance
 
     def perform_destroy(self, instance):
-        tenant_db = get_tenant_database_alias(self.request.user.employer_profile)
+        employer = get_active_employer(self.request, require_context=True)
+        tenant_db = get_tenant_database_alias(employer)
         instance.delete(using=tenant_db)
 
 
 class AttendanceAllowedWifiViewSet(viewsets.ModelViewSet):
     """Manage allowed Wi-Fi networks."""
 
-    permission_classes = [IsAuthenticated, IsEmployer]
+    permission_classes = [IsAuthenticated, EmployerAccessPermission]
+    permission_map = {"*": ["attendance.manage"]}
     serializer_class = AttendanceAllowedWifiSerializer
 
     def get_queryset(self):
-        employer = self.request.user.employer_profile
+        employer = get_active_employer(self.request, require_context=True)
         tenant_db = get_tenant_database_alias(employer)
-        return AttendanceAllowedWifi.objects.using(tenant_db).filter(employer_id=employer.id)
+        qs = AttendanceAllowedWifi.objects.using(tenant_db).filter(employer_id=employer.id)
+        if is_delegate_user(self.request.user, employer.id):
+            scope = get_delegate_scope(self.request.user, employer.id)
+            qs = apply_scope_filter(qs, scope, branch_field="branch_id")
+        return qs
 
     def perform_create(self, serializer):
-        employer = self.request.user.employer_profile
+        employer = get_active_employer(self.request, require_context=True)
         tenant_db = get_tenant_database_alias(employer)
+        if is_delegate_user(self.request.user, employer.id):
+            branch = serializer.validated_data.get("branch")
+            if branch and str(branch.id) not in get_delegate_scope(self.request.user, employer.id).get("branch_ids", set()):
+                raise permissions.PermissionDenied("You do not have access to this branch.")
         instance = AttendanceAllowedWifi.objects.using(tenant_db).create(
             employer_id=employer.id, **serializer.validated_data
         )
         serializer.instance = instance
 
     def perform_destroy(self, instance):
-        tenant_db = get_tenant_database_alias(self.request.user.employer_profile)
+        employer = get_active_employer(self.request, require_context=True)
+        tenant_db = get_tenant_database_alias(employer)
         instance.delete(using=tenant_db)
 
 
 class AttendanceKioskStationViewSet(viewsets.ModelViewSet):
     """Manage branch-scoped kiosk stations."""
 
-    permission_classes = [IsAuthenticated, IsEmployer]
+    permission_classes = [IsAuthenticated, EmployerAccessPermission]
+    permission_map = {"*": ["attendance.manage"]}
     serializer_class = AttendanceKioskStationSerializer
 
     def get_queryset(self):
-        employer = self.request.user.employer_profile
+        employer = get_active_employer(self.request, require_context=True)
         tenant_db = get_tenant_database_alias(employer)
-        return AttendanceKioskStation.objects.using(tenant_db).filter(employer_id=employer.id)
+        qs = AttendanceKioskStation.objects.using(tenant_db).filter(employer_id=employer.id)
+        if is_delegate_user(self.request.user, employer.id):
+            scope = get_delegate_scope(self.request.user, employer.id)
+            qs = apply_scope_filter(qs, scope, branch_field="branch_id")
+        return qs
 
     def perform_create(self, serializer):
-        employer = self.request.user.employer_profile
+        employer = get_active_employer(self.request, require_context=True)
         tenant_db = get_tenant_database_alias(employer)
+        if is_delegate_user(self.request.user, employer.id):
+            branch = serializer.validated_data.get("branch")
+            if branch and str(branch.id) not in get_delegate_scope(self.request.user, employer.id).get("branch_ids", set()):
+                raise permissions.PermissionDenied("You do not have access to this branch.")
         instance = AttendanceKioskStation.objects.using(tenant_db).create(
             employer_id=employer.id, **serializer.validated_data
         )
         serializer.instance = instance
 
     def perform_update(self, serializer):
-        employer = self.request.user.employer_profile
+        employer = get_active_employer(self.request, require_context=True)
         tenant_db = get_tenant_database_alias(employer)
         serializer.save()
         instance = serializer.instance
@@ -248,23 +293,25 @@ class AttendanceKioskStationViewSet(viewsets.ModelViewSet):
             instance.save(using=tenant_db)
 
     def perform_destroy(self, instance):
-        tenant_db = get_tenant_database_alias(self.request.user.employer_profile)
+        employer = get_active_employer(self.request, require_context=True)
+        tenant_db = get_tenant_database_alias(employer)
         instance.delete(using=tenant_db)
 
 
 class WorkingScheduleViewSet(viewsets.ModelViewSet):
     """Manage working schedules and their day rules."""
 
-    permission_classes = [IsAuthenticated, IsEmployer]
+    permission_classes = [IsAuthenticated, EmployerAccessPermission]
+    permission_map = {"*": ["attendance.manage"]}
     serializer_class = WorkingScheduleSerializer
 
     def get_queryset(self):
-        employer = self.request.user.employer_profile
+        employer = get_active_employer(self.request, require_context=True)
         tenant_db = get_tenant_database_alias(employer)
         return WorkingSchedule.objects.using(tenant_db).filter(employer_id=employer.id)
 
     def perform_create(self, serializer):
-        employer = self.request.user.employer_profile
+        employer = get_active_employer(self.request, require_context=True)
         tenant_db = get_tenant_database_alias(employer)
         serializer.save(employer_id=employer.id)
         instance = serializer.instance
@@ -272,7 +319,7 @@ class WorkingScheduleViewSet(viewsets.ModelViewSet):
             instance.save(using=tenant_db)
 
     def perform_update(self, serializer):
-        employer = self.request.user.employer_profile
+        employer = get_active_employer(self.request, require_context=True)
         tenant_db = get_tenant_database_alias(employer)
         serializer.save()
         instance = serializer.instance
@@ -280,11 +327,12 @@ class WorkingScheduleViewSet(viewsets.ModelViewSet):
             instance.save(using=tenant_db)
 
     def perform_destroy(self, instance):
-        tenant_db = get_tenant_database_alias(self.request.user.employer_profile)
+        employer = get_active_employer(self.request, require_context=True)
+        tenant_db = get_tenant_database_alias(employer)
         instance.delete(using=tenant_db)
 
     def _get_schedule(self):
-        employer = self.request.user.employer_profile
+        employer = get_active_employer(self.request, require_context=True)
         tenant_db = get_tenant_database_alias(employer)
         try:
             return WorkingSchedule.objects.using(tenant_db).get(id=self.kwargs.get("pk"), employer_id=employer.id)
@@ -294,7 +342,7 @@ class WorkingScheduleViewSet(viewsets.ModelViewSet):
     @action(detail=True, methods=["get", "post"], url_path="days")
     def days(self, request, pk=None):
         schedule = self._get_schedule()
-        tenant_db = get_tenant_database_alias(request.user.employer_profile)
+        tenant_db = get_tenant_database_alias(get_active_employer(request, require_context=True))
 
         if request.method.lower() == "get":
             qs = WorkingScheduleDay.objects.using(tenant_db).filter(schedule=schedule)
@@ -321,7 +369,7 @@ class WorkingScheduleViewSet(viewsets.ModelViewSet):
     @action(detail=True, methods=["get", "patch", "delete"], url_path="days/(?P<day_id>[^/.]+)")
     def day_detail(self, request, pk=None, day_id=None):
         schedule = self._get_schedule()
-        tenant_db = get_tenant_database_alias(request.user.employer_profile)
+        tenant_db = get_tenant_database_alias(get_active_employer(request, require_context=True))
         try:
             day = WorkingScheduleDay.objects.using(tenant_db).get(id=day_id, schedule=schedule)
         except WorkingScheduleDay.DoesNotExist:
@@ -352,7 +400,8 @@ class WorkingScheduleViewSet(viewsets.ModelViewSet):
 class AttendanceRecordViewSet(viewsets.ReadOnlyModelViewSet):
     """List and approve attendance records."""
 
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticated, EmployerOrEmployeeAccessPermission]
+    permission_map = {"*": ["attendance.manage"]}
     serializer_class = AttendanceRecordSerializer
 
     def get_queryset(self):
@@ -364,9 +413,26 @@ class AttendanceRecordViewSet(viewsets.ReadOnlyModelViewSet):
         date_from = params.get("from")
         date_to = params.get("to")
 
-        if hasattr(user, "employer_profile"):
-            tenant_db = get_tenant_database_alias(user.employer_profile)
-            qs = AttendanceRecord.objects.using(tenant_db).filter(employer_id=user.employer_profile.id)
+        employer = None
+        if getattr(user, "employer_profile", None):
+            employer = user.employer_profile
+        else:
+            resolved = get_active_employer(self.request, require_context=False)
+            if resolved and (user.is_admin or user.is_superuser or is_delegate_user(user, resolved.id)):
+                employer = resolved
+
+        if employer:
+            tenant_db = get_tenant_database_alias(employer)
+            qs = AttendanceRecord.objects.using(tenant_db).filter(employer_id=employer.id)
+            if is_delegate_user(user, employer.id):
+                scope = get_delegate_scope(user, employer.id)
+                qs = apply_scope_filter(
+                    qs,
+                    scope,
+                    branch_field="employee__branch_id",
+                    department_field="employee__department_id",
+                    self_field="employee_id",
+                )
         elif hasattr(user, "employee_profile") and user.employee_profile:
             employee = user.employee_profile
             tenant_db = employee._state.db or "default"
@@ -376,7 +442,7 @@ class AttendanceRecordViewSet(viewsets.ReadOnlyModelViewSet):
 
         if status_param:
             qs = qs.filter(status=status_param)
-        if employee_id and hasattr(user, "employer_profile"):
+        if employee_id and employer:
             qs = qs.filter(employee_id=employee_id)
         if mode:
             qs = qs.filter(mode=mode)
@@ -386,17 +452,26 @@ class AttendanceRecordViewSet(viewsets.ReadOnlyModelViewSet):
             qs = qs.filter(check_in_at__date__lte=date_to)
         return qs
 
-    @action(detail=False, methods=["get"], url_path="to-approve", permission_classes=[IsAuthenticated, IsEmployer])
+    @action(detail=False, methods=["get"], url_path="to-approve", permission_classes=[IsAuthenticated, EmployerAccessPermission])
     def to_approve(self, request):
-        employer = request.user.employer_profile
+        employer = get_active_employer(request, require_context=True)
         tenant_db = get_tenant_database_alias(employer)
         qs = AttendanceRecord.objects.using(tenant_db).filter(
             employer_id=employer.id, status=AttendanceRecord.STATUS_TO_APPROVE
         )
+        if is_delegate_user(request.user, employer.id):
+            scope = get_delegate_scope(request.user, employer.id)
+            qs = apply_scope_filter(
+                qs,
+                scope,
+                branch_field="employee__branch_id",
+                department_field="employee__department_id",
+                self_field="employee_id",
+            )
         serializer = self.get_serializer(qs, many=True)
         return Response(serializer.data)
 
-    @action(detail=True, methods=["post"], url_path="approve", permission_classes=[IsAuthenticated, IsEmployer])
+    @action(detail=True, methods=["post"], url_path="approve", permission_classes=[IsAuthenticated, EmployerAccessPermission])
     def approve(self, request, pk=None):
         record = self.get_object()
         tenant_db = record._state.db or "default"
@@ -404,7 +479,7 @@ class AttendanceRecordViewSet(viewsets.ReadOnlyModelViewSet):
         record.save(using=tenant_db, update_fields=["status", "updated_at"])
         return Response(self.get_serializer(record).data)
 
-    @action(detail=True, methods=["post"], url_path="refuse", permission_classes=[IsAuthenticated, IsEmployer])
+    @action(detail=True, methods=["post"], url_path="refuse", permission_classes=[IsAuthenticated, EmployerAccessPermission])
     def refuse(self, request, pk=None):
         record = self.get_object()
         tenant_db = record._state.db or "default"
@@ -417,7 +492,7 @@ class AttendanceRecordViewSet(viewsets.ReadOnlyModelViewSet):
         detail=True,
         methods=["post"],
         url_path="partial-approve",
-        permission_classes=[IsAuthenticated, IsEmployer],
+        permission_classes=[IsAuthenticated, EmployerAccessPermission],
     )
     def partial_approve(self, request, pk=None):
         record = self.get_object()
@@ -627,18 +702,30 @@ class AttendanceStatusView(APIView):
 
 
 class ManualAttendanceCreateView(APIView):
-    permission_classes = [permissions.IsAuthenticated, IsEmployer]
+    permission_classes = [permissions.IsAuthenticated, EmployerAccessPermission]
+    required_permissions = ["attendance.manage"]
 
     def post(self, request):
         serializer = AttendanceManualCreateSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
-        employer = request.user.employer_profile
+        employer = get_active_employer(request, require_context=True)
         tenant_db = get_tenant_database_alias(employer)
         data = serializer.validated_data
 
         employee = Employee.objects.using(tenant_db).filter(id=data["employee_id"], employer_id=employer.id).first()
         if not employee:
             return Response({"detail": "Employee not found."}, status=status.HTTP_404_NOT_FOUND)
+        if is_delegate_user(request.user, employer.id):
+            scope = get_delegate_scope(request.user, employer.id)
+            scoped = apply_scope_filter(
+                Employee.objects.using(tenant_db).filter(id=employee.id),
+                scope,
+                branch_field="branch_id",
+                department_field="department_id",
+                self_field="id",
+            )
+            if not scoped.exists():
+                return Response({"detail": "Employee not found."}, status=status.HTTP_404_NOT_FOUND)
         if not employee.is_active:
             return Response({"detail": "Employee is not active."}, status=status.HTTP_400_BAD_REQUEST)
 
@@ -693,17 +780,34 @@ class ManualAttendanceCreateView(APIView):
 
 
 class AttendanceReportView(APIView):
-    permission_classes = [permissions.IsAuthenticated]
+    permission_classes = [permissions.IsAuthenticated, EmployerOrEmployeeAccessPermission]
+    required_permissions = ["attendance.manage"]
 
     def get(self, request):
         serializer = AttendanceReportQuerySerializer(data=request.query_params)
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
 
-        if hasattr(request.user, "employer_profile"):
+        employer = None
+        if getattr(request.user, "employer_profile", None):
             employer = request.user.employer_profile
+        else:
+            resolved = get_active_employer(request, require_context=False)
+            if resolved and (request.user.is_admin or request.user.is_superuser or is_delegate_user(request.user, resolved.id)):
+                employer = resolved
+
+        if employer:
             tenant_db = get_tenant_database_alias(employer)
             qs = AttendanceRecord.objects.using(tenant_db).filter(employer_id=employer.id)
+            if is_delegate_user(request.user, employer.id):
+                scope = get_delegate_scope(request.user, employer.id)
+                qs = apply_scope_filter(
+                    qs,
+                    scope,
+                    branch_field="employee__branch_id",
+                    department_field="employee__department_id",
+                    self_field="employee_id",
+                )
         elif hasattr(request.user, "employee_profile") and request.user.employee_profile:
             employee = request.user.employee_profile
             tenant_db = employee._state.db or "default"

@@ -3,6 +3,7 @@ from django.db import models
 from django.utils import timezone
 from datetime import timedelta
 import secrets
+import uuid
 
 
 class CustomUserManager(BaseUserManager):
@@ -41,6 +42,7 @@ class User(AbstractUser):
     is_admin = models.BooleanField(default=False, help_text='Designates whether the user is a super admin')
     is_employer = models.BooleanField(default=False, help_text='Designates whether the user is an employer')
     is_employee = models.BooleanField(default=False, help_text='Designates whether the user is an employee')
+    is_employer_owner = models.BooleanField(default=False, help_text='Designates whether the user is the employer owner')
     profile_completed = models.BooleanField(default=False, help_text='Designates whether the user has completed their profile')
     two_factor_enabled = models.BooleanField(default=False, help_text='Designates whether 2FA is enabled')
     two_factor_secret = models.CharField(max_length=32, blank=True, null=True, help_text='TOTP secret for 2FA')
@@ -348,3 +350,234 @@ class EmployeeRegistry(models.Model):
 
     def __str__(self):
         return f"{self.first_name} {self.last_name} - {self.user.email}"
+
+
+class Permission(models.Model):
+    """RBAC permission definition (global catalog)."""
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    code = models.CharField(max_length=200, unique=True)
+    module = models.CharField(max_length=50, db_index=True)
+    resource = models.CharField(max_length=50)
+    action = models.CharField(max_length=50)
+    scope = models.CharField(max_length=50)
+    description = models.TextField(blank=True, null=True)
+    is_active = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "rbac_permissions"
+        verbose_name = "Permission"
+        verbose_name_plural = "Permissions"
+        ordering = ["module", "resource", "action", "scope"]
+
+    def __str__(self):
+        return self.code
+
+
+class Role(models.Model):
+    """Employer-scoped RBAC role."""
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    employer = models.ForeignKey(
+        EmployerProfile, on_delete=models.CASCADE, related_name="roles"
+    )
+    name = models.CharField(max_length=100)
+    description = models.TextField(blank=True, null=True)
+    is_system_role = models.BooleanField(
+        default=False, help_text="Template/system role indicator"
+    )
+    is_active = models.BooleanField(default=True)
+    allow_high_risk_combination = models.BooleanField(
+        default=False,
+        help_text="Allow payroll input + treasury release combinations (owner only).",
+    )
+    created_by = models.ForeignKey(
+        User,
+        on_delete=models.SET_NULL,
+        related_name="roles_created",
+        blank=True,
+        null=True,
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "rbac_roles"
+        verbose_name = "Role"
+        verbose_name_plural = "Roles"
+        unique_together = ("employer", "name")
+        indexes = [
+            models.Index(fields=["employer", "is_active"]),
+        ]
+
+    def __str__(self):
+        return f"{self.name} ({self.employer_id})"
+
+
+class RolePermission(models.Model):
+    """Join table between Role and Permission."""
+
+    role = models.ForeignKey(Role, on_delete=models.CASCADE, related_name="role_permissions")
+    permission = models.ForeignKey(
+        Permission, on_delete=models.CASCADE, related_name="role_permissions"
+    )
+
+    class Meta:
+        db_table = "rbac_role_permissions"
+        verbose_name = "Role Permission"
+        verbose_name_plural = "Role Permissions"
+        unique_together = ("role", "permission")
+        indexes = [
+            models.Index(fields=["role", "permission"]),
+        ]
+
+    def __str__(self):
+        return f"{self.role_id}:{self.permission_id}"
+
+
+class EmployeeRole(models.Model):
+    """Role assignment for an employee/user within an employer."""
+
+    SCOPE_COMPANY = "COMPANY"
+    SCOPE_BRANCH = "BRANCH"
+    SCOPE_DEPARTMENT = "DEPARTMENT"
+    SCOPE_SELF = "SELF"
+
+    SCOPE_CHOICES = [
+        (SCOPE_COMPANY, "Company"),
+        (SCOPE_BRANCH, "Branch"),
+        (SCOPE_DEPARTMENT, "Department"),
+        (SCOPE_SELF, "Self"),
+    ]
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    employer = models.ForeignKey(
+        EmployerProfile, on_delete=models.CASCADE, related_name="employee_roles"
+    )
+    role = models.ForeignKey(Role, on_delete=models.CASCADE, related_name="employee_roles")
+    user = models.ForeignKey(
+        User,
+        on_delete=models.SET_NULL,
+        related_name="employee_roles",
+        blank=True,
+        null=True,
+    )
+    employee_id = models.CharField(
+        max_length=64,
+        db_index=True,
+        help_text="Employee PK inside the employer tenant database (supports UUIDs)",
+    )
+    scope_type = models.CharField(
+        max_length=20, choices=SCOPE_CHOICES, default=SCOPE_COMPANY
+    )
+    scope_id = models.CharField(
+        max_length=64,
+        blank=True,
+        null=True,
+        help_text="Optional branch/department scope identifier (UUID as string).",
+    )
+    assigned_by = models.ForeignKey(
+        User,
+        on_delete=models.SET_NULL,
+        related_name="roles_assigned",
+        blank=True,
+        null=True,
+    )
+    assigned_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = "rbac_employee_roles"
+        verbose_name = "Employee Role"
+        verbose_name_plural = "Employee Roles"
+        unique_together = ("employer", "employee_id", "role", "scope_type", "scope_id")
+        indexes = [
+            models.Index(fields=["employer", "employee_id"]),
+            models.Index(fields=["user", "employer"]),
+        ]
+
+    def __str__(self):
+        return f"{self.employee_id} -> {self.role.name}"
+
+
+class UserPermissionOverride(models.Model):
+    """Per-user permission overrides (allow/deny)."""
+
+    EFFECT_ALLOW = "ALLOW"
+    EFFECT_DENY = "DENY"
+    EFFECT_CHOICES = [
+        (EFFECT_ALLOW, "Allow"),
+        (EFFECT_DENY, "Deny"),
+    ]
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    employer = models.ForeignKey(
+        EmployerProfile, on_delete=models.CASCADE, related_name="permission_overrides"
+    )
+    user = models.ForeignKey(
+        User, on_delete=models.CASCADE, related_name="permission_overrides"
+    )
+    permission = models.ForeignKey(
+        Permission, on_delete=models.CASCADE, related_name="user_overrides"
+    )
+    effect = models.CharField(max_length=10, choices=EFFECT_CHOICES)
+    reason = models.TextField(blank=True, null=True)
+    created_by = models.ForeignKey(
+        User,
+        on_delete=models.SET_NULL,
+        related_name="permission_overrides_created",
+        blank=True,
+        null=True,
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "rbac_user_permission_overrides"
+        verbose_name = "User Permission Override"
+        verbose_name_plural = "User Permission Overrides"
+        unique_together = ("employer", "user", "permission")
+        indexes = [
+            models.Index(fields=["employer", "user"]),
+        ]
+
+    def __str__(self):
+        return f"{self.user_id}:{self.permission.code}:{self.effect}"
+
+
+class AuditLog(models.Model):
+    """RBAC audit log entries."""
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    action = models.CharField(max_length=100)
+    entity_type = models.CharField(max_length=50)
+    entity_id = models.CharField(max_length=64)
+    meta_old = models.TextField(blank=True, null=True)
+    meta_new = models.TextField(blank=True, null=True)
+    ip_address = models.GenericIPAddressField(blank=True, null=True)
+    user_agent = models.TextField(blank=True, null=True)
+    actor = models.ForeignKey(
+        User, on_delete=models.SET_NULL, related_name="audit_actions", blank=True, null=True
+    )
+    employer = models.ForeignKey(
+        EmployerProfile,
+        on_delete=models.SET_NULL,
+        related_name="audit_logs",
+        blank=True,
+        null=True,
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = "rbac_audit_logs"
+        verbose_name = "Audit Log"
+        verbose_name_plural = "Audit Logs"
+        ordering = ["-created_at"]
+        indexes = [
+            models.Index(fields=["employer", "created_at"]),
+            models.Index(fields=["action"]),
+        ]
+
+    def __str__(self):
+        return f"{self.action} {self.entity_type}:{self.entity_id}"

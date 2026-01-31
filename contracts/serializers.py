@@ -5,6 +5,7 @@ from .models import (
     ContractConfiguration, SalaryScale
 )
 from timeoff.defaults import merge_time_off_defaults, validate_time_off_config
+from accounts.rbac import get_active_employer, is_delegate_user
 from .configuration_defaults import CONFIGURATION_MERGE_FUNCTIONS
 
 class AllowanceSerializer(serializers.ModelSerializer):
@@ -52,11 +53,19 @@ class ContractSerializer(serializers.ModelSerializer):
         instance = self.instance
         is_list_instance = isinstance(instance, (list, tuple))
 
-        if request and hasattr(request, 'user') and hasattr(request.user, 'employer_profile'):
+        if request and hasattr(request, 'user'):
             from accounts.database_utils import get_tenant_database_alias
             from employees.models import Employee, Branch, Department
-            
-            tenant_db = get_tenant_database_alias(request.user.employer_profile)
+            employer = None
+            if getattr(request.user, 'employer_profile', None):
+                employer = request.user.employer_profile
+            else:
+                resolved = get_active_employer(request, require_context=False)
+                if resolved and is_delegate_user(request.user, resolved.id):
+                    employer = resolved
+
+            if employer:
+                tenant_db = get_tenant_database_alias(employer)
             
             # Set dynamic querysets for tenant-aware relational fields
             if 'employee' in self.fields:
@@ -83,10 +92,18 @@ class ContractSerializer(serializers.ModelSerializer):
         employer_id = None
         tenant_db = 'default'
 
-        if request and hasattr(request, 'user') and hasattr(request.user, 'employer_profile'):
+        if request and hasattr(request, 'user'):
             from accounts.database_utils import get_tenant_database_alias
-            employer_id = request.user.employer_profile.id
-            tenant_db = get_tenant_database_alias(request.user.employer_profile)
+            employer = None
+            if getattr(request.user, 'employer_profile', None):
+                employer = request.user.employer_profile
+            else:
+                resolved = get_active_employer(request, require_context=False)
+                if resolved and is_delegate_user(request.user, resolved.id):
+                    employer = resolved
+            if employer:
+                employer_id = employer.id
+                tenant_db = get_tenant_database_alias(employer)
         elif self.instance:
             employer_id = getattr(self.instance, 'employer_id', None)
             tenant_db = self.instance._state.db or 'default'
@@ -248,23 +265,31 @@ class ContractSerializer(serializers.ModelSerializer):
         
         # Set tenant and user context automatically
         request = self.context.get('request')
-        if request and hasattr(request, 'user') and hasattr(request.user, 'employer_profile'):
+        if request and hasattr(request, 'user'):
             from accounts.database_utils import get_tenant_database_alias
-            
-            validated_data['employer_id'] = request.user.employer_profile.id
-            validated_data['created_by'] = request.user.id
-            
-            tenant_db = get_tenant_database_alias(request.user.employer_profile)
-            contract = Contract.objects.using(tenant_db).create(**validated_data)
-            
-            # Create nested objects
-            for allowance_data in allowances_data:
-                Allowance.objects.using(tenant_db).create(contract=contract, **allowance_data)
+            employer = None
+            if getattr(request.user, 'employer_profile', None):
+                employer = request.user.employer_profile
+            else:
+                resolved = get_active_employer(request, require_context=False)
+                if resolved and is_delegate_user(request.user, resolved.id):
+                    employer = resolved
+
+            if employer:
+                validated_data['employer_id'] = employer.id
+                validated_data['created_by'] = request.user.id
                 
-            for deduction_data in deductions_data:
-                Deduction.objects.using(tenant_db).create(contract=contract, **deduction_data)
-                
-            return contract
+                tenant_db = get_tenant_database_alias(employer)
+                contract = Contract.objects.using(tenant_db).create(**validated_data)
+            
+                # Create nested objects
+                for allowance_data in allowances_data:
+                    Allowance.objects.using(tenant_db).create(contract=contract, **allowance_data)
+                    
+                for deduction_data in deductions_data:
+                    Deduction.objects.using(tenant_db).create(contract=contract, **deduction_data)
+                    
+                return contract
             
         return super().create(validated_data)
 
@@ -275,9 +300,17 @@ class ContractSerializer(serializers.ModelSerializer):
         # Get tenant DB
         request = self.context.get('request')
         tenant_db = 'default'
-        if request and hasattr(request, 'user') and hasattr(request.user, 'employer_profile'):
-             from accounts.database_utils import get_tenant_database_alias
-             tenant_db = get_tenant_database_alias(request.user.employer_profile)
+        if request and hasattr(request, 'user'):
+            from accounts.database_utils import get_tenant_database_alias
+            employer = None
+            if getattr(request.user, 'employer_profile', None):
+                employer = request.user.employer_profile
+            else:
+                resolved = get_active_employer(request, require_context=False)
+                if resolved and is_delegate_user(request.user, resolved.id):
+                    employer = resolved
+            if employer:
+                tenant_db = get_tenant_database_alias(employer)
 
         # Update contract fields
         for attr, value in validated_data.items():

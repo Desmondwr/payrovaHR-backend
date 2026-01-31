@@ -6,6 +6,7 @@ from django.utils import timezone
 from rest_framework.exceptions import PermissionDenied, ValidationError
 
 from accounts.models import EmployerProfile
+from accounts.rbac import get_active_employer, is_delegate_user
 
 from .models import (
     BankAccount,
@@ -23,8 +24,12 @@ def resolve_institution(request):
     if not user or not user.is_authenticated:
         raise PermissionDenied("Authentication required.")
 
-    if hasattr(user, "employer_profile"):
+    if getattr(user, "employer_profile", None):
         return user.employer_profile
+
+    resolved = get_active_employer(request, require_context=False)
+    if resolved and (user.is_admin or user.is_superuser or is_delegate_user(user, resolved.id)):
+        return resolved
 
     employee = getattr(user, "employee_profile", None)
     if employee and getattr(employee, "employer_id", None):

@@ -6,7 +6,8 @@ from rest_framework.decorators import action
 from rest_framework.response import Response
 
 from accounts.database_utils import get_tenant_database_alias
-from accounts.permissions import IsEmployer
+from accounts.permissions import EmployerAccessPermission, EmployerOrEmployeeAccessPermission
+from accounts.rbac import get_active_employer, is_delegate_user, get_delegate_scope, apply_scope_filter
 from accounts.notifications import create_notification
 from accounts.models import EmployerProfile
 from employees.models import Employee
@@ -57,14 +58,22 @@ class TimeOffConfigurationViewSet(viewsets.ModelViewSet):
     Manage tenant-specific Time Off configuration (global + leave types).
     """
 
-    permission_classes = [permissions.IsAuthenticated]
+    permission_classes = [permissions.IsAuthenticated, EmployerOrEmployeeAccessPermission]
+    permission_map = {"*": ["timeoff.manage"]}
     serializer_class = TimeOffConfigurationSerializer
 
     def get_queryset(self):
         user = self.request.user
-        if hasattr(user, "employer_profile"):
-            tenant_db = get_tenant_database_alias(user.employer_profile)
-            return TimeOffConfiguration.objects.using(tenant_db).filter(employer_id=user.employer_profile.id)
+        employer = None
+        if getattr(user, "employer_profile", None):
+            employer = user.employer_profile
+        else:
+            resolved = get_active_employer(self.request, require_context=False)
+            if resolved and (user.is_admin or user.is_superuser or is_delegate_user(user, resolved.id)):
+                employer = resolved
+        if employer:
+            tenant_db = get_tenant_database_alias(employer)
+            return TimeOffConfiguration.objects.using(tenant_db).filter(employer_id=employer.id)
         if hasattr(user, "employee_profile") and user.employee_profile:
             employee = user.employee_profile
             tenant_db = employee._state.db or "default"
@@ -72,12 +81,19 @@ class TimeOffConfigurationViewSet(viewsets.ModelViewSet):
         return TimeOffConfiguration.objects.none()
 
     def perform_create(self, serializer):
-        if not hasattr(self.request.user, "employer_profile"):
+        employer = get_active_employer(self.request, require_context=True)
+        user = self.request.user
+        if not (
+            getattr(user, "employer_profile", None)
+            or user.is_admin
+            or user.is_superuser
+            or is_delegate_user(user, employer.id)
+        ):
             raise permissions.PermissionDenied("Only employers can create configurations.")
-        tenant_db = get_tenant_database_alias(self.request.user.employer_profile)
+        tenant_db = get_tenant_database_alias(employer)
         serializer.save(
-            employer_id=self.request.user.employer_profile.id,
-            tenant_id=self.request.user.employer_profile.id,
+            employer_id=employer.id,
+            tenant_id=employer.id,
             schema_version=2,
         )
         instance = serializer.instance
@@ -86,9 +102,16 @@ class TimeOffConfigurationViewSet(viewsets.ModelViewSet):
         ensure_timeoff_configuration(instance.employer_id, tenant_db)
 
     def perform_update(self, serializer):
-        if not hasattr(self.request.user, "employer_profile"):
+        employer = get_active_employer(self.request, require_context=True)
+        user = self.request.user
+        if not (
+            getattr(user, "employer_profile", None)
+            or user.is_admin
+            or user.is_superuser
+            or is_delegate_user(user, employer.id)
+        ):
             raise permissions.PermissionDenied("Only employers can update configurations.")
-        tenant_db = get_tenant_database_alias(self.request.user.employer_profile)
+        tenant_db = get_tenant_database_alias(employer)
         serializer.save()
         instance = serializer.instance
         if instance._state.db != tenant_db:
@@ -102,8 +125,15 @@ class TimeOffConfigurationViewSet(viewsets.ModelViewSet):
         Creates a default record if missing.
         """
 
-        if hasattr(request.user, "employer_profile"):
+        employer = None
+        if getattr(request.user, "employer_profile", None):
             employer = request.user.employer_profile
+        else:
+            resolved = get_active_employer(request, require_context=False)
+            if resolved and (request.user.is_admin or request.user.is_superuser or is_delegate_user(request.user, resolved.id)):
+                employer = resolved
+
+        if employer:
             tenant_db = get_tenant_database_alias(employer)
             employer_id = employer.id
         elif hasattr(request.user, "employee_profile") and request.user.employee_profile:
@@ -116,7 +146,13 @@ class TimeOffConfigurationViewSet(viewsets.ModelViewSet):
         config = ensure_timeoff_configuration(employer_id, tenant_db)
 
         if request.method == "PATCH":
-            if not hasattr(request.user, "employer_profile"):
+            user = request.user
+            if not employer or not (
+                getattr(user, "employer_profile", None)
+                or user.is_admin
+                or user.is_superuser
+                or is_delegate_user(user, employer.id)
+            ):
                 raise permissions.PermissionDenied("Only employers can update configurations.")
             serializer = self.get_serializer(config, data=request.data, partial=True)
             serializer.is_valid(raise_exception=True)
@@ -132,15 +168,23 @@ class TimeOffTypeViewSet(viewsets.ModelViewSet):
     CRUD for leave types stored in the new normalized table.
     """
 
-    permission_classes = [permissions.IsAuthenticated]
+    permission_classes = [permissions.IsAuthenticated, EmployerOrEmployeeAccessPermission]
+    permission_map = {"*": ["timeoff.manage"]}
     serializer_class = TimeOffTypeSerializer
 
     def get_queryset(self):
         user = self.request.user
-        if hasattr(user, "employer_profile"):
-            tenant_db = get_tenant_database_alias(user.employer_profile)
-            ensure_timeoff_configuration(user.employer_profile.id, tenant_db)
-            return TimeOffType.objects.using(tenant_db).filter(employer_id=user.employer_profile.id)
+        employer = None
+        if getattr(user, "employer_profile", None):
+            employer = user.employer_profile
+        else:
+            resolved = get_active_employer(self.request, require_context=False)
+            if resolved and (user.is_admin or user.is_superuser or is_delegate_user(user, resolved.id)):
+                employer = resolved
+        if employer:
+            tenant_db = get_tenant_database_alias(employer)
+            ensure_timeoff_configuration(employer.id, tenant_db)
+            return TimeOffType.objects.using(tenant_db).filter(employer_id=employer.id)
         if hasattr(user, "employee_profile") and user.employee_profile:
             employee = user.employee_profile
             tenant_db = employee._state.db or "default"
@@ -149,18 +193,32 @@ class TimeOffTypeViewSet(viewsets.ModelViewSet):
         return TimeOffType.objects.none()
 
     def perform_create(self, serializer):
-        if not hasattr(self.request.user, "employer_profile"):
+        employer = get_active_employer(self.request, require_context=True)
+        user = self.request.user
+        if not (
+            getattr(user, "employer_profile", None)
+            or user.is_admin
+            or user.is_superuser
+            or is_delegate_user(user, employer.id)
+        ):
             raise permissions.PermissionDenied("Only employers can create leave types.")
-        tenant_db = get_tenant_database_alias(self.request.user.employer_profile)
+        tenant_db = get_tenant_database_alias(employer)
         serializer.save()
         instance = serializer.instance
         if instance._state.db != tenant_db:
             instance.save(using=tenant_db)
 
     def perform_update(self, serializer):
-        if not hasattr(self.request.user, "employer_profile"):
+        employer = get_active_employer(self.request, require_context=True)
+        user = self.request.user
+        if not (
+            getattr(user, "employer_profile", None)
+            or user.is_admin
+            or user.is_superuser
+            or is_delegate_user(user, employer.id)
+        ):
             raise permissions.PermissionDenied("Only employers can update leave types.")
-        tenant_db = get_tenant_database_alias(self.request.user.employer_profile)
+        tenant_db = get_tenant_database_alias(employer)
         serializer.save()
         instance = serializer.instance
         if instance._state.db != tenant_db:
@@ -172,7 +230,8 @@ class TimeOffRequestViewSet(viewsets.ModelViewSet):
     CRUD + workflows for time off requests (tenant-aware).
     """
 
-    permission_classes = [permissions.IsAuthenticated]
+    permission_classes = [permissions.IsAuthenticated, EmployerOrEmployeeAccessPermission]
+    permission_map = {"*": ["timeoff.manage"]}
 
     def get_serializer_class(self):
         if self.action in ["create", "update", "partial_update"]:
@@ -183,8 +242,15 @@ class TimeOffRequestViewSet(viewsets.ModelViewSet):
         context = super().get_serializer_context()
         user = self.request.user
         tenant_db = "default"
-        if hasattr(user, "employer_profile"):
-            tenant_db = get_tenant_database_alias(user.employer_profile)
+        employer = None
+        if getattr(user, "employer_profile", None):
+            employer = user.employer_profile
+        else:
+            resolved = get_active_employer(self.request, require_context=False)
+            if resolved and (user.is_admin or user.is_superuser or is_delegate_user(user, resolved.id)):
+                employer = resolved
+        if employer:
+            tenant_db = get_tenant_database_alias(employer)
         elif hasattr(user, "employee_profile") and user.employee_profile:
             tenant_db = user.employee_profile._state.db or "default"
         context["tenant_db"] = tenant_db
@@ -204,7 +270,13 @@ class TimeOffRequestViewSet(viewsets.ModelViewSet):
                 employer_profile=employer_profile,
                 data={"request_id": str(req_obj.id), "status": req_obj.status},
             )
-        if hasattr(self.request.user, "employer_profile"):
+        employer_context = get_active_employer(self.request, require_context=False)
+        if employer_context and (
+            getattr(self.request.user, "employer_profile", None)
+            or self.request.user.is_admin
+            or self.request.user.is_superuser
+            or is_delegate_user(self.request.user, employer_context.id)
+        ):
             create_notification(
                 user=self.request.user,
                 title="New time-off request",
@@ -224,9 +296,26 @@ class TimeOffRequestViewSet(viewsets.ModelViewSet):
         employee_id = params.get("employee_id")
         scope = params.get("scope")
 
-        if hasattr(user, "employer_profile"):
-            tenant_db = get_tenant_database_alias(user.employer_profile)
-            qs = TimeOffRequest.objects.using(tenant_db).filter(employer_id=user.employer_profile.id)
+        employer = None
+        if getattr(user, "employer_profile", None):
+            employer = user.employer_profile
+        else:
+            resolved = get_active_employer(self.request, require_context=False)
+            if resolved and (user.is_admin or user.is_superuser or is_delegate_user(user, resolved.id)):
+                employer = resolved
+
+        if employer:
+            tenant_db = get_tenant_database_alias(employer)
+            qs = TimeOffRequest.objects.using(tenant_db).filter(employer_id=employer.id)
+            if is_delegate_user(user, employer.id):
+                scope_data = get_delegate_scope(user, employer.id)
+                qs = apply_scope_filter(
+                    qs,
+                    scope_data,
+                    branch_field="employee__branch_id",
+                    department_field="employee__department_id",
+                    self_field="employee_id",
+                )
         elif hasattr(user, "employee_profile") and user.employee_profile:
             employee = user.employee_profile
             tenant_db = employee._state.db or "default"
@@ -240,7 +329,7 @@ class TimeOffRequestViewSet(viewsets.ModelViewSet):
             qs = qs.filter(status=status_param)
         if leave_type_param:
             qs = qs.filter(leave_type_code=leave_type_param)
-        if employee_id and hasattr(user, "employer_profile"):
+        if employee_id and employer:
             qs = qs.filter(employee_id=employee_id)
         if date_from:
             qs = qs.filter(start_at__date__gte=date_from)
@@ -295,10 +384,8 @@ class TimeOffRequestViewSet(viewsets.ModelViewSet):
         serializer = TimeOffRequestSerializer(req_obj, context=self.get_serializer_context())
         return Response(serializer.data)
 
-    @action(detail=True, methods=["post"], url_path="approve")
+    @action(detail=True, methods=["post"], url_path="approve", permission_classes=[permissions.IsAuthenticated, EmployerAccessPermission])
     def approve(self, request, pk=None):
-        if not hasattr(request.user, "employer_profile"):
-            return Response({"detail": "Only employer users can approve requests."}, status=status.HTTP_403_FORBIDDEN)
         req_obj = self.get_object()
         if req_obj.status == "APPROVED":
             serializer = TimeOffRequestSerializer(req_obj, context=self.get_serializer_context())
@@ -327,10 +414,8 @@ class TimeOffRequestViewSet(viewsets.ModelViewSet):
             )
         return Response(serializer.data)
 
-    @action(detail=True, methods=["post"], url_path="reject")
+    @action(detail=True, methods=["post"], url_path="reject", permission_classes=[permissions.IsAuthenticated, EmployerAccessPermission])
     def reject(self, request, pk=None):
-        if not hasattr(request.user, "employer_profile"):
-            return Response({"detail": "Only employer users can reject requests."}, status=status.HTTP_403_FORBIDDEN)
         req_obj = self.get_object()
         reservation_policy, _, tenant_db = self._get_policies(req_obj)
         apply_rejection_or_cancellation_transitions(
@@ -379,7 +464,8 @@ class TimeOffBalanceViewSet(viewsets.ViewSet):
     Read-only balances per leave type for an employee.
     """
 
-    permission_classes = [permissions.IsAuthenticated]
+    permission_classes = [permissions.IsAuthenticated, EmployerOrEmployeeAccessPermission]
+    required_permissions = ["timeoff.manage"]
 
     def _get_context(self, request):
         user = request.user
@@ -387,15 +473,34 @@ class TimeOffBalanceViewSet(viewsets.ViewSet):
         tenant_db = "default"
         employer_id = None
 
-        # Employer admin: allow employee_id param
-        if hasattr(user, "employer_profile"):
-            employer_id = user.employer_profile.id
-            tenant_db = get_tenant_database_alias(user.employer_profile)
+        # Employer admin/delegate: allow employee_id param
+        employer = None
+        if getattr(user, "employer_profile", None):
+            employer = user.employer_profile
+        else:
+            resolved = get_active_employer(request, require_context=False)
+            if resolved and (user.is_admin or user.is_superuser or is_delegate_user(user, resolved.id)):
+                employer = resolved
+
+        if employer:
+            employer_id = employer.id
+            tenant_db = get_tenant_database_alias(employer)
             employee_id = request.query_params.get("employee_id")
             if employee_id:
                 employee = Employee.objects.using(tenant_db).filter(id=employee_id).first()
             else:
                 raise permissions.PermissionDenied("employee_id is required for employer balance lookup.")
+            if employee and is_delegate_user(user, employer.id):
+                scope = get_delegate_scope(user, employer.id)
+                scoped = apply_scope_filter(
+                    Employee.objects.using(tenant_db).filter(id=employee.id),
+                    scope,
+                    branch_field="branch_id",
+                    department_field="department_id",
+                    self_field="id",
+                )
+                if not scoped.exists():
+                    raise permissions.PermissionDenied("Unable to resolve employee for balance lookup.")
         elif hasattr(user, "employee_profile") and user.employee_profile:
             employee = user.employee_profile
             tenant_db = employee._state.db or "default"
@@ -441,16 +546,24 @@ class TimeOffLedgerViewSet(viewsets.ReadOnlyModelViewSet):
     Read-only ledger entries with filters for audit/admin.
     """
 
-    permission_classes = [permissions.IsAuthenticated]
+    permission_classes = [permissions.IsAuthenticated, EmployerOrEmployeeAccessPermission]
+    required_permissions = ["timeoff.manage"]
     serializer_class = TimeOffLedgerEntrySerializer
 
     def get_queryset(self):
         user = self.request.user
         tenant_db = "default"
         employer_id = None
-        if hasattr(user, "employer_profile"):
-            employer_id = user.employer_profile.id
-            tenant_db = get_tenant_database_alias(user.employer_profile)
+        employer = None
+        if getattr(user, "employer_profile", None):
+            employer = user.employer_profile
+        else:
+            resolved = get_active_employer(self.request, require_context=False)
+            if resolved and (user.is_admin or user.is_superuser or is_delegate_user(user, resolved.id)):
+                employer = resolved
+        if employer:
+            employer_id = employer.id
+            tenant_db = get_tenant_database_alias(employer)
         elif hasattr(user, "employee_profile") and user.employee_profile:
             employee = user.employee_profile
             employer_id = employee.employer_id
@@ -459,6 +572,15 @@ class TimeOffLedgerViewSet(viewsets.ReadOnlyModelViewSet):
             return TimeOffLedgerEntry.objects.none()
 
         qs = TimeOffLedgerEntry.objects.using(tenant_db).filter(employer_id=employer_id)
+        if employer and is_delegate_user(user, employer.id):
+            scope = get_delegate_scope(user, employer.id)
+            qs = apply_scope_filter(
+                qs,
+                scope,
+                branch_field="employee__branch_id",
+                department_field="employee__department_id",
+                self_field="employee_id",
+            )
 
         params = self.request.query_params
         employee_id = params.get("employee_id")
@@ -485,7 +607,8 @@ class TimeOffLedgerViewSet(viewsets.ReadOnlyModelViewSet):
 
 
 class TimeOffAllocationViewSet(viewsets.ModelViewSet):
-    permission_classes = [permissions.IsAuthenticated, IsEmployer]
+    permission_classes = [permissions.IsAuthenticated, EmployerAccessPermission]
+    permission_map = {"*": ["timeoff.manage"]}
 
     def get_serializer_class(self):
         if self.action in ["create"]:
@@ -496,10 +619,27 @@ class TimeOffAllocationViewSet(viewsets.ModelViewSet):
 
     def get_queryset(self):
         user = self.request.user
-        if not hasattr(user, "employer_profile"):
+        employer = None
+        if getattr(user, "employer_profile", None):
+            employer = user.employer_profile
+        else:
+            resolved = get_active_employer(self.request, require_context=False)
+            if resolved and (user.is_admin or user.is_superuser or is_delegate_user(user, resolved.id)):
+                employer = resolved
+        if not employer:
             return TimeOffAllocation.objects.none()
-        tenant_db = get_tenant_database_alias(user.employer_profile)
-        return TimeOffAllocation.objects.using(tenant_db).filter(employer_id=user.employer_profile.id)
+        tenant_db = get_tenant_database_alias(employer)
+        qs = TimeOffAllocation.objects.using(tenant_db).filter(employer_id=employer.id)
+        if is_delegate_user(user, employer.id):
+            scope = get_delegate_scope(user, employer.id)
+            qs = apply_scope_filter(
+                qs,
+                scope,
+                branch_field="lines__employee__branch_id",
+                department_field="lines__employee__department_id",
+                self_field="lines__employee_id",
+            )
+        return qs
 
     def perform_create(self, serializer):
         allocation = serializer.save()
@@ -563,24 +703,40 @@ class TimeOffAllocationViewSet(viewsets.ModelViewSet):
 
 
 class TimeOffAllocationRequestViewSet(viewsets.ModelViewSet):
-    permission_classes = [permissions.IsAuthenticated]
+    permission_classes = [permissions.IsAuthenticated, EmployerOrEmployeeAccessPermission]
+    permission_map = {"*": ["timeoff.manage"]}
     serializer_class = TimeOffAllocationRequestSerializer
 
     def get_queryset(self):
         user = self.request.user
-        if hasattr(user, "employer_profile"):
-            tenant_db = get_tenant_database_alias(user.employer_profile)
-            return TimeOffAllocationRequest.objects.using(tenant_db).filter(employer_id=user.employer_profile.id)
+        employer = None
+        if getattr(user, "employer_profile", None):
+            employer = user.employer_profile
+        else:
+            resolved = get_active_employer(self.request, require_context=False)
+            if resolved and (user.is_admin or user.is_superuser or is_delegate_user(user, resolved.id)):
+                employer = resolved
+        if employer:
+            tenant_db = get_tenant_database_alias(employer)
+            qs = TimeOffAllocationRequest.objects.using(tenant_db).filter(employer_id=employer.id)
+            if is_delegate_user(user, employer.id):
+                scope = get_delegate_scope(user, employer.id)
+                qs = apply_scope_filter(
+                    qs,
+                    scope,
+                    branch_field="employee__branch_id",
+                    department_field="employee__department_id",
+                    self_field="employee_id",
+                )
+            return qs
         if hasattr(user, "employee_profile") and user.employee_profile:
             employee = user.employee_profile
             tenant_db = employee._state.db or "default"
             return TimeOffAllocationRequest.objects.using(tenant_db).filter(employee=employee)
         return TimeOffAllocationRequest.objects.none()
 
-    @action(detail=True, methods=["post"], url_path="approve")
+    @action(detail=True, methods=["post"], url_path="approve", permission_classes=[permissions.IsAuthenticated, EmployerAccessPermission])
     def approve(self, request, pk=None):
-        if not hasattr(request.user, "employer_profile"):
-            return Response({"detail": "Only employer users can approve allocation requests."}, status=status.HTTP_403_FORBIDDEN)
         req = self.get_object()
         if req.status != "PENDING":
             serializer = self.get_serializer(req)
@@ -624,10 +780,8 @@ class TimeOffAllocationRequestViewSet(viewsets.ModelViewSet):
         serializer = self.get_serializer(req)
         return Response(serializer.data)
 
-    @action(detail=True, methods=["post"], url_path="reject")
+    @action(detail=True, methods=["post"], url_path="reject", permission_classes=[permissions.IsAuthenticated, EmployerAccessPermission])
     def reject(self, request, pk=None):
-        if not hasattr(request.user, "employer_profile"):
-            return Response({"detail": "Only employer users can reject allocation requests."}, status=status.HTTP_403_FORBIDDEN)
         req = self.get_object()
         if req.status != "PENDING":
             serializer = self.get_serializer(req)
@@ -656,12 +810,14 @@ class TimeOffAllocationRequestViewSet(viewsets.ModelViewSet):
 
 
 class AccrualRunViewSet(viewsets.ViewSet):
-    permission_classes = [permissions.IsAuthenticated, IsEmployer]
+    permission_classes = [permissions.IsAuthenticated, EmployerAccessPermission]
+    required_permissions = ["timeoff.manage"]
 
     def create(self, request):
         run_date_param = request.data.get("run_date")
         upto = date.fromisoformat(run_date_param) if run_date_param else date.today()
-        tenant_db = get_tenant_database_alias(request.user.employer_profile)
+        employer = get_active_employer(request, require_context=True)
+        tenant_db = get_tenant_database_alias(employer)
         run_accruals_for_subscriptions(
             upto_date=upto,
             created_by=request.user.id,

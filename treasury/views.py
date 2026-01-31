@@ -13,7 +13,8 @@ from rest_framework.views import APIView
 
 from accounts.database_utils import get_tenant_database_alias
 from accounts.notifications import create_notification
-from accounts.permissions import IsAuthenticated, IsEmployer
+from accounts.permissions import IsAuthenticated, EmployerAccessPermission
+from accounts.rbac import get_active_employer, is_delegate_user
 from accounts.utils import api_response
 
 from .models import (
@@ -98,7 +99,8 @@ def _update_batch_reconciliation_status(batch, tenant_db):
 
 
 class TreasuryConfigurationView(APIView):
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticated, EmployerAccessPermission]
+    required_permissions = ["treasury.manage"]
 
     def get(self, request):
         institution = resolve_institution(request)
@@ -108,13 +110,6 @@ class TreasuryConfigurationView(APIView):
         return api_response(success=True, message="Treasury config retrieved.", data=serializer.data)
 
     def put(self, request):
-        if not hasattr(request.user, "employer_profile"):
-            return api_response(
-                success=False,
-                message="Only employers can update configurations.",
-                status=status.HTTP_403_FORBIDDEN,
-            )
-
         institution = resolve_institution(request)
         tenant_db = get_tenant_database_alias(institution)
         config = ensure_treasury_configuration(institution, tenant_db=tenant_db)
@@ -125,7 +120,8 @@ class TreasuryConfigurationView(APIView):
 
 
 class TreasuryReferencePreviewView(APIView):
-    permission_classes = [IsAuthenticated]
+    permission_classes = [IsAuthenticated, EmployerAccessPermission]
+    required_permissions = ["treasury.manage"]
 
     def get(self, request):
         reference_type = request.query_params.get("type")
@@ -153,7 +149,8 @@ class TreasuryReferencePreviewView(APIView):
 
 
 class TreasuryTenantViewSet(viewsets.ModelViewSet):
-    permission_classes = [IsAuthenticated, IsEmployer]
+    permission_classes = [IsAuthenticated, EmployerAccessPermission]
+    permission_map = {"*": ["treasury.manage"]}
 
     def get_serializer_context(self):
         context = super().get_serializer_context()
@@ -163,9 +160,16 @@ class TreasuryTenantViewSet(viewsets.ModelViewSet):
         return context
 
     def _resolve_employer(self):
-        if not hasattr(self.request.user, "employer_profile"):
+        user = self.request.user
+        employer = None
+        if getattr(user, "employer_profile", None):
+            employer = user.employer_profile
+        else:
+            resolved = get_active_employer(self.request, require_context=False)
+            if resolved and (user.is_admin or user.is_superuser or is_delegate_user(user, resolved.id)):
+                employer = resolved
+        if not employer:
             return None, None
-        employer = self.request.user.employer_profile
         tenant_db = get_tenant_database_alias(employer)
         return employer, tenant_db
 
@@ -1006,15 +1010,14 @@ class BankStatementViewSet(TreasuryTenantViewSet):
 
 
 class ReconciliationAutoMatchView(APIView):
-    permission_classes = [IsAuthenticated, IsEmployer]
+    permission_classes = [IsAuthenticated, EmployerAccessPermission]
+    required_permissions = ["treasury.manage"]
 
     def get(self, request, statement_id=None):
         return self.post(request, statement_id=statement_id)
 
     def post(self, request, statement_id=None):
-        if not hasattr(request.user, "employer_profile"):
-            raise PermissionDenied("Employer context required.")
-        employer = request.user.employer_profile
+        employer = get_active_employer(request, require_context=True)
         tenant_db = get_tenant_database_alias(employer)
         config = ensure_treasury_configuration(employer, tenant_db=tenant_db)
         enforce_reconciliation_enabled(config)
@@ -1164,12 +1167,11 @@ class ReconciliationAutoMatchView(APIView):
 
 
 class ReconciliationConfirmView(APIView):
-    permission_classes = [IsAuthenticated, IsEmployer]
+    permission_classes = [IsAuthenticated, EmployerAccessPermission]
+    required_permissions = ["treasury.manage"]
 
     def post(self, request):
-        if not hasattr(request.user, "employer_profile"):
-            raise PermissionDenied("Employer context required.")
-        employer = request.user.employer_profile
+        employer = get_active_employer(request, require_context=True)
         tenant_db = get_tenant_database_alias(employer)
         config = ensure_treasury_configuration(employer, tenant_db=tenant_db)
         enforce_reconciliation_enabled(config)
@@ -1218,12 +1220,11 @@ class ReconciliationConfirmView(APIView):
 
 
 class ReconciliationRejectView(APIView):
-    permission_classes = [IsAuthenticated, IsEmployer]
+    permission_classes = [IsAuthenticated, EmployerAccessPermission]
+    required_permissions = ["treasury.manage"]
 
     def post(self, request):
-        if not hasattr(request.user, "employer_profile"):
-            raise PermissionDenied("Employer context required.")
-        employer = request.user.employer_profile
+        employer = get_active_employer(request, require_context=True)
         tenant_db = get_tenant_database_alias(employer)
         config = ensure_treasury_configuration(employer, tenant_db=tenant_db)
         enforce_reconciliation_enabled(config)

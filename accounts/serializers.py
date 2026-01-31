@@ -3,7 +3,18 @@ from django.contrib.auth import authenticate
 from django.contrib.auth.password_validation import validate_password
 from django.utils import timezone
 
-from .models import User, ActivationToken, EmployerProfile, EmployeeRegistry, EmployeeMembership
+from .models import (
+    User,
+    ActivationToken,
+    EmployerProfile,
+    EmployeeRegistry,
+    EmployeeMembership,
+    Permission,
+    Role,
+    RolePermission,
+    EmployeeRole,
+    UserPermissionOverride,
+)
 
 
 
@@ -27,6 +38,8 @@ class EmployerProfileSerializer(serializers.ModelSerializer):
         profile = EmployerProfile.objects.create(user=user, **validated_data)
         # Mark profile as completed
         user.profile_completed = True
+        if not user.is_employer_owner:
+            user.is_employer_owner = True
         user.save()
         return profile
     def update(self, instance, validated_data):
@@ -36,7 +49,9 @@ class EmployerProfileSerializer(serializers.ModelSerializer):
         # Ensure profile is marked as completed
         if not instance.user.profile_completed:
             instance.user.profile_completed = True
-            instance.user.save()
+        if not instance.user.is_employer_owner:
+            instance.user.is_employer_owner = True
+        instance.user.save()
         return instance
 
 class EmployerListSerializer(serializers.ModelSerializer):
@@ -200,6 +215,8 @@ class EmployerProfileSerializer(serializers.ModelSerializer):
         
         # Mark profile as completed
         user.profile_completed = True
+        if not user.is_employer_owner:
+            user.is_employer_owner = True
         user.save()
         
         return profile
@@ -212,7 +229,9 @@ class EmployerProfileSerializer(serializers.ModelSerializer):
         # Ensure profile is marked as completed
         if not instance.user.profile_completed:
             instance.user.profile_completed = True
-            instance.user.save()
+        if not instance.user.is_employer_owner:
+            instance.user.is_employer_owner = True
+        instance.user.save()
         
         return instance
 
@@ -396,3 +415,109 @@ class SetActiveEmployerSerializer(serializers.Serializer):
         user.last_active_employer_id = employer_id
         user.save(update_fields=['last_active_employer_id'])
         return user
+
+
+class PermissionSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Permission
+        fields = (
+            "id",
+            "code",
+            "module",
+            "resource",
+            "action",
+            "scope",
+            "description",
+            "is_active",
+        )
+        read_only_fields = ("id",)
+
+
+class RoleSerializer(serializers.ModelSerializer):
+    permissions = serializers.ListField(
+        child=serializers.CharField(), write_only=True, required=False
+    )
+    permission_codes = serializers.SerializerMethodField(read_only=True)
+
+    class Meta:
+        model = Role
+        fields = (
+            "id",
+            "name",
+            "description",
+            "is_system_role",
+            "is_active",
+            "allow_high_risk_combination",
+            "permission_codes",
+            "permissions",
+        )
+        read_only_fields = ("id", "is_system_role")
+
+    def get_permission_codes(self, obj):
+        return list(
+            obj.role_permissions.values_list("permission__code", flat=True)
+        )
+
+    def _sync_permissions(self, role, codes):
+        if codes is None:
+            return
+        perms = Permission.objects.filter(code__in=codes, is_active=True)
+        RolePermission.objects.filter(role=role).exclude(permission__in=perms).delete()
+        existing = set(
+            RolePermission.objects.filter(role=role, permission__in=perms).values_list(
+                "permission_id", flat=True
+            )
+        )
+        for perm in perms:
+            if perm.id not in existing:
+                RolePermission.objects.create(role=role, permission=perm)
+
+    def create(self, validated_data):
+        codes = validated_data.pop("permissions", None)
+        role = Role.objects.create(**validated_data)
+        self._sync_permissions(role, codes)
+        return role
+
+    def update(self, instance, validated_data):
+        codes = validated_data.pop("permissions", None)
+        for attr, value in validated_data.items():
+            setattr(instance, attr, value)
+        instance.save()
+        self._sync_permissions(instance, codes)
+        return instance
+
+
+class EmployeeRoleSerializer(serializers.ModelSerializer):
+    role_name = serializers.CharField(source="role.name", read_only=True)
+
+    class Meta:
+        model = EmployeeRole
+        fields = (
+            "id",
+            "role",
+            "role_name",
+            "user",
+            "employee_id",
+            "scope_type",
+            "scope_id",
+            "assigned_at",
+            "assigned_by",
+        )
+        read_only_fields = ("id", "assigned_at", "assigned_by")
+
+
+class UserPermissionOverrideSerializer(serializers.ModelSerializer):
+    permission_code = serializers.CharField(source="permission.code", read_only=True)
+
+    class Meta:
+        model = UserPermissionOverride
+        fields = (
+            "id",
+            "user",
+            "permission",
+            "permission_code",
+            "effect",
+            "reason",
+            "created_at",
+        )
+        read_only_fields = ("id", "created_at")

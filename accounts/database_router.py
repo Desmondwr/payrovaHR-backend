@@ -20,10 +20,15 @@ class TenantDatabaseRouter:
         'employerprofile',
         'employeeregistry',  # Central employee registry for cross-institutional tracking
         'employeemembership',
+        'permission',
+        'role',
+        'rolepermission',
+        'employeerole',
+        'userpermissionoverride',
+        'auditlog',
         'notification',
         'session',
         'contenttype',
-        'permission',
         'group',
         'logentry',
     ]

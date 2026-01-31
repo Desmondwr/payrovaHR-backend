@@ -1,5 +1,6 @@
-from rest_framework import status, generics, permissions
+from rest_framework import status, generics, permissions, viewsets
 from rest_framework.views import APIView
+from rest_framework.exceptions import PermissionDenied
 from rest_framework.response import Response
 from rest_framework.permissions import IsAdminUser
 from rest_framework_simplejwt.tokens import RefreshToken
@@ -9,19 +10,48 @@ from django.utils.decorators import method_decorator
 from django.core.files.base import ContentFile
 from django.utils import timezone
 from accounts.notifications import create_notification
-from .models import ActivationToken, EmployerProfile, EmployeeRegistry, EmployeeMembership
+from .models import (
+    ActivationToken,
+    EmployerProfile,
+    EmployeeRegistry,
+    EmployeeMembership,
+    Permission,
+    Role,
+    EmployeeRole,
+    UserPermissionOverride,
+)
 from .serializers import (
-    UserSerializer, CreateEmployerSerializer, ActivateAccountSerializer,
-    LoginSerializer, EmployerProfileSerializer, Enable2FASerializer,
-    Disable2FASerializer, EmployeeRegistrySerializer,
-    EmployerListSerializer, SignatureUploadSerializer, EmployeeMembershipSerializer,
-    SetActiveEmployerSerializer
+    UserSerializer,
+    CreateEmployerSerializer,
+    ActivateAccountSerializer,
+    LoginSerializer,
+    EmployerProfileSerializer,
+    Enable2FASerializer,
+    Disable2FASerializer,
+    EmployeeRegistrySerializer,
+    EmployerListSerializer,
+    SignatureUploadSerializer,
+    EmployeeMembershipSerializer,
+    SetActiveEmployerSerializer,
+    PermissionSerializer,
+    RoleSerializer,
+    EmployeeRoleSerializer,
+    UserPermissionOverrideSerializer,
 )
 from .utils import (
     api_response, send_activation_email, generate_totp_secret,
     generate_qr_code, verify_totp_code
 )
 from .database_utils import create_tenant_database
+from .rbac import (
+    get_active_employer,
+    get_effective_permission_codes,
+    get_employee_roles_for_user,
+    get_delegate_scope,
+    is_delegate_user,
+)
+from .rbac_defaults import ensure_default_permissions
+from .permissions import IsEmployerOwner
 import logging
 import base64
 
@@ -207,7 +237,46 @@ class LoginView(APIView):
             if user.is_employee:
                 employee = user.employee_profile
                 if employee:
-                    employee_profile_completed = employee.profile_completed
+                    completion_state = getattr(employee, "profile_completion_state", None)
+                    try:
+                        from employees.utils import check_missing_fields_against_config, get_or_create_employee_config
+                        tenant_db = getattr(getattr(employee, "_state", None), "db", None) or "default"
+                        config = get_or_create_employee_config(employee.employer_id, tenant_db)
+                        validation_result = check_missing_fields_against_config(employee, config)
+                        completion_state = validation_result.get('completion_state') or completion_state
+
+                        if (
+                            employee.profile_completion_state != validation_result.get('completion_state')
+                            or employee.profile_completion_required != validation_result.get('requires_update')
+                            or employee.missing_required_fields != validation_result.get('missing_critical')
+                            or employee.missing_optional_fields != validation_result.get('missing_non_critical')
+                        ):
+                            employee.profile_completion_state = validation_result.get('completion_state')
+                            employee.profile_completion_required = validation_result.get('requires_update')
+                            employee.missing_required_fields = validation_result.get('missing_critical')
+                            employee.missing_optional_fields = validation_result.get('missing_non_critical')
+
+                            if validation_result.get('completion_state') == 'COMPLETE':
+                                employee.profile_completed = True
+                                employee.profile_completed_at = timezone.now()
+                            else:
+                                employee.profile_completed = False
+                                employee.profile_completed_at = None
+
+                            employee.save(using=tenant_db, update_fields=[
+                                'profile_completion_state', 'profile_completion_required',
+                                'missing_required_fields', 'missing_optional_fields',
+                                'profile_completed', 'profile_completed_at'
+                            ])
+                    except Exception:
+                        pass
+
+                    if completion_state == 'INCOMPLETE_BLOCKING':
+                        employee_profile_completed = False
+                    elif completion_state:
+                        employee_profile_completed = True
+                    else:
+                        employee_profile_completed = employee.profile_completed
             
             response_data = {
                 'user': UserSerializer(user).data,
@@ -789,4 +858,143 @@ class SetActiveEmployerView(APIView):
             message='Failed to update active employer.',
             errors=serializer.errors,
             status=status.HTTP_400_BAD_REQUEST,
+        )
+
+
+class PermissionViewSet(viewsets.ReadOnlyModelViewSet):
+    """List available permissions (employer owners/admins)."""
+
+    permission_classes = [permissions.IsAuthenticated, IsEmployerOwner]
+    serializer_class = PermissionSerializer
+
+    def get_queryset(self):
+        ensure_default_permissions()
+        return Permission.objects.filter(is_active=True).order_by("module", "resource", "action", "scope")
+
+
+class RoleViewSet(viewsets.ModelViewSet):
+    """Employer-configured roles."""
+
+    permission_classes = [permissions.IsAuthenticated, IsEmployerOwner]
+    serializer_class = RoleSerializer
+
+    def get_queryset(self):
+        ensure_default_permissions()
+        employer = get_active_employer(self.request, require_context=True)
+        return Role.objects.filter(employer=employer).order_by("name")
+
+    def perform_create(self, serializer):
+        ensure_default_permissions()
+        employer = get_active_employer(self.request, require_context=True)
+        serializer.save(employer=employer, created_by=self.request.user)
+
+    def perform_update(self, serializer):
+        ensure_default_permissions()
+        serializer.save()
+
+
+class EmployeeRoleViewSet(viewsets.ModelViewSet):
+    """Assign roles to employees/users within an employer."""
+
+    permission_classes = [permissions.IsAuthenticated, IsEmployerOwner]
+    serializer_class = EmployeeRoleSerializer
+
+    def get_queryset(self):
+        employer = get_active_employer(self.request, require_context=True)
+        return EmployeeRole.objects.filter(employer=employer).select_related("role", "user")
+
+    def perform_create(self, serializer):
+        employer = get_active_employer(self.request, require_context=True)
+        data = serializer.validated_data
+
+        employee_id = data.get("employee_id")
+        user = data.get("user")
+
+        if employee_id and not user:
+            from accounts.database_utils import get_tenant_database_alias
+            from employees.models import Employee
+
+            tenant_db = get_tenant_database_alias(employer)
+            employee = (
+                Employee.objects.using(tenant_db)
+                .filter(id=employee_id, employer_id=employer.id)
+                .first()
+            )
+            if not employee or not employee.user_id:
+                raise PermissionDenied(
+                    "Employee must be linked to a user account before assigning roles."
+                )
+            user = User.objects.filter(id=employee.user_id).first()
+
+        scope_type = data.get("scope_type")
+        scope_id = data.get("scope_id")
+        if scope_type in ("BRANCH", "DEPARTMENT") and not scope_id:
+            raise PermissionDenied("scope_id is required for branch/department scope.")
+
+        serializer.save(
+            employer=employer,
+            user=user,
+            assigned_by=self.request.user,
+        )
+
+
+class UserPermissionOverrideViewSet(viewsets.ModelViewSet):
+    """Per-user permission overrides."""
+
+    permission_classes = [permissions.IsAuthenticated, IsEmployerOwner]
+    serializer_class = UserPermissionOverrideSerializer
+
+    def get_queryset(self):
+        employer = get_active_employer(self.request, require_context=True)
+        return UserPermissionOverride.objects.filter(employer=employer).select_related("permission", "user")
+
+    def perform_create(self, serializer):
+        employer = get_active_employer(self.request, require_context=True)
+        serializer.save(employer=employer, created_by=self.request.user)
+
+
+class PortalContextView(APIView):
+    """Return available portals, roles, permissions for active employer context."""
+
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get(self, request):
+        ensure_default_permissions()
+        user = request.user
+        employer = get_active_employer(request, require_context=False)
+
+        portals = []
+        if user.is_admin:
+            portals.append("admin")
+        if user.is_employee:
+            portals.append("employee")
+
+        permissions_list = []
+        roles_data = []
+        scope = {}
+        employer_id = None
+        employer_name = None
+
+        if employer:
+            employer_id = employer.id
+            employer_name = employer.company_name
+            permissions_list = get_effective_permission_codes(user, employer.id)
+            roles = get_employee_roles_for_user(user, employer.id).select_related("role")
+            roles_data = EmployeeRoleSerializer(roles, many=True).data
+            if getattr(user, "employer_profile", None):
+                portals.append("employer_owner")
+            elif user.is_employee and roles.exists():
+                portals.append("employer_delegate")
+                scope = get_delegate_scope(user, employer.id)
+
+        return Response(
+            {
+                "employer_id": employer_id,
+                "employer_name": employer_name,
+                "portals": portals,
+                "permissions": permissions_list,
+                "roles": roles_data,
+                "scope": scope,
+                "is_employer_owner": bool(getattr(user, "is_employer_owner", False)),
+            }
         )

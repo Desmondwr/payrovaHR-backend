@@ -1,4 +1,5 @@
-from django.urls import path
+from django.urls import path, include
+from rest_framework.routers import DefaultRouter
 from rest_framework_simplejwt.views import TokenRefreshView
 from .views import (
     CreateEmployerView, ActivateAccountView, LoginView,
@@ -6,10 +7,22 @@ from .views import (
     EmployerProfileView, CompleteEmployerProfileView, UserProfileView,
     ListEmployersView, EmployerStatusView, UserSignatureView,
     RequestPasswordResetView, VerifyResetCodeView, ResendResetCodeView,
-    ChangePasswordView, MyEmployersView, SetActiveEmployerView
+    ChangePasswordView, MyEmployersView, SetActiveEmployerView,
+    PermissionViewSet, RoleViewSet, EmployeeRoleViewSet, UserPermissionOverrideViewSet,
+    PortalContextView
 )
 
 app_name = 'accounts'
+
+router = DefaultRouter()
+router.register(r'rbac/permissions', PermissionViewSet, basename='rbac-permissions')
+router.register(r'rbac/roles', RoleViewSet, basename='rbac-roles')
+router.register(r'rbac/employee-roles', EmployeeRoleViewSet, basename='rbac-employee-roles')
+router.register(r'rbac/permission-overrides', UserPermissionOverrideViewSet, basename='rbac-permission-overrides')
+router.register(r'accounts/permissions', PermissionViewSet, basename='legacy-permissions')
+router.register(r'accounts/roles', RoleViewSet, basename='legacy-roles')
+router.register(r'accounts/employee-roles', EmployeeRoleViewSet, basename='legacy-employee-roles')
+router.register(r'accounts/permission-overrides', UserPermissionOverrideViewSet, basename='legacy-permission-overrides')
 
 urlpatterns = [
     # Admin endpoints
@@ -42,5 +55,8 @@ urlpatterns = [
     path('employer/profile/complete/', CompleteEmployerProfileView.as_view(), name='complete-employer-profile'),
     path('accounts/my-employers/', MyEmployersView.as_view(), name='my-employers'),
     path('accounts/set-active-employer/', SetActiveEmployerView.as_view(), name='set-active-employer'),
+    path('accounts/portal-context/', PortalContextView.as_view(), name='portal-context'),
 ]
+
+urlpatterns += router.urls
 

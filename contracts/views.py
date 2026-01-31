@@ -13,7 +13,8 @@ from django.utils import timezone
 from django.core.exceptions import ValidationError
 from accounts.middleware import set_current_tenant_db
 from accounts.models import EmployerProfile, User
-from accounts.permissions import IsEmployer
+from accounts.permissions import EmployerAccessPermission, EmployerOrEmployeeAccessPermission
+from accounts.rbac import get_active_employer, is_delegate_user, get_delegate_scope, apply_scope_filter
 from contracts.management.commands.seed_contract_template import TYPE_BODIES, BASE_BODY
 
 class ContractViewSet(viewsets.ModelViewSet):
@@ -22,7 +23,8 @@ class ContractViewSet(viewsets.ModelViewSet):
     Restricted to the current user's tenant.
     """
     serializer_class = ContractSerializer
-    permission_classes = [permissions.IsAuthenticated]
+    permission_classes = [permissions.IsAuthenticated, EmployerOrEmployeeAccessPermission]
+    permission_map = {"*": ["contracts.manage"]}
 
     def _set_tenant_alias(self, alias):
         """Set tenant context when we already know the DB alias."""
@@ -44,7 +46,11 @@ class ContractViewSet(viewsets.ModelViewSet):
         return db_alias
     def _is_employer_user(self, user, contract):
         """Check if the user is the employer that owns the contract"""
-        return hasattr(user, 'employer_profile') and user.employer_profile.id == contract.employer_id
+        if user.is_admin or user.is_superuser:
+            return True
+        if hasattr(user, 'employer_profile') and user.employer_profile.id == contract.employer_id:
+            return True
+        return is_delegate_user(user, contract.employer_id)
 
     def _get_role(self, user, contract):
         """Determine if user is employer or employee for this contract"""
@@ -75,11 +81,29 @@ class ContractViewSet(viewsets.ModelViewSet):
         user = self.request.user
         
         # 1. Employer Access
-        if user.is_authenticated and hasattr(user, 'employer_profile'):
+        employer = None
+        if user.is_authenticated and getattr(user, 'employer_profile', None):
+            employer = user.employer_profile
+        else:
+            resolved = get_active_employer(self.request, require_context=False)
+            if resolved and (user.is_admin or user.is_superuser or is_delegate_user(user, resolved.id)):
+                employer = resolved
+
+        if employer:
             from accounts.database_utils import get_tenant_database_alias
-            tenant_db = get_tenant_database_alias(user.employer_profile)
+            tenant_db = get_tenant_database_alias(employer)
             self._set_tenant_alias(tenant_db)
-            return Contract.objects.using(tenant_db).filter(employer_id=user.employer_profile.id)
+            qs = Contract.objects.using(tenant_db).filter(employer_id=employer.id)
+            if is_delegate_user(user, employer.id):
+                scope = get_delegate_scope(user, employer.id)
+                qs = apply_scope_filter(
+                    qs,
+                    scope,
+                    branch_field="employee__branch_id",
+                    department_field="employee__department_id",
+                    self_field="employee_id",
+                )
+            return qs
             
         # 2. Employee Access
         if user.is_authenticated and user.employee_profile:
@@ -92,9 +116,15 @@ class ContractViewSet(viewsets.ModelViewSet):
 
     def perform_destroy(self, instance):
         """Delete contract from tenant database"""
-        if hasattr(self.request.user, 'employer_profile'):
+        employer = get_active_employer(self.request, require_context=False)
+        if employer and (
+            getattr(self.request.user, 'employer_profile', None)
+            or self.request.user.is_admin
+            or self.request.user.is_superuser
+            or is_delegate_user(self.request.user, employer.id)
+        ):
             from accounts.database_utils import get_tenant_database_alias
-            tenant_db = get_tenant_database_alias(self.request.user.employer_profile)
+            tenant_db = get_tenant_database_alias(employer)
             instance.delete(using=tenant_db)
         else:
             instance.delete()
@@ -103,7 +133,13 @@ class ContractViewSet(viewsets.ModelViewSet):
     def default_template(self, request):
         """Get or update the default template body for the employer by contract_type (no uploads)."""
         user = request.user
-        if not hasattr(user, 'employer_profile'):
+        employer = get_active_employer(request, require_context=False)
+        if not employer or not (
+            getattr(user, 'employer_profile', None)
+            or user.is_admin
+            or user.is_superuser
+            or is_delegate_user(user, employer.id)
+        ):
             return Response({'error': 'Only employers can manage templates.'}, status=status.HTTP_403_FORBIDDEN)
 
         contract_type = request.query_params.get('contract_type') or request.data.get('contract_type')
@@ -111,11 +147,11 @@ class ContractViewSet(viewsets.ModelViewSet):
             return Response({'error': 'contract_type is required.'}, status=status.HTTP_400_BAD_REQUEST)
 
         from accounts.database_utils import get_tenant_database_alias
-        tenant_db = get_tenant_database_alias(user.employer_profile)
+        tenant_db = get_tenant_database_alias(employer)
 
         template = (
             ContractTemplate.objects.using(tenant_db)
-            .filter(employer_id=user.employer_profile.id, contract_type=contract_type, is_default=True)
+            .filter(employer_id=employer.id, contract_type=contract_type, is_default=True)
             .order_by('-created_at')
             .first()
         )
@@ -480,7 +516,8 @@ class ContractAmendmentViewSet(viewsets.ModelViewSet):
     """
     from .serializers import ContractAmendmentSerializer
     serializer_class = ContractAmendmentSerializer
-    permission_classes = [permissions.IsAuthenticated]
+    permission_classes = [permissions.IsAuthenticated, EmployerAccessPermission]
+    permission_map = {"*": ["contracts.manage"]}
     
     def get_queryset(self):
         user = self.request.user
@@ -491,13 +528,21 @@ class ContractAmendmentViewSet(viewsets.ModelViewSet):
             return ContractAmendment.objects.none()
             
         # Get Tenant DB
-        if user.is_authenticated and hasattr(user, 'employer_profile'):
+        employer = None
+        if user.is_authenticated and getattr(user, 'employer_profile', None):
+            employer = user.employer_profile
+        else:
+            resolved = get_active_employer(self.request, require_context=False)
+            if resolved and (user.is_admin or user.is_superuser or is_delegate_user(user, resolved.id)):
+                employer = resolved
+
+        if employer:
             from accounts.database_utils import get_tenant_database_alias
-            tenant_db = get_tenant_database_alias(user.employer_profile)
+            tenant_db = get_tenant_database_alias(employer)
             
             from .models import ContractAmendment
             qs = ContractAmendment.objects.using(tenant_db).filter(
-                contract__employer_id=user.employer_profile.id,
+                contract__employer_id=employer.id,
                 contract_id=contract_pk
             )
             return qs
@@ -508,15 +553,23 @@ class ContractAmendmentViewSet(viewsets.ModelViewSet):
         contract_pk = self.kwargs.get('contract_pk')
         
         # Get Contract and Tenant DB
-        if hasattr(user, 'employer_profile'):
+        employer = None
+        if getattr(user, 'employer_profile', None):
+            employer = user.employer_profile
+        else:
+            resolved = get_active_employer(self.request, require_context=False)
+            if resolved and (user.is_admin or user.is_superuser or is_delegate_user(user, resolved.id)):
+                employer = resolved
+
+        if employer:
             from accounts.database_utils import get_tenant_database_alias
-            tenant_db = get_tenant_database_alias(user.employer_profile)
+            tenant_db = get_tenant_database_alias(employer)
             
             # Fetch contract
             try:
                 contract = Contract.objects.using(tenant_db).get(
                     id=contract_pk, 
-                    employer_id=user.employer_profile.id
+                    employer_id=employer.id
                 )
             except Contract.DoesNotExist:
                  from rest_framework.exceptions import NotFound
@@ -554,28 +607,38 @@ class ContractConfigurationViewSet(viewsets.ModelViewSet):
     Global config: contract_type is null.
     Type-specific: contract_type is set.
     """
-    permission_classes = [permissions.IsAuthenticated]
+    permission_classes = [permissions.IsAuthenticated, EmployerAccessPermission]
+    permission_map = {"*": ["contracts.manage"]}
     serializer_class = ContractConfigurationSerializer
 
     def get_queryset(self):
         from accounts.database_utils import get_tenant_database_alias
         user = self.request.user
-        if hasattr(user, 'employer_profile'):
-            tenant_db = get_tenant_database_alias(user.employer_profile)
-            return ContractConfiguration.objects.using(tenant_db).filter(employer_id=user.employer_profile.id)
+        employer = None
+        if getattr(user, 'employer_profile', None):
+            employer = user.employer_profile
+        else:
+            resolved = get_active_employer(self.request, require_context=False)
+            if resolved and (user.is_admin or user.is_superuser or is_delegate_user(user, resolved.id)):
+                employer = resolved
+        if employer:
+            tenant_db = get_tenant_database_alias(employer)
+            return ContractConfiguration.objects.using(tenant_db).filter(employer_id=employer.id)
         return ContractConfiguration.objects.none()
 
     def perform_create(self, serializer):
         from accounts.database_utils import get_tenant_database_alias
-        tenant_db = get_tenant_database_alias(self.request.user.employer_profile)
-        serializer.save(employer_id=self.request.user.employer_profile.id)
+        employer = get_active_employer(self.request, require_context=True)
+        tenant_db = get_tenant_database_alias(employer)
+        serializer.save(employer_id=employer.id)
         instance = serializer.instance
         if instance._state.db != tenant_db:
             instance.save(using=tenant_db)
             
     def perform_update(self, serializer):
         from accounts.database_utils import get_tenant_database_alias
-        tenant_db = get_tenant_database_alias(self.request.user.employer_profile)
+        employer = get_active_employer(self.request, require_context=True)
+        tenant_db = get_tenant_database_alias(employer)
         serializer.save()
         instance = serializer.instance
         if instance._state.db != tenant_db:
@@ -585,7 +648,7 @@ class ContractConfigurationViewSet(viewsets.ModelViewSet):
     def global_config(self, request):
         """Helper to get and update the singleton-like global config"""
         from accounts.database_utils import get_tenant_database_alias
-        employer = request.user.employer_profile
+        employer = get_active_employer(request, require_context=True)
         tenant_db = get_tenant_database_alias(employer)
         
         config, created = ContractConfiguration.objects.using(tenant_db).get_or_create(
@@ -615,33 +678,49 @@ class ContractConfigurationViewSet(viewsets.ModelViewSet):
 class SalaryScaleViewSet(viewsets.ModelViewSet):
     """API endpoint for managing salary scales."""
 
-    permission_classes = [IsEmployer]
+    permission_classes = [permissions.IsAuthenticated, EmployerAccessPermission]
+    permission_map = {"*": ["contracts.manage"]}
     serializer_class = SalaryScaleSerializer
 
     def get_serializer_context(self):
         context = super().get_serializer_context()
-        if hasattr(self.request.user, 'employer_profile'):
+        employer = get_active_employer(self.request, require_context=False)
+        if employer and (
+            getattr(self.request.user, 'employer_profile', None)
+            or self.request.user.is_admin
+            or self.request.user.is_superuser
+            or is_delegate_user(self.request.user, employer.id)
+        ):
             from accounts.database_utils import ensure_tenant_database_loaded
-            tenant_db = ensure_tenant_database_loaded(self.request.user.employer_profile)
+            tenant_db = ensure_tenant_database_loaded(employer)
             context['tenant_db'] = tenant_db
         return context
 
     def get_queryset(self):
         from accounts.database_utils import get_tenant_database_alias
         user = self.request.user
-        if hasattr(user, 'employer_profile'):
-            tenant_db = get_tenant_database_alias(user.employer_profile)
-            return SalaryScale.objects.using(tenant_db).filter(employer_id=user.employer_profile.id)
+        employer = None
+        if getattr(user, 'employer_profile', None):
+            employer = user.employer_profile
+        else:
+            resolved = get_active_employer(self.request, require_context=False)
+            if resolved and (user.is_admin or user.is_superuser or is_delegate_user(user, resolved.id)):
+                employer = resolved
+        if employer:
+            tenant_db = get_tenant_database_alias(employer)
+            return SalaryScale.objects.using(tenant_db).filter(employer_id=employer.id)
         return SalaryScale.objects.none()
 
     def perform_create(self, serializer):
-        serializer.save(employer_id=self.request.user.employer_profile.id)
+        employer = get_active_employer(self.request, require_context=True)
+        serializer.save(employer_id=employer.id)
 
     def perform_update(self, serializer):
         serializer.save()
 
     def perform_destroy(self, instance):
         from accounts.database_utils import get_tenant_database_alias
-        tenant_db = get_tenant_database_alias(self.request.user.employer_profile)
+        employer = get_active_employer(self.request, require_context=True)
+        tenant_db = get_tenant_database_alias(employer)
         instance.delete(using=tenant_db)
 

@@ -756,8 +756,9 @@ def check_missing_fields_against_config(employee_data, config):
         
         # Get uploaded document types for this employee
         from employees.models import EmployeeDocument
+        tenant_db = getattr(getattr(employee_data, "_state", None), "db", None) or "default"
         uploaded_doc_types = list(
-            EmployeeDocument.objects.filter(employee=employee_data)
+            EmployeeDocument.objects.using(tenant_db).filter(employee_id=employee_data.id)
             .values_list('document_type', flat=True)
             .distinct()
         )
