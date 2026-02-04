@@ -58,6 +58,7 @@ INSTALLED_APPS = [
     'notifications',
     'treasury.apps.TreasuryConfig',
     'income_expense.apps.IncomeExpenseConfig',
+    'recruitment.apps.RecruitmentConfig',
 ]
 
 MIDDLEWARE = [
@@ -251,7 +252,6 @@ CACHES = {
         }
     }
 }
-
 
 # Security Settings (for production)
 if not DEBUG:

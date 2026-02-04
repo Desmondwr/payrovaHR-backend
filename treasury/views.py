@@ -187,6 +187,16 @@ class TreasuryTenantViewSet(viewsets.ModelViewSet):
 
 
 class BankAccountViewSet(TreasuryTenantViewSet):
+    permission_map = {
+        "list": ["treasury.account.view", "treasury.manage"],
+        "retrieve": ["treasury.account.view", "treasury.manage"],
+        "create": ["treasury.account.create", "treasury.manage"],
+        "update": ["treasury.account.update", "treasury.manage"],
+        "partial_update": ["treasury.account.update", "treasury.manage"],
+        "destroy": ["treasury.account.delete", "treasury.manage"],
+        "withdraw_to_cashdesk": ["treasury.account.withdraw", "treasury.manage"],
+        "*": ["treasury.manage"],
+    }
     serializer_class = BankAccountSerializer
 
     def get_queryset(self):
@@ -285,6 +295,20 @@ class BankAccountViewSet(TreasuryTenantViewSet):
         )
 
 class CashDeskViewSet(TreasuryTenantViewSet):
+    permission_map = {
+        "list": ["treasury.cashdesk.view", "treasury.manage"],
+        "retrieve": ["treasury.cashdesk.view", "treasury.manage"],
+        "create": ["treasury.cashdesk.create", "treasury.manage"],
+        "update": ["treasury.cashdesk.update", "treasury.manage"],
+        "partial_update": ["treasury.cashdesk.update", "treasury.manage"],
+        "destroy": ["treasury.cashdesk.delete", "treasury.manage"],
+        "open_session": ["treasury.cashdesk.open", "treasury.manage"],
+        "close_session": ["treasury.cashdesk.close", "treasury.manage"],
+        "cash_in": ["treasury.cashdesk.cash_in", "treasury.manage"],
+        "cash_out": ["treasury.cashdesk.cash_out", "treasury.manage"],
+        "transfer_to_bank": ["treasury.cashdesk.transfer_to_bank", "treasury.manage"],
+        "*": ["treasury.manage"],
+    }
     serializer_class = CashDeskSerializer
 
     def get_queryset(self):
@@ -580,6 +604,19 @@ class CashDeskViewSet(TreasuryTenantViewSet):
 
 
 class PaymentBatchViewSet(TreasuryTenantViewSet):
+    permission_map = {
+        "list": ["treasury.payment.view", "treasury.manage"],
+        "retrieve": ["treasury.payment.view", "treasury.manage"],
+        "create": ["treasury.payment.create", "treasury.manage"],
+        "update": ["treasury.payment.update", "treasury.manage"],
+        "partial_update": ["treasury.payment.update", "treasury.manage"],
+        "destroy": ["treasury.payment.delete", "treasury.manage"],
+        "submit_approval": ["treasury.payment.submit", "treasury.manage"],
+        "approve": ["treasury.payment.approve", "treasury.manage"],
+        "execute": ["treasury.payment.execute", "treasury.manage"],
+        "cancel": ["treasury.payment.cancel", "treasury.manage"],
+        "*": ["treasury.manage"],
+    }
     serializer_class = PaymentBatchSerializer
 
     def get_queryset(self):
@@ -826,6 +863,17 @@ class PaymentBatchViewSet(TreasuryTenantViewSet):
         )
 
 class PaymentLineViewSet(TreasuryTenantViewSet):
+    permission_map = {
+        "list": ["treasury.payment.view", "treasury.manage"],
+        "retrieve": ["treasury.payment.view", "treasury.manage"],
+        "create": ["treasury.payment.update", "treasury.manage"],
+        "update": ["treasury.payment.update", "treasury.manage"],
+        "partial_update": ["treasury.payment.update", "treasury.manage"],
+        "destroy": ["treasury.payment.update", "treasury.manage"],
+        "mark_paid": ["treasury.payment.mark_paid", "treasury.manage"],
+        "mark_failed": ["treasury.payment.fail", "treasury.manage"],
+        "*": ["treasury.manage"],
+    }
     serializer_class = PaymentLineSerializer
 
     def get_queryset(self):
@@ -938,6 +986,17 @@ class PaymentLineViewSet(TreasuryTenantViewSet):
 
 
 class BankStatementViewSet(TreasuryTenantViewSet):
+    permission_map = {
+        "list": ["treasury.statement.view", "treasury.manage"],
+        "retrieve": ["treasury.statement.view", "treasury.manage"],
+        "create": ["treasury.statement.create", "treasury.manage"],
+        "update": ["treasury.statement.update", "treasury.manage"],
+        "partial_update": ["treasury.statement.update", "treasury.manage"],
+        "destroy": ["treasury.statement.delete", "treasury.manage"],
+        "import_statement": ["treasury.statement.import", "treasury.manage"],
+        "lines": ["treasury.statement.view", "treasury.manage"],
+        "*": ["treasury.manage"],
+    }
     serializer_class = BankStatementSerializer
 
     def get_queryset(self):

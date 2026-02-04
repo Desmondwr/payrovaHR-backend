@@ -24,7 +24,29 @@ class ContractViewSet(viewsets.ModelViewSet):
     """
     serializer_class = ContractSerializer
     permission_classes = [permissions.IsAuthenticated, EmployerOrEmployeeAccessPermission]
-    permission_map = {"*": ["contracts.manage"]}
+    permission_map = {
+        "list": ["contracts.contract.view", "contracts.manage"],
+        "retrieve": ["contracts.contract.view", "contracts.manage"],
+        "create": ["contracts.contract.create", "contracts.manage"],
+        "update": ["contracts.contract.update", "contracts.manage"],
+        "partial_update": ["contracts.contract.update", "contracts.manage"],
+        "destroy": ["contracts.contract.delete", "contracts.manage"],
+        "default_template": [
+            "contracts.template.view",
+            "contracts.template.update",
+            "contracts.manage",
+        ],
+        "activate": ["contracts.contract.activate", "contracts.manage"],
+        "approve": ["contracts.contract.approve", "contracts.manage"],
+        "send_for_approval": ["contracts.contract.send_for_approval", "contracts.manage"],
+        "send_for_signature_alias": ["contracts.contract.send_for_signature", "contracts.manage"],
+        "generate_document": ["contracts.contract.generate_document", "contracts.manage"],
+        "sign_contract": ["contracts.contract.sign", "contracts.manage"],
+        "renew": ["contracts.contract.renew", "contracts.manage"],
+        "terminate": ["contracts.contract.terminate", "contracts.manage"],
+        "expire": ["contracts.contract.expire", "contracts.manage"],
+        "*": ["contracts.manage"],
+    }
 
     def _set_tenant_alias(self, alias):
         """Set tenant context when we already know the DB alias."""
@@ -517,7 +539,15 @@ class ContractAmendmentViewSet(viewsets.ModelViewSet):
     from .serializers import ContractAmendmentSerializer
     serializer_class = ContractAmendmentSerializer
     permission_classes = [permissions.IsAuthenticated, EmployerAccessPermission]
-    permission_map = {"*": ["contracts.manage"]}
+    permission_map = {
+        "list": ["contracts.contract.view", "contracts.manage"],
+        "retrieve": ["contracts.contract.view", "contracts.manage"],
+        "create": ["contracts.contract.update", "contracts.manage"],
+        "update": ["contracts.contract.update", "contracts.manage"],
+        "partial_update": ["contracts.contract.update", "contracts.manage"],
+        "destroy": ["contracts.contract.update", "contracts.manage"],
+        "*": ["contracts.manage"],
+    }
     
     def get_queryset(self):
         user = self.request.user
@@ -608,7 +638,16 @@ class ContractConfigurationViewSet(viewsets.ModelViewSet):
     Type-specific: contract_type is set.
     """
     permission_classes = [permissions.IsAuthenticated, EmployerAccessPermission]
-    permission_map = {"*": ["contracts.manage"]}
+    permission_map = {
+        "list": ["contracts.configuration.view", "contracts.manage"],
+        "retrieve": ["contracts.configuration.view", "contracts.manage"],
+        "create": ["contracts.configuration.update", "contracts.manage"],
+        "update": ["contracts.configuration.update", "contracts.manage"],
+        "partial_update": ["contracts.configuration.update", "contracts.manage"],
+        "destroy": ["contracts.configuration.update", "contracts.manage"],
+        "global_config": ["contracts.configuration.update", "contracts.manage"],
+        "*": ["contracts.manage"],
+    }
     serializer_class = ContractConfigurationSerializer
 
     def get_queryset(self):
@@ -679,7 +718,15 @@ class SalaryScaleViewSet(viewsets.ModelViewSet):
     """API endpoint for managing salary scales."""
 
     permission_classes = [permissions.IsAuthenticated, EmployerAccessPermission]
-    permission_map = {"*": ["contracts.manage"]}
+    permission_map = {
+        "list": ["contracts.salary_scale.view", "contracts.manage"],
+        "retrieve": ["contracts.salary_scale.view", "contracts.manage"],
+        "create": ["contracts.salary_scale.create", "contracts.manage"],
+        "update": ["contracts.salary_scale.update", "contracts.manage"],
+        "partial_update": ["contracts.salary_scale.update", "contracts.manage"],
+        "destroy": ["contracts.salary_scale.delete", "contracts.manage"],
+        "*": ["contracts.manage"],
+    }
     serializer_class = SalaryScaleSerializer
 
     def get_serializer_context(self):

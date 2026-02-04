@@ -204,7 +204,10 @@ class EmployerProfile(models.Model):
     database_name = models.CharField(max_length=100, unique=True, null=True, blank=True, help_text='Tenant database name')
     database_created = models.BooleanField(default=False, help_text='Whether tenant database has been created')
     database_created_at = models.DateTimeField(null=True, blank=True, help_text='When the tenant database was created')
-    
+
+    # Public Access
+    slug = models.SlugField(max_length=100, unique=True, null=True, blank=True, help_text='URL-friendly identifier for public pages')
+
     # Timestamps
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)

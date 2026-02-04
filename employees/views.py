@@ -46,7 +46,15 @@ class DepartmentViewSet(viewsets.ModelViewSet):
     """ViewSet for managing departments"""
     
     permission_classes = [IsAuthenticated, EmployerAccessPermission]
-    permission_map = {"*": ["employees.manage"]}
+    permission_map = {
+        "list": ["employees.department.view", "employees.manage"],
+        "retrieve": ["employees.department.view", "employees.manage"],
+        "create": ["employees.department.create", "employees.manage"],
+        "update": ["employees.department.update", "employees.manage"],
+        "partial_update": ["employees.department.update", "employees.manage"],
+        "destroy": ["employees.department.delete", "employees.manage"],
+        "*": ["employees.manage"],
+    }
     serializer_class = DepartmentSerializer
     
     def get_queryset(self):
@@ -87,7 +95,15 @@ class BranchViewSet(viewsets.ModelViewSet):
     """ViewSet for managing branches"""
     
     permission_classes = [IsAuthenticated, EmployerAccessPermission]
-    permission_map = {"*": ["employees.configure"]}
+    permission_map = {
+        "list": ["employees.branch.view", "employees.configure"],
+        "retrieve": ["employees.branch.view", "employees.configure"],
+        "create": ["employees.branch.create", "employees.configure"],
+        "update": ["employees.branch.update", "employees.configure"],
+        "partial_update": ["employees.branch.update", "employees.configure"],
+        "destroy": ["employees.branch.delete", "employees.configure"],
+        "*": ["employees.configure"],
+    }
     serializer_class = BranchSerializer
     
     def get_queryset(self):
@@ -128,7 +144,32 @@ class EmployeeViewSet(viewsets.ModelViewSet):
     """ViewSet for managing employees"""
     
     permission_classes = [IsAuthenticated, EmployerAccessPermission]
-    permission_map = {"*": ["employees.manage"]}
+    permission_map = {
+        "list": ["employees.employee.view", "employees.manage"],
+        "retrieve": ["employees.employee.view", "employees.manage"],
+        "create": ["employees.employee.create", "employees.manage"],
+        "update": ["employees.employee.update", "employees.manage"],
+        "partial_update": ["employees.employee.update", "employees.manage"],
+        "destroy": ["employees.employee.delete", "employees.manage"],
+        "attendance_credentials": ["employees.employee.credentials", "employees.manage"],
+        "send_invitation": ["employees.employee.invite", "employees.manage"],
+        "terminate": ["employees.employee.terminate", "employees.manage"],
+        "reactivate": ["employees.employee.update", "employees.manage"],
+        "documents": ["employees.employee.view", "employees.manage"],
+        "cross_institutions": ["employees.employee.view", "employees.manage"],
+        "audit_log": ["employees.employee.view", "employees.manage"],
+        "termination_approvals": ["employees.termination_approval.view", "employees.manage"],
+        "pending_approvals": [
+            "employees.termination_approval.view",
+            "employees.termination_approval.approve",
+            "employees.termination_approval.reject",
+            "employees.manage",
+        ],
+        "expiring_soon": ["employees.employee.view", "employees.manage"],
+        "detect_duplicates": ["employees.employee.create", "employees.manage"],
+        "prefill_existing": ["employees.employee.create", "employees.manage"],
+        "*": ["employees.manage"],
+    }
     
     def get_serializer_class(self):
         """Return appropriate serializer based on action"""
@@ -929,7 +970,15 @@ class EmployeeDocumentViewSet(viewsets.ModelViewSet):
     """ViewSet for managing employee documents"""
     
     permission_classes = [IsAuthenticated, EmployerOrEmployeeAccessPermission]
-    permission_map = {"*": ["employees.manage"]}
+    permission_map = {
+        "list": ["employees.employee.view", "employees.manage"],
+        "retrieve": ["employees.employee.view", "employees.manage"],
+        "create": ["employees.document.upload", "employees.manage"],
+        "update": ["employees.employee.update", "employees.manage"],
+        "partial_update": ["employees.employee.update", "employees.manage"],
+        "destroy": ["employees.employee.update", "employees.manage"],
+        "*": ["employees.manage"],
+    }
     serializer_class = EmployeeDocumentSerializer
 
     def _resolve_employer_context(self):
@@ -1097,7 +1146,15 @@ class EmployeeConfigurationViewSet(viewsets.ModelViewSet):
     """ViewSet for managing employee configuration"""
     
     permission_classes = [IsAuthenticated, EmployerAccessPermission]
-    permission_map = {"*": ["employees.configure"]}
+    permission_map = {
+        "list": ["employees.configuration.view", "employees.configure"],
+        "retrieve": ["employees.configuration.view", "employees.configure"],
+        "create": ["employees.configuration.update", "employees.configure"],
+        "update": ["employees.configuration.update", "employees.configure"],
+        "partial_update": ["employees.configuration.update", "employees.configure"],
+        "destroy": ["employees.configuration.update", "employees.configure"],
+        "*": ["employees.configure"],
+    }
     serializer_class = EmployeeConfigurationSerializer
     http_method_names = ['get', 'post', 'patch', 'put']
     
@@ -1201,7 +1258,11 @@ class EmployeeInvitationViewSet(viewsets.ReadOnlyModelViewSet):
     """ViewSet for viewing employee invitations"""
     
     permission_classes = [IsAuthenticated, EmployerOrEmployeeAccessPermission]
-    permission_map = {"*": ["employees.manage"]}
+    permission_map = {
+        "list": ["employees.employee.view", "employees.manage"],
+        "retrieve": ["employees.employee.view", "employees.manage"],
+        "*": ["employees.manage"],
+    }
     serializer_class = EmployeeInvitationSerializer
     
     def get_queryset(self):

@@ -157,56 +157,155 @@ class FleetTenantViewSet(EmployerContextMixin, viewsets.ModelViewSet):
 
 
 class ManufacturerViewSet(FleetTenantViewSet):
+    permission_map = {
+        "list": ["fleets.configuration.view", "fleets.manage"],
+        "retrieve": ["fleets.configuration.view", "fleets.manage"],
+        "create": ["fleets.configuration.create", "fleets.manage"],
+        "update": ["fleets.configuration.update", "fleets.manage"],
+        "partial_update": ["fleets.configuration.update", "fleets.manage"],
+        "destroy": ["fleets.configuration.delete", "fleets.manage"],
+        "*": ["fleets.manage"],
+    }
     queryset = Manufacturer.objects.all()
     serializer_class = ManufacturerSerializer
 
 
 class VehicleCategoryViewSet(FleetTenantViewSet):
+    permission_map = {
+        "list": ["fleets.configuration.view", "fleets.manage"],
+        "retrieve": ["fleets.configuration.view", "fleets.manage"],
+        "create": ["fleets.configuration.create", "fleets.manage"],
+        "update": ["fleets.configuration.update", "fleets.manage"],
+        "partial_update": ["fleets.configuration.update", "fleets.manage"],
+        "destroy": ["fleets.configuration.delete", "fleets.manage"],
+        "*": ["fleets.manage"],
+    }
     queryset = VehicleCategory.objects.all()
     serializer_class = VehicleCategorySerializer
 
 
 class VehicleModelViewSet(FleetTenantViewSet):
+    permission_map = {
+        "list": ["fleets.configuration.view", "fleets.manage"],
+        "retrieve": ["fleets.configuration.view", "fleets.manage"],
+        "create": ["fleets.configuration.create", "fleets.manage"],
+        "update": ["fleets.configuration.update", "fleets.manage"],
+        "partial_update": ["fleets.configuration.update", "fleets.manage"],
+        "destroy": ["fleets.configuration.delete", "fleets.manage"],
+        "*": ["fleets.manage"],
+    }
     queryset = VehicleModel.objects.all()
     serializer_class = VehicleModelSerializer
 
 
 class ServiceTypeViewSet(FleetTenantViewSet):
+    permission_map = {
+        "list": ["fleets.configuration.view", "fleets.manage"],
+        "retrieve": ["fleets.configuration.view", "fleets.manage"],
+        "create": ["fleets.configuration.create", "fleets.manage"],
+        "update": ["fleets.configuration.update", "fleets.manage"],
+        "partial_update": ["fleets.configuration.update", "fleets.manage"],
+        "destroy": ["fleets.configuration.delete", "fleets.manage"],
+        "*": ["fleets.manage"],
+    }
     queryset = ServiceType.objects.all()
     serializer_class = ServiceTypeSerializer
 
 
 class VendorViewSet(FleetTenantViewSet):
+    permission_map = {
+        "list": ["fleets.configuration.view", "fleets.manage"],
+        "retrieve": ["fleets.configuration.view", "fleets.manage"],
+        "create": ["fleets.configuration.create", "fleets.manage"],
+        "update": ["fleets.configuration.update", "fleets.manage"],
+        "partial_update": ["fleets.configuration.update", "fleets.manage"],
+        "destroy": ["fleets.configuration.delete", "fleets.manage"],
+        "*": ["fleets.manage"],
+    }
     queryset = Vendor.objects.all()
     serializer_class = VendorSerializer
 
 
 class FleetSettingViewSet(FleetTenantViewSet):
+    permission_map = {
+        "list": ["fleets.configuration.view", "fleets.manage"],
+        "retrieve": ["fleets.configuration.view", "fleets.manage"],
+        "create": ["fleets.configuration.create", "fleets.manage"],
+        "update": ["fleets.configuration.update", "fleets.manage"],
+        "partial_update": ["fleets.configuration.update", "fleets.manage"],
+        "destroy": ["fleets.configuration.delete", "fleets.manage"],
+        "*": ["fleets.manage"],
+    }
     queryset = FleetSetting.objects.all()
     serializer_class = FleetSettingSerializer
 
 
 class VehicleViewSet(FleetTenantViewSet):
+    permission_map = {
+        "list": ["fleets.vehicle.view", "fleets.manage"],
+        "retrieve": ["fleets.vehicle.view", "fleets.manage"],
+        "create": ["fleets.vehicle.create", "fleets.manage"],
+        "update": ["fleets.vehicle.update", "fleets.manage"],
+        "partial_update": ["fleets.vehicle.update", "fleets.manage"],
+        "destroy": ["fleets.vehicle.delete", "fleets.manage"],
+        "*": ["fleets.manage"],
+    }
     queryset = Vehicle.objects.all()
     serializer_class = VehicleSerializer
 
 
 class DriverAssignmentViewSet(FleetTenantViewSet):
+    permission_map = {
+        "list": ["fleets.assignment.view", "fleets.manage"],
+        "retrieve": ["fleets.assignment.view", "fleets.manage"],
+        "create": ["fleets.assignment.create", "fleets.manage"],
+        "update": ["fleets.assignment.update", "fleets.manage"],
+        "partial_update": ["fleets.assignment.update", "fleets.manage"],
+        "destroy": ["fleets.assignment.delete", "fleets.manage"],
+        "*": ["fleets.manage"],
+    }
     queryset = DriverAssignment.objects.all()
     serializer_class = DriverAssignmentSerializer
 
 
 class VehicleContractViewSet(FleetTenantViewSet):
+    permission_map = {
+        "list": ["fleets.contract.view", "fleets.manage"],
+        "retrieve": ["fleets.contract.view", "fleets.manage"],
+        "create": ["fleets.contract.create", "fleets.manage"],
+        "update": ["fleets.contract.update", "fleets.manage"],
+        "partial_update": ["fleets.contract.update", "fleets.manage"],
+        "destroy": ["fleets.contract.delete", "fleets.manage"],
+        "*": ["fleets.manage"],
+    }
     queryset = VehicleContract.objects.all()
     serializer_class = VehicleContractSerializer
 
 
 class ServiceRecordViewSet(FleetTenantViewSet):
+    permission_map = {
+        "list": ["fleets.service.view", "fleets.manage"],
+        "retrieve": ["fleets.service.view", "fleets.manage"],
+        "create": ["fleets.service.create", "fleets.manage"],
+        "update": ["fleets.service.update", "fleets.manage"],
+        "partial_update": ["fleets.service.update", "fleets.manage"],
+        "destroy": ["fleets.service.delete", "fleets.manage"],
+        "*": ["fleets.manage"],
+    }
     queryset = ServiceRecord.objects.all()
     serializer_class = ServiceRecordSerializer
 
 
 class AccidentEventViewSet(FleetTenantViewSet):
+    permission_map = {
+        "list": ["fleets.accident.view", "fleets.manage"],
+        "retrieve": ["fleets.accident.view", "fleets.manage"],
+        "create": ["fleets.accident.create", "fleets.manage"],
+        "update": ["fleets.accident.update", "fleets.manage"],
+        "partial_update": ["fleets.accident.update", "fleets.manage"],
+        "destroy": ["fleets.accident.delete", "fleets.manage"],
+        "*": ["fleets.manage"],
+    }
     queryset = AccidentEvent.objects.all()
     serializer_class = AccidentEventSerializer
 

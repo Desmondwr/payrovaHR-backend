@@ -3,6 +3,7 @@ import uuid
 
 from django.db import models
 from rest_framework import permissions, status, viewsets
+from rest_framework.exceptions import PermissionDenied
 from rest_framework.decorators import action
 from rest_framework.response import Response
 from rest_framework.views import APIView
@@ -143,7 +144,15 @@ class AttendanceConfigurationViewSet(viewsets.ModelViewSet):
     """Tenant-scoped attendance configuration."""
 
     permission_classes = [IsAuthenticated, EmployerAccessPermission]
-    permission_map = {"*": ["attendance.manage"]}
+    permission_map = {
+        "list": ["attendance.configuration.view", "attendance.manage"],
+        "retrieve": ["attendance.configuration.view", "attendance.manage"],
+        "create": ["attendance.configuration.update", "attendance.manage"],
+        "update": ["attendance.configuration.update", "attendance.manage"],
+        "partial_update": ["attendance.configuration.update", "attendance.manage"],
+        "destroy": ["attendance.configuration.update", "attendance.manage"],
+        "*": ["attendance.manage"],
+    }
     serializer_class = AttendanceConfigurationSerializer
 
     def get_queryset(self):
@@ -172,7 +181,7 @@ class KioskTokenRegenerateView(APIView):
     """Rotate kiosk access token for the employer."""
 
     permission_classes = [permissions.IsAuthenticated, EmployerAccessPermission]
-    required_permissions = ["attendance.manage"]
+    required_permissions = ["attendance.configuration.update", "attendance.manage"]
 
     def post(self, request):
         employer = get_active_employer(request, require_context=True)
@@ -192,7 +201,15 @@ class AttendanceLocationSiteViewSet(viewsets.ModelViewSet):
     """Manage allowed geofence sites."""
 
     permission_classes = [IsAuthenticated, EmployerAccessPermission]
-    permission_map = {"*": ["attendance.manage"]}
+    permission_map = {
+        "list": ["attendance.site.view", "attendance.manage"],
+        "retrieve": ["attendance.site.view", "attendance.manage"],
+        "create": ["attendance.site.create", "attendance.manage"],
+        "update": ["attendance.site.update", "attendance.manage"],
+        "partial_update": ["attendance.site.update", "attendance.manage"],
+        "destroy": ["attendance.site.delete", "attendance.manage"],
+        "*": ["attendance.manage"],
+    }
     serializer_class = AttendanceLocationSiteSerializer
 
     def get_queryset(self):
@@ -210,7 +227,7 @@ class AttendanceLocationSiteViewSet(viewsets.ModelViewSet):
         if is_delegate_user(self.request.user, employer.id):
             branch = serializer.validated_data.get("branch")
             if branch and str(branch.id) not in get_delegate_scope(self.request.user, employer.id).get("branch_ids", set()):
-                raise permissions.PermissionDenied("You do not have access to this branch.")
+                raise PermissionDenied("You do not have access to this branch.")
         instance = AttendanceLocationSite.objects.using(tenant_db).create(
             employer_id=employer.id, **serializer.validated_data
         )
@@ -226,7 +243,15 @@ class AttendanceAllowedWifiViewSet(viewsets.ModelViewSet):
     """Manage allowed Wi-Fi networks."""
 
     permission_classes = [IsAuthenticated, EmployerAccessPermission]
-    permission_map = {"*": ["attendance.manage"]}
+    permission_map = {
+        "list": ["attendance.wifi.view", "attendance.manage"],
+        "retrieve": ["attendance.wifi.view", "attendance.manage"],
+        "create": ["attendance.wifi.create", "attendance.manage"],
+        "update": ["attendance.wifi.update", "attendance.manage"],
+        "partial_update": ["attendance.wifi.update", "attendance.manage"],
+        "destroy": ["attendance.wifi.delete", "attendance.manage"],
+        "*": ["attendance.manage"],
+    }
     serializer_class = AttendanceAllowedWifiSerializer
 
     def get_queryset(self):
@@ -244,7 +269,7 @@ class AttendanceAllowedWifiViewSet(viewsets.ModelViewSet):
         if is_delegate_user(self.request.user, employer.id):
             branch = serializer.validated_data.get("branch")
             if branch and str(branch.id) not in get_delegate_scope(self.request.user, employer.id).get("branch_ids", set()):
-                raise permissions.PermissionDenied("You do not have access to this branch.")
+                raise PermissionDenied("You do not have access to this branch.")
         instance = AttendanceAllowedWifi.objects.using(tenant_db).create(
             employer_id=employer.id, **serializer.validated_data
         )
@@ -260,7 +285,15 @@ class AttendanceKioskStationViewSet(viewsets.ModelViewSet):
     """Manage branch-scoped kiosk stations."""
 
     permission_classes = [IsAuthenticated, EmployerAccessPermission]
-    permission_map = {"*": ["attendance.manage"]}
+    permission_map = {
+        "list": ["attendance.kiosk.view", "attendance.manage"],
+        "retrieve": ["attendance.kiosk.view", "attendance.manage"],
+        "create": ["attendance.kiosk.create", "attendance.manage"],
+        "update": ["attendance.kiosk.update", "attendance.manage"],
+        "partial_update": ["attendance.kiosk.update", "attendance.manage"],
+        "destroy": ["attendance.kiosk.delete", "attendance.manage"],
+        "*": ["attendance.manage"],
+    }
     serializer_class = AttendanceKioskStationSerializer
 
     def get_queryset(self):
@@ -278,7 +311,7 @@ class AttendanceKioskStationViewSet(viewsets.ModelViewSet):
         if is_delegate_user(self.request.user, employer.id):
             branch = serializer.validated_data.get("branch")
             if branch and str(branch.id) not in get_delegate_scope(self.request.user, employer.id).get("branch_ids", set()):
-                raise permissions.PermissionDenied("You do not have access to this branch.")
+                raise PermissionDenied("You do not have access to this branch.")
         instance = AttendanceKioskStation.objects.using(tenant_db).create(
             employer_id=employer.id, **serializer.validated_data
         )
@@ -302,7 +335,17 @@ class WorkingScheduleViewSet(viewsets.ModelViewSet):
     """Manage working schedules and their day rules."""
 
     permission_classes = [IsAuthenticated, EmployerAccessPermission]
-    permission_map = {"*": ["attendance.manage"]}
+    permission_map = {
+        "list": ["attendance.schedule.view", "attendance.manage"],
+        "retrieve": ["attendance.schedule.view", "attendance.manage"],
+        "create": ["attendance.schedule.create", "attendance.manage"],
+        "update": ["attendance.schedule.update", "attendance.manage"],
+        "partial_update": ["attendance.schedule.update", "attendance.manage"],
+        "destroy": ["attendance.schedule.delete", "attendance.manage"],
+        "days": ["attendance.schedule.view", "attendance.manage"],
+        "day_detail": ["attendance.schedule.update", "attendance.manage"],
+        "*": ["attendance.manage"],
+    }
     serializer_class = WorkingScheduleSerializer
 
     def get_queryset(self):
@@ -337,7 +380,7 @@ class WorkingScheduleViewSet(viewsets.ModelViewSet):
         try:
             return WorkingSchedule.objects.using(tenant_db).get(id=self.kwargs.get("pk"), employer_id=employer.id)
         except WorkingSchedule.DoesNotExist:
-            raise permissions.PermissionDenied("Schedule not found for this employer.")
+            raise PermissionDenied("Schedule not found for this employer.")
 
     @action(detail=True, methods=["get", "post"], url_path="days")
     def days(self, request, pk=None):
@@ -401,7 +444,15 @@ class AttendanceRecordViewSet(viewsets.ReadOnlyModelViewSet):
     """List and approve attendance records."""
 
     permission_classes = [IsAuthenticated, EmployerOrEmployeeAccessPermission]
-    permission_map = {"*": ["attendance.manage"]}
+    permission_map = {
+        "list": ["attendance.record.view", "attendance.manage"],
+        "retrieve": ["attendance.record.view", "attendance.manage"],
+        "to_approve": ["attendance.record.view", "attendance.manage"],
+        "approve": ["attendance.record.approve", "attendance.manage"],
+        "refuse": ["attendance.record.refuse", "attendance.manage"],
+        "partial_approve": ["attendance.record.partial_approve", "attendance.manage"],
+        "*": ["attendance.manage"],
+    }
     serializer_class = AttendanceRecordSerializer
 
     def get_queryset(self):
@@ -703,7 +754,7 @@ class AttendanceStatusView(APIView):
 
 class ManualAttendanceCreateView(APIView):
     permission_classes = [permissions.IsAuthenticated, EmployerAccessPermission]
-    required_permissions = ["attendance.manage"]
+    required_permissions = ["attendance.record.create", "attendance.manage"]
 
     def post(self, request):
         serializer = AttendanceManualCreateSerializer(data=request.data)

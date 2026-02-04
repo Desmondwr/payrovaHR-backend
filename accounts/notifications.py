@@ -3,7 +3,6 @@ from django.utils import timezone
 from notifications.models import Notification  # noqa: F401
 from accounts.models import EmployerProfile, User  # noqa: F401
 
-
 def create_notification(user, title, body='', *, type='INFO', data=None, employer_profile=None):
     """
     Helper to emit a notification to a user.

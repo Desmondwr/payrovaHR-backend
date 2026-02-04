@@ -136,7 +136,15 @@ class SoftDeleteMixin:
 
 class ExpenseCategoryViewSet(SoftDeleteMixin, IncomeExpenseTenantViewSet):
     permission_classes = [IsAuthenticated, EmployerOrEmployeeAccessPermission]
-    permission_map = {"*": ["income_expense.manage"]}
+    permission_map = {
+        "list": ["income_expense.category.view", "income_expense.manage"],
+        "retrieve": ["income_expense.category.view", "income_expense.manage"],
+        "create": ["income_expense.category.create", "income_expense.manage"],
+        "update": ["income_expense.category.update", "income_expense.manage"],
+        "partial_update": ["income_expense.category.update", "income_expense.manage"],
+        "destroy": ["income_expense.category.delete", "income_expense.manage"],
+        "*": ["income_expense.manage"],
+    }
     serializer_class = ExpenseCategorySerializer
 
     def get_queryset(self):
@@ -158,7 +166,15 @@ class ExpenseCategoryViewSet(SoftDeleteMixin, IncomeExpenseTenantViewSet):
 
 class IncomeCategoryViewSet(SoftDeleteMixin, IncomeExpenseTenantViewSet):
     permission_classes = [IsAuthenticated, EmployerAccessPermission]
-    permission_map = {"*": ["income_expense.manage"]}
+    permission_map = {
+        "list": ["income_expense.category.view", "income_expense.manage"],
+        "retrieve": ["income_expense.category.view", "income_expense.manage"],
+        "create": ["income_expense.category.create", "income_expense.manage"],
+        "update": ["income_expense.category.update", "income_expense.manage"],
+        "partial_update": ["income_expense.category.update", "income_expense.manage"],
+        "destroy": ["income_expense.category.delete", "income_expense.manage"],
+        "*": ["income_expense.manage"],
+    }
     serializer_class = IncomeCategorySerializer
 
     def get_queryset(self):
@@ -180,7 +196,17 @@ class IncomeCategoryViewSet(SoftDeleteMixin, IncomeExpenseTenantViewSet):
 
 class BudgetPlanViewSet(SoftDeleteMixin, IncomeExpenseTenantViewSet):
     permission_classes = [IsAuthenticated, EmployerAccessPermission]
-    permission_map = {"*": ["income_expense.manage"]}
+    permission_map = {
+        "list": ["income_expense.budget.view", "income_expense.manage"],
+        "retrieve": ["income_expense.budget.view", "income_expense.manage"],
+        "create": ["income_expense.budget.create", "income_expense.manage"],
+        "update": ["income_expense.budget.update", "income_expense.manage"],
+        "partial_update": ["income_expense.budget.update", "income_expense.manage"],
+        "destroy": ["income_expense.budget.delete", "income_expense.manage"],
+        "summary": ["income_expense.budget.view", "income_expense.manage"],
+        "activate": ["income_expense.budget.activate", "income_expense.manage"],
+        "*": ["income_expense.manage"],
+    }
     serializer_class = BudgetPlanSerializer
 
     def get_queryset(self):
@@ -275,7 +301,15 @@ class BudgetPlanViewSet(SoftDeleteMixin, IncomeExpenseTenantViewSet):
 
 class BudgetLineViewSet(SoftDeleteMixin, IncomeExpenseTenantViewSet):
     permission_classes = [IsAuthenticated, EmployerAccessPermission]
-    permission_map = {"*": ["income_expense.manage"]}
+    permission_map = {
+        "list": ["income_expense.budget.view", "income_expense.manage"],
+        "retrieve": ["income_expense.budget.view", "income_expense.manage"],
+        "create": ["income_expense.budget.update", "income_expense.manage"],
+        "update": ["income_expense.budget.update", "income_expense.manage"],
+        "partial_update": ["income_expense.budget.update", "income_expense.manage"],
+        "destroy": ["income_expense.budget.update", "income_expense.manage"],
+        "*": ["income_expense.manage"],
+    }
     serializer_class = BudgetLineSerializer
 
     def get_queryset(self):
@@ -304,7 +338,20 @@ class BudgetLineViewSet(SoftDeleteMixin, IncomeExpenseTenantViewSet):
 
 class ExpenseClaimViewSet(SoftDeleteMixin, IncomeExpenseTenantViewSet):
     permission_classes = [IsAuthenticated, EmployerOrEmployeeAccessPermission]
-    permission_map = {"*": ["income_expense.manage"]}
+    permission_map = {
+        "list": ["income_expense.expense.view", "income_expense.manage"],
+        "retrieve": ["income_expense.expense.view", "income_expense.manage"],
+        "create": ["income_expense.expense.create", "income_expense.manage"],
+        "update": ["income_expense.expense.update", "income_expense.manage"],
+        "partial_update": ["income_expense.expense.update", "income_expense.manage"],
+        "destroy": ["income_expense.expense.delete", "income_expense.manage"],
+        "submit": ["income_expense.expense.submit", "income_expense.manage"],
+        "approve": ["income_expense.expense.approve", "income_expense.manage"],
+        "reject": ["income_expense.expense.reject", "income_expense.manage"],
+        "cancel": ["income_expense.expense.cancel", "income_expense.manage"],
+        "mark_paid": ["income_expense.expense.mark_paid", "income_expense.manage"],
+        "*": ["income_expense.manage"],
+    }
     serializer_class = ExpenseClaimSerializer
 
     def get_queryset(self):
@@ -753,7 +800,19 @@ class ExpenseClaimViewSet(SoftDeleteMixin, IncomeExpenseTenantViewSet):
 
 class IncomeRecordViewSet(SoftDeleteMixin, IncomeExpenseTenantViewSet):
     permission_classes = [IsAuthenticated, EmployerAccessPermission]
-    permission_map = {"*": ["income_expense.manage"]}
+    permission_map = {
+        "list": ["income_expense.income.view", "income_expense.manage"],
+        "retrieve": ["income_expense.income.view", "income_expense.manage"],
+        "create": ["income_expense.income.create", "income_expense.manage"],
+        "update": ["income_expense.income.update", "income_expense.manage"],
+        "partial_update": ["income_expense.income.update", "income_expense.manage"],
+        "destroy": ["income_expense.income.delete", "income_expense.manage"],
+        "submit": ["income_expense.income.submit", "income_expense.manage"],
+        "approve": ["income_expense.income.approve", "income_expense.manage"],
+        "reject": ["income_expense.income.reject", "income_expense.manage"],
+        "mark_received": ["income_expense.income.mark_received", "income_expense.manage"],
+        "*": ["income_expense.manage"],
+    }
     serializer_class = IncomeRecordSerializer
 
     def get_queryset(self):

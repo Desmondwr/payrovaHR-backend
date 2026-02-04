@@ -2,6 +2,7 @@ from datetime import date
 
 from django.utils import timezone
 from rest_framework import mixins, permissions, status, viewsets
+from rest_framework.exceptions import PermissionDenied
 from rest_framework.decorators import action
 from rest_framework.response import Response
 
@@ -59,7 +60,16 @@ class TimeOffConfigurationViewSet(viewsets.ModelViewSet):
     """
 
     permission_classes = [permissions.IsAuthenticated, EmployerOrEmployeeAccessPermission]
-    permission_map = {"*": ["timeoff.manage"]}
+    permission_map = {
+        "list": ["timeoff.configuration.view", "timeoff.manage"],
+        "retrieve": ["timeoff.configuration.view", "timeoff.manage"],
+        "create": ["timeoff.configuration.update", "timeoff.manage"],
+        "update": ["timeoff.configuration.update", "timeoff.manage"],
+        "partial_update": ["timeoff.configuration.update", "timeoff.manage"],
+        "destroy": ["timeoff.configuration.update", "timeoff.manage"],
+        "global_config": ["timeoff.configuration.update", "timeoff.manage"],
+        "*": ["timeoff.manage"],
+    }
     serializer_class = TimeOffConfigurationSerializer
 
     def get_queryset(self):
@@ -89,7 +99,7 @@ class TimeOffConfigurationViewSet(viewsets.ModelViewSet):
             or user.is_superuser
             or is_delegate_user(user, employer.id)
         ):
-            raise permissions.PermissionDenied("Only employers can create configurations.")
+            raise PermissionDenied("Only employers can create configurations.")
         tenant_db = get_tenant_database_alias(employer)
         serializer.save(
             employer_id=employer.id,
@@ -110,7 +120,7 @@ class TimeOffConfigurationViewSet(viewsets.ModelViewSet):
             or user.is_superuser
             or is_delegate_user(user, employer.id)
         ):
-            raise permissions.PermissionDenied("Only employers can update configurations.")
+            raise PermissionDenied("Only employers can update configurations.")
         tenant_db = get_tenant_database_alias(employer)
         serializer.save()
         instance = serializer.instance
@@ -141,7 +151,7 @@ class TimeOffConfigurationViewSet(viewsets.ModelViewSet):
             employer_id = employee.employer_id
             tenant_db = employee._state.db or "default"
         else:
-            raise permissions.PermissionDenied("Unable to resolve tenant.")
+            raise PermissionDenied("Unable to resolve tenant.")
 
         config = ensure_timeoff_configuration(employer_id, tenant_db)
 
@@ -153,7 +163,7 @@ class TimeOffConfigurationViewSet(viewsets.ModelViewSet):
                 or user.is_superuser
                 or is_delegate_user(user, employer.id)
             ):
-                raise permissions.PermissionDenied("Only employers can update configurations.")
+                raise PermissionDenied("Only employers can update configurations.")
             serializer = self.get_serializer(config, data=request.data, partial=True)
             serializer.is_valid(raise_exception=True)
             self.perform_update(serializer)
@@ -169,7 +179,15 @@ class TimeOffTypeViewSet(viewsets.ModelViewSet):
     """
 
     permission_classes = [permissions.IsAuthenticated, EmployerOrEmployeeAccessPermission]
-    permission_map = {"*": ["timeoff.manage"]}
+    permission_map = {
+        "list": ["timeoff.type.view", "timeoff.manage"],
+        "retrieve": ["timeoff.type.view", "timeoff.manage"],
+        "create": ["timeoff.type.create", "timeoff.manage"],
+        "update": ["timeoff.type.update", "timeoff.manage"],
+        "partial_update": ["timeoff.type.update", "timeoff.manage"],
+        "destroy": ["timeoff.type.delete", "timeoff.manage"],
+        "*": ["timeoff.manage"],
+    }
     serializer_class = TimeOffTypeSerializer
 
     def get_queryset(self):
@@ -201,7 +219,7 @@ class TimeOffTypeViewSet(viewsets.ModelViewSet):
             or user.is_superuser
             or is_delegate_user(user, employer.id)
         ):
-            raise permissions.PermissionDenied("Only employers can create leave types.")
+            raise PermissionDenied("Only employers can create leave types.")
         tenant_db = get_tenant_database_alias(employer)
         serializer.save()
         instance = serializer.instance
@@ -217,7 +235,7 @@ class TimeOffTypeViewSet(viewsets.ModelViewSet):
             or user.is_superuser
             or is_delegate_user(user, employer.id)
         ):
-            raise permissions.PermissionDenied("Only employers can update leave types.")
+            raise PermissionDenied("Only employers can update leave types.")
         tenant_db = get_tenant_database_alias(employer)
         serializer.save()
         instance = serializer.instance
@@ -231,7 +249,19 @@ class TimeOffRequestViewSet(viewsets.ModelViewSet):
     """
 
     permission_classes = [permissions.IsAuthenticated, EmployerOrEmployeeAccessPermission]
-    permission_map = {"*": ["timeoff.manage"]}
+    permission_map = {
+        "list": ["timeoff.request.view", "timeoff.manage"],
+        "retrieve": ["timeoff.request.view", "timeoff.manage"],
+        "create": ["timeoff.request.create", "timeoff.manage"],
+        "update": ["timeoff.request.update", "timeoff.manage"],
+        "partial_update": ["timeoff.request.update", "timeoff.manage"],
+        "destroy": ["timeoff.request.delete", "timeoff.manage"],
+        "submit": ["timeoff.request.submit", "timeoff.manage"],
+        "approve": ["timeoff.request.approve", "timeoff.manage"],
+        "reject": ["timeoff.request.reject", "timeoff.manage"],
+        "cancel": ["timeoff.request.cancel", "timeoff.manage"],
+        "*": ["timeoff.manage"],
+    }
 
     def get_serializer_class(self):
         if self.action in ["create", "update", "partial_update"]:
@@ -465,7 +495,7 @@ class TimeOffBalanceViewSet(viewsets.ViewSet):
     """
 
     permission_classes = [permissions.IsAuthenticated, EmployerOrEmployeeAccessPermission]
-    required_permissions = ["timeoff.manage"]
+    required_permissions = ["timeoff.request.view", "timeoff.manage"]
 
     def _get_context(self, request):
         user = request.user
@@ -489,7 +519,7 @@ class TimeOffBalanceViewSet(viewsets.ViewSet):
             if employee_id:
                 employee = Employee.objects.using(tenant_db).filter(id=employee_id).first()
             else:
-                raise permissions.PermissionDenied("employee_id is required for employer balance lookup.")
+                raise PermissionDenied("employee_id is required for employer balance lookup.")
             if employee and is_delegate_user(user, employer.id):
                 scope = get_delegate_scope(user, employer.id)
                 scoped = apply_scope_filter(
@@ -500,14 +530,14 @@ class TimeOffBalanceViewSet(viewsets.ViewSet):
                     self_field="id",
                 )
                 if not scoped.exists():
-                    raise permissions.PermissionDenied("Unable to resolve employee for balance lookup.")
+                    raise PermissionDenied("Unable to resolve employee for balance lookup.")
         elif hasattr(user, "employee_profile") and user.employee_profile:
             employee = user.employee_profile
             tenant_db = employee._state.db or "default"
             employer_id = employee.employer_id
 
         if not employee:
-            raise permissions.PermissionDenied("Unable to resolve employee for balance lookup.")
+            raise PermissionDenied("Unable to resolve employee for balance lookup.")
 
         return employee, employer_id, tenant_db
 
@@ -523,7 +553,7 @@ class TimeOffBalanceViewSet(viewsets.ViewSet):
             try:
                 as_of_date = date.fromisoformat(as_of_param)
             except ValueError:
-                raise permissions.PermissionDenied("Invalid as_of date format. Use YYYY-MM-DD.")
+                raise PermissionDenied("Invalid as_of date format. Use YYYY-MM-DD.")
         reservation_map = {}
         for lt in config.get("leave_types") or []:
             policy = lt.get("reservation_policy") or reservation_policy
@@ -547,7 +577,7 @@ class TimeOffLedgerViewSet(viewsets.ReadOnlyModelViewSet):
     """
 
     permission_classes = [permissions.IsAuthenticated, EmployerOrEmployeeAccessPermission]
-    required_permissions = ["timeoff.manage"]
+    required_permissions = ["timeoff.request.view", "timeoff.manage"]
     serializer_class = TimeOffLedgerEntrySerializer
 
     def get_queryset(self):
@@ -608,7 +638,18 @@ class TimeOffLedgerViewSet(viewsets.ReadOnlyModelViewSet):
 
 class TimeOffAllocationViewSet(viewsets.ModelViewSet):
     permission_classes = [permissions.IsAuthenticated, EmployerAccessPermission]
-    permission_map = {"*": ["timeoff.manage"]}
+    permission_map = {
+        "list": ["timeoff.allocation.view", "timeoff.manage"],
+        "retrieve": ["timeoff.allocation.view", "timeoff.manage"],
+        "create": ["timeoff.allocation.create", "timeoff.manage"],
+        "update": ["timeoff.allocation.update", "timeoff.manage"],
+        "partial_update": ["timeoff.allocation.update", "timeoff.manage"],
+        "destroy": ["timeoff.allocation.delete", "timeoff.manage"],
+        "bulk": ["timeoff.allocation.bulk", "timeoff.manage"],
+        "confirm": ["timeoff.allocation.confirm", "timeoff.manage"],
+        "cancel": ["timeoff.allocation.cancel", "timeoff.manage"],
+        "*": ["timeoff.manage"],
+    }
 
     def get_serializer_class(self):
         if self.action in ["create"]:
@@ -704,7 +745,18 @@ class TimeOffAllocationViewSet(viewsets.ModelViewSet):
 
 class TimeOffAllocationRequestViewSet(viewsets.ModelViewSet):
     permission_classes = [permissions.IsAuthenticated, EmployerOrEmployeeAccessPermission]
-    permission_map = {"*": ["timeoff.manage"]}
+    permission_map = {
+        "list": ["timeoff.allocation.view", "timeoff.manage"],
+        "retrieve": ["timeoff.allocation.view", "timeoff.manage"],
+        "create": ["timeoff.allocation.create", "timeoff.manage"],
+        "update": ["timeoff.allocation.update", "timeoff.manage"],
+        "partial_update": ["timeoff.allocation.update", "timeoff.manage"],
+        "destroy": ["timeoff.allocation.delete", "timeoff.manage"],
+        "approve": ["timeoff.allocation.approve", "timeoff.manage"],
+        "reject": ["timeoff.allocation.reject", "timeoff.manage"],
+        "cancel": ["timeoff.allocation.cancel", "timeoff.manage"],
+        "*": ["timeoff.manage"],
+    }
     serializer_class = TimeOffAllocationRequestSerializer
 
     def get_queryset(self):
@@ -811,7 +863,7 @@ class TimeOffAllocationRequestViewSet(viewsets.ModelViewSet):
 
 class AccrualRunViewSet(viewsets.ViewSet):
     permission_classes = [permissions.IsAuthenticated, EmployerAccessPermission]
-    required_permissions = ["timeoff.manage"]
+    required_permissions = ["timeoff.accrual.run", "timeoff.manage"]
 
     def create(self, request):
         run_date_param = request.data.get("run_date")

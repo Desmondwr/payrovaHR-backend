@@ -33,12 +33,28 @@ class TenantPrimaryKeyRelatedField(serializers.PrimaryKeyRelatedField):
                 tenant_db = serializer._resolve_tenant_db_alias()
             except Exception:
                 tenant_db = None
+        if tenant_db is None and serializer and hasattr(serializer, "parent"):
+            parent_serializer = serializer.parent
+            if parent_serializer and hasattr(parent_serializer, "_resolve_tenant_db_alias"):
+                try:
+                    tenant_db = parent_serializer._resolve_tenant_db_alias()
+                except Exception:
+                    tenant_db = None
         if tenant_db:
             return queryset.using(tenant_db)
         return queryset
 
 
 class EmployerScopedSerializer(serializers.ModelSerializer):
+    def _set_field_queryset(self, field_name, queryset):
+        field = self.fields.get(field_name)
+        if not field:
+            return
+        if hasattr(field, "child_relation"):
+            field.child_relation.queryset = queryset
+        else:
+            field.queryset = queryset
+
     def get_extra_kwargs(self):
         extra_kwargs = super().get_extra_kwargs()
         employer_kwargs = extra_kwargs.setdefault("employer_id", {})
@@ -59,8 +75,6 @@ class EmployerScopedSerializer(serializers.ModelSerializer):
 
         for field_name, value in many_to_many.items():
             relation_manager = getattr(instance, field_name)
-            if hasattr(relation_manager, "using"):
-                relation_manager = relation_manager.using(tenant_db)
             relation_manager.set(value)
 
         return instance
@@ -80,8 +94,6 @@ class EmployerScopedSerializer(serializers.ModelSerializer):
 
         for attr, value in m2m_fields:
             relation_manager = getattr(instance, attr)
-            if hasattr(relation_manager, "using"):
-                relation_manager = relation_manager.using(tenant_db)
             relation_manager.set(value)
 
         return instance
@@ -216,14 +228,14 @@ class VendorSerializer(EmployerScopedSerializer):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         tenant_db = self._resolve_tenant_db_alias()
-        self.fields["service_types"].queryset = ServiceType.objects.using(tenant_db)
+        self._set_field_queryset("service_types", ServiceType.objects.using(tenant_db))
 
     def create(self, validated_data):
         tenant_db = self._resolve_tenant_db_alias()
         service_types = validated_data.pop("service_types", [])
         vendor = Vendor.objects.using(tenant_db).create(**validated_data)
         if service_types:
-            vendor.service_types.using(tenant_db).set(service_types)
+            vendor.service_types.set(service_types)
         return vendor
 
     def update(self, instance, validated_data):
@@ -233,7 +245,7 @@ class VendorSerializer(EmployerScopedSerializer):
         tenant_db = self._resolve_tenant_db_alias()
         instance.save(using=tenant_db)
         if service_types is not None:
-            instance.service_types.using(tenant_db).set(service_types)
+            instance.service_types.set(service_types)
         return instance
 
     class Meta:
@@ -336,7 +348,9 @@ class DriverAssignmentSerializer(EmployerScopedSerializer):
     branch = serializers.PrimaryKeyRelatedField(queryset=Branch.objects.none())
     branch_name = serializers.CharField(source="branch.name", read_only=True)
     employee = serializers.PrimaryKeyRelatedField(queryset=Employee.objects.all(), allow_null=True, required=False)
+    employee_name = serializers.CharField(source="employee.full_name", read_only=True)
     vehicle = serializers.PrimaryKeyRelatedField(queryset=Vehicle.objects.all())
+    vehicle_license_plate = serializers.CharField(source="vehicle.license_plate", read_only=True)
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -381,9 +395,11 @@ class DriverAssignmentSerializer(EmployerScopedSerializer):
             "id",
             "employer_id",
             "vehicle",
+            "vehicle_license_plate",
             "branch",
             "branch_name",
             "employee",
+            "employee_name",
             "external_driver_name",
             "external_driver_contact",
             "assignment_type",
@@ -398,7 +414,9 @@ class DriverAssignmentSerializer(EmployerScopedSerializer):
 
 class VehicleContractSerializer(EmployerScopedSerializer):
     vehicle = serializers.PrimaryKeyRelatedField(queryset=Vehicle.objects.all())
+    vehicle_license_plate = serializers.CharField(source="vehicle.license_plate", read_only=True)
     responsible_person = serializers.PrimaryKeyRelatedField(queryset=Employee.objects.all(), allow_null=True, required=False)
+    responsible_person_name = serializers.CharField(source="responsible_person.full_name", read_only=True)
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -423,9 +441,11 @@ class VehicleContractSerializer(EmployerScopedSerializer):
             "id",
             "employer_id",
             "vehicle",
+            "vehicle_license_plate",
             "start_date",
             "end_date",
             "responsible_person",
+            "responsible_person_name",
             "catalog_value",
             "residual_value",
             "status",
@@ -475,7 +495,7 @@ class AccidentEventSerializer(EmployerScopedSerializer):
         super().__init__(*args, **kwargs)
         tenant_db = self._resolve_tenant_db_alias()
         self.fields["vehicle"].queryset = Vehicle.objects.using(tenant_db)
-        self.fields["services"].queryset = ServiceRecord.objects.using(tenant_db)
+        self._set_field_queryset("services", ServiceRecord.objects.using(tenant_db))
 
     class Meta:
         model = AccidentEvent

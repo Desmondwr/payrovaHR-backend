@@ -29,7 +29,16 @@ class FrontdeskStationViewSet(viewsets.ModelViewSet):
     """Manage branch-based stations (one active per branch)."""
 
     permission_classes = [IsAuthenticated, EmployerAccessPermission]
-    permission_map = {"*": ["frontdesk.manage"]}
+    permission_map = {
+        "list": ["frontdesk.station.view", "frontdesk.manage"],
+        "retrieve": ["frontdesk.station.view", "frontdesk.manage"],
+        "create": ["frontdesk.station.create", "frontdesk.manage"],
+        "update": ["frontdesk.station.update", "frontdesk.manage"],
+        "partial_update": ["frontdesk.station.update", "frontdesk.manage"],
+        "destroy": ["frontdesk.station.delete", "frontdesk.manage"],
+        "delete_station": ["frontdesk.station.delete", "frontdesk.manage"],
+        "*": ["frontdesk.manage"],
+    }
     serializer_class = FrontdeskStationSerializer
 
     def get_queryset(self):
@@ -62,7 +71,15 @@ class StationResponsibleViewSet(viewsets.ModelViewSet):
     """Manage station responsibles (HR/office admins scoped to branch)."""
 
     permission_classes = [IsAuthenticated, EmployerAccessPermission]
-    permission_map = {"*": ["frontdesk.manage"]}
+    permission_map = {
+        "list": ["frontdesk.responsible.view", "frontdesk.manage"],
+        "retrieve": ["frontdesk.responsible.view", "frontdesk.manage"],
+        "create": ["frontdesk.responsible.create", "frontdesk.manage"],
+        "update": ["frontdesk.responsible.update", "frontdesk.manage"],
+        "partial_update": ["frontdesk.responsible.update", "frontdesk.manage"],
+        "destroy": ["frontdesk.responsible.delete", "frontdesk.manage"],
+        "*": ["frontdesk.manage"],
+    }
     serializer_class = StationResponsibleSerializer
 
     def get_queryset(self):
@@ -87,7 +104,15 @@ class VisitorViewSet(viewsets.ModelViewSet):
     """CRUD for external visitors."""
 
     permission_classes = [IsAuthenticated, EmployerAccessPermission]
-    permission_map = {"*": ["frontdesk.manage"]}
+    permission_map = {
+        "list": ["frontdesk.visitor.view", "frontdesk.manage"],
+        "retrieve": ["frontdesk.visitor.view", "frontdesk.manage"],
+        "create": ["frontdesk.visitor.create", "frontdesk.manage"],
+        "update": ["frontdesk.visitor.update", "frontdesk.manage"],
+        "partial_update": ["frontdesk.visitor.update", "frontdesk.manage"],
+        "destroy": ["frontdesk.visitor.delete", "frontdesk.manage"],
+        "*": ["frontdesk.manage"],
+    }
     serializer_class = VisitorSerializer
 
     def get_queryset(self):
@@ -104,7 +129,18 @@ class VisitViewSet(viewsets.ModelViewSet):
     """Visitor lifecycle: planned/walk-in, check-in, manual check-out."""
 
     permission_classes = [IsAuthenticated, EmployerAccessPermission]
-    permission_map = {"*": ["frontdesk.manage"]}
+    permission_map = {
+        "list": ["frontdesk.visit.view", "frontdesk.manage"],
+        "retrieve": ["frontdesk.visit.view", "frontdesk.manage"],
+        "create": ["frontdesk.visit.create", "frontdesk.manage"],
+        "update": ["frontdesk.visit.update", "frontdesk.manage"],
+        "partial_update": ["frontdesk.visit.update", "frontdesk.manage"],
+        "destroy": ["frontdesk.visit.delete", "frontdesk.manage"],
+        "check_in": ["frontdesk.visit.check_in", "frontdesk.manage"],
+        "check_out": ["frontdesk.visit.check_out", "frontdesk.manage"],
+        "cancel": ["frontdesk.visit.cancel", "frontdesk.manage"],
+        "*": ["frontdesk.manage"],
+    }
     serializer_class = VisitSerializer
 
     def get_queryset(self):

@@ -123,27 +123,42 @@ def get_effective_permissions(user, employer_id):
         .filter(role__is_active=True)
         .values_list("role_id", flat=True)
     )
-    if not roles:
-        return Permission.objects.none()
 
-    base_perms = Permission.objects.filter(
-        is_active=True,
-        role_permissions__role_id__in=roles,
-    ).distinct()
+    base_perms = Permission.objects.none()
+    if roles:
+        base_perms = Permission.objects.filter(
+            is_active=True,
+            role_permissions__role_id__in=roles,
+        ).distinct()
 
     overrides = UserPermissionOverride.objects.filter(
         employer_id=employer_id,
         user_id=user.id,
     ).select_related("permission")
 
-    if not overrides:
-        return base_perms
-
     base_codes = {perm.code for perm in base_perms}
     allow_codes = {o.permission.code for o in overrides if o.effect == UserPermissionOverride.EFFECT_ALLOW}
     deny_codes = {o.permission.code for o in overrides if o.effect == UserPermissionOverride.EFFECT_DENY}
 
     effective_codes = (base_codes | allow_codes) - deny_codes
+
+    if employer_id and not getattr(user, "employer_profile", None):
+        has_membership = EmployeeMembership.objects.filter(
+            user_id=user.id,
+            employer_profile_id=employer_id,
+            status=EmployeeMembership.STATUS_ACTIVE,
+        ).exists()
+        if has_membership:
+            effective_codes |= {
+                "employees.employee.view",
+                "employees.branch.view",
+                "employees.department.view",
+                "contracts.salary_scale.view",
+            }
+
+    if not effective_codes:
+        return Permission.objects.none()
+
     return Permission.objects.filter(code__in=effective_codes, is_active=True)
 
 
