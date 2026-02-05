@@ -11,12 +11,14 @@ from .models import JobPosition, RecruitmentApplicant, RecruitmentApplicantStage
 from .serializers import JobPositionPublicSerializer, RecruitmentApplySerializer
 from .services import (
     ensure_recruitment_settings,
-    duplicate_application_blocked,
+    duplicate_application_detected,
     get_default_stage,
     get_required_application_fields,
-    get_required_custom_question_ids,
     job_scope_allows_public,
     job_visible_to_public,
+    notify_applicant_application_received,
+    notify_employer_application_received,
+    notify_integration_resume_ocr_queued,
     public_apply_allowed,
     public_apply_rate_limit,
     resolve_public_employer,
@@ -154,7 +156,26 @@ class PublicJobDetailView(APIView):
                 return Response({"detail": "Job not available."}, status=status.HTTP_404_NOT_FOUND)
 
             serializer = JobPositionPublicSerializer(job)
-            return Response(serializer.data)
+            payload = serializer.data
+            payload.update(
+                {
+                    "application_fields": settings_obj.application_fields or [],
+                    "custom_questions": settings_obj.custom_questions or [],
+                    "cv_allowed_extensions": settings_obj.cv_allowed_extensions or [],
+                    "cv_max_file_size_mb": settings_obj.cv_max_file_size_mb,
+                    "public_apply_requires_login": settings_obj.public_apply_requires_login,
+                    "public_apply_captcha_enabled": settings_obj.public_apply_captcha_enabled,
+                    "public_apply_spam_check_enabled": settings_obj.public_apply_spam_check_enabled,
+                    "public_apply_honeypot_enabled": settings_obj.public_apply_honeypot_enabled,
+                    "duplicate_application_action": settings_obj.duplicate_application_action,
+                    "duplicate_application_window_days": settings_obj.duplicate_application_window_days,
+                    "integration_interview_scheduling_enabled": settings_obj.integration_interview_scheduling_enabled,
+                    "integration_offers_esign_enabled": settings_obj.integration_offers_esign_enabled,
+                    "integration_resume_ocr_enabled": settings_obj.integration_resume_ocr_enabled,
+                    "integration_job_board_ingest_enabled": settings_obj.integration_job_board_ingest_enabled,
+                }
+            )
+            return Response(payload)
 
         # No employer context - search across all employers
         employers = EmployerProfile.objects.filter(database_created=True)
@@ -174,7 +195,26 @@ class PublicJobDetailView(APIView):
             ).first()
             if job and job_scope_allows_public(job, settings_obj):
                 serializer = JobPositionPublicSerializer(job)
-                return Response(serializer.data)
+                payload = serializer.data
+                payload.update(
+                    {
+                        "application_fields": settings_obj.application_fields or [],
+                        "custom_questions": settings_obj.custom_questions or [],
+                        "cv_allowed_extensions": settings_obj.cv_allowed_extensions or [],
+                        "cv_max_file_size_mb": settings_obj.cv_max_file_size_mb,
+                        "public_apply_requires_login": settings_obj.public_apply_requires_login,
+                        "public_apply_captcha_enabled": settings_obj.public_apply_captcha_enabled,
+                        "public_apply_spam_check_enabled": settings_obj.public_apply_spam_check_enabled,
+                        "public_apply_honeypot_enabled": settings_obj.public_apply_honeypot_enabled,
+                        "duplicate_application_action": settings_obj.duplicate_application_action,
+                        "duplicate_application_window_days": settings_obj.duplicate_application_window_days,
+                        "integration_interview_scheduling_enabled": settings_obj.integration_interview_scheduling_enabled,
+                        "integration_offers_esign_enabled": settings_obj.integration_offers_esign_enabled,
+                        "integration_resume_ocr_enabled": settings_obj.integration_resume_ocr_enabled,
+                        "integration_job_board_ingest_enabled": settings_obj.integration_job_board_ingest_enabled,
+                    }
+                )
+                return Response(payload)
 
         return Response({"detail": "Job not available."}, status=status.HTTP_404_NOT_FOUND)
 
@@ -244,20 +284,50 @@ class PublicJobApplyView(APIView):
         serializer.is_valid(raise_exception=True)
         payload = serializer.validated_data
 
-        required_fields = get_required_application_fields(settings_obj)
-        field_aliases = {}
-        missing = [field for field in required_fields if not payload.get(field_aliases.get(field, field))]
-        if "cv" in required_fields and not payload.get("cv"):
-            missing.append("cv")
-        if missing:
-            return Response({"detail": f"Missing required fields: {', '.join(sorted(set(missing)))}"}, status=status.HTTP_400_BAD_REQUEST)
-
         answers = payload.get("answers") or {}
         if not isinstance(answers, dict):
             answers = {}
         answers = {str(k): v for k, v in answers.items()}
-        required_questions = get_required_custom_question_ids(settings_obj)
-        missing_q = [qid for qid in required_questions if not answers.get(qid)]
+
+        custom_questions = [q for q in (settings_obj.custom_questions or []) if q.get("is_active", True)]
+        file_question_ids = {
+            str(q.get("id"))
+            for q in custom_questions
+            if q.get("type") == "file"
+        }
+        required_questions = [q for q in custom_questions if q.get("required", False)]
+        file_uploads = {}
+        for key, file in request.FILES.items():
+            if key.startswith("custom_file_"):
+                qid = key.replace("custom_file_", "")
+                file_uploads[qid] = file
+
+        required_fields = get_required_application_fields(settings_obj)
+        field_aliases = {}
+        known_fields = {"full_name", "email", "phone", "linkedin", "intro", "source", "medium", "referral"}
+        missing = []
+        for field in required_fields:
+            if field == "cv":
+                if not payload.get("cv"):
+                    missing.append("cv")
+                continue
+            if field in known_fields:
+                if not payload.get(field_aliases.get(field, field)):
+                    missing.append(field)
+                continue
+            if not answers.get(field):
+                missing.append(field)
+        if missing:
+            return Response({"detail": f"Missing required fields: {', '.join(sorted(set(missing)))}"}, status=status.HTTP_400_BAD_REQUEST)
+
+        missing_q = []
+        for question in required_questions:
+            qid = str(question.get("id"))
+            if question.get("type") == "file":
+                if qid not in file_uploads:
+                    missing_q.append(qid)
+            elif not answers.get(qid):
+                missing_q.append(qid)
         if missing_q:
             return Response({"detail": "Missing required custom question answers."}, status=status.HTTP_400_BAD_REQUEST)
 
@@ -265,18 +335,36 @@ class PublicJobApplyView(APIView):
             job=job,
             email__iexact=payload.get("email"),
         ).order_by("-applied_at").first()
-        if last_application and duplicate_application_blocked(settings_obj, last_application.applied_at):
-            return Response({"detail": "Duplicate application detected."}, status=status.HTTP_409_CONFLICT)
+        is_duplicate = False
+        duplicate_warning = False
+        if last_application and duplicate_application_detected(settings_obj, last_application.applied_at):
+            is_duplicate = True
+            if settings_obj.duplicate_application_action == settings_obj.DUPLICATE_ACTION_BLOCK:
+                return Response({"detail": "Duplicate application detected."}, status=status.HTTP_409_CONFLICT)
+            if settings_obj.duplicate_application_action == settings_obj.DUPLICATE_ACTION_WARN:
+                duplicate_warning = True
 
         cv_file = payload.get("cv")
-        if cv_file:
-            ext = cv_file.name.split(".")[-1].lower()
+        def validate_upload(file_obj):
+            ext = file_obj.name.split(".")[-1].lower()
             allowed = [e.lower() for e in settings_obj.cv_allowed_extensions or []]
-            if ext not in allowed:
-                return Response({"detail": "Unsupported CV format."}, status=status.HTTP_400_BAD_REQUEST)
+            if allowed and ext not in allowed:
+                return False, "Unsupported file format."
             max_bytes = int(settings_obj.cv_max_file_size_mb or 10) * 1024 * 1024
-            if cv_file.size > max_bytes:
-                return Response({"detail": "CV exceeds maximum file size."}, status=status.HTTP_400_BAD_REQUEST)
+            if file_obj.size > max_bytes:
+                return False, "File exceeds maximum size."
+            return True, ""
+
+        if cv_file:
+            ok, msg = validate_upload(cv_file)
+            if not ok:
+                return Response({"detail": msg}, status=status.HTTP_400_BAD_REQUEST)
+        for qid, file_obj in file_uploads.items():
+            if qid not in file_question_ids:
+                continue
+            ok, msg = validate_upload(file_obj)
+            if not ok:
+                return Response({"detail": msg}, status=status.HTTP_400_BAD_REQUEST)
 
         stage = get_default_stage(job, tenant_db, settings_obj)
         if not stage:
@@ -311,6 +399,34 @@ class PublicJobApplyView(APIView):
                 original_name=cv_file.name,
                 purpose=RecruitmentAttachment.PURPOSE_CV,
             )
+        for qid, file_obj in file_uploads.items():
+            if qid not in file_question_ids:
+                continue
+            attachment = RecruitmentAttachment.objects.using(tenant_db).create(
+                employer_id=employer.id,
+                tenant_id=employer.id,
+                applicant=applicant,
+                file=file_obj,
+                file_size=file_obj.size,
+                content_type=getattr(file_obj, "content_type", None),
+                original_name=file_obj.name,
+                purpose=RecruitmentAttachment.PURPOSE_OTHER,
+            )
+            answers[qid] = {
+                "attachment_id": str(attachment.id),
+                "file_name": file_obj.name,
+            }
+
+        if answers and applicant.answers != answers:
+            applicant.answers = answers
+            applicant.save(using=tenant_db, update_fields=["answers"])
+
+        notify_integration_resume_ocr_queued(
+            applicant=applicant,
+            employer=employer,
+            settings_obj=settings_obj,
+            actor_user_id=request.user.id if request.user and request.user.is_authenticated else None,
+        )
 
         RecruitmentApplicantStageHistory.objects.using(tenant_db).create(
             applicant=applicant,
@@ -326,5 +442,22 @@ class PublicJobApplyView(APIView):
             applicant=applicant,
             stage=stage,
         )
+        notify_employer_application_received(
+            applicant=applicant,
+            employer=employer,
+            actor_user_id=request.user.id if request.user and request.user.is_authenticated else None,
+            source="public",
+            is_duplicate=is_duplicate,
+        )
+        if request.user and request.user.is_authenticated and request.user.is_employee:
+            notify_applicant_application_received(
+                applicant=applicant,
+                user=request.user,
+                employer=employer,
+            )
 
-        return Response({"id": str(applicant.id), "status": applicant.status}, status=status.HTTP_201_CREATED)
+        response_payload = {"id": str(applicant.id), "status": applicant.status}
+        if duplicate_warning:
+            response_payload["warning"] = "Duplicate application detected. We will still review your submission."
+            response_payload["warning_code"] = "DUPLICATE_APPLICATION"
+        return Response(response_payload, status=status.HTTP_201_CREATED)

@@ -1,16 +1,19 @@
 from datetime import timedelta
 
 from django.conf import settings as django_settings
+from django.contrib.auth import get_user_model
 from django.core.cache import cache
 from django.core.mail import send_mail
 from django.utils import timezone
 
 from accounts.database_utils import ensure_tenant_database_loaded
-from accounts.models import EmployerProfile
+from accounts.models import EmployeeMembership, EmployerProfile
+from accounts.notifications import create_notification
 
 from .models import (
     JobPosition,
     RecruitmentApplicant,
+    RecruitmentAttachment,
     RecruitmentEmailLog,
     RecruitmentEmailTemplate,
     RecruitmentSettings,
@@ -172,6 +175,16 @@ def internal_apply_allowed(settings: RecruitmentSettings) -> bool:
 def duplicate_application_blocked(settings: RecruitmentSettings, last_applied_at) -> bool:
     if settings.duplicate_application_action != RecruitmentSettings.DUPLICATE_ACTION_BLOCK:
         return False
+    window_days = int(settings.duplicate_application_window_days or 0)
+    if window_days <= 0:
+        return False
+    if not last_applied_at:
+        return False
+    cutoff = timezone.now() - timedelta(days=window_days)
+    return last_applied_at >= cutoff
+
+
+def duplicate_application_detected(settings: RecruitmentSettings, last_applied_at) -> bool:
     window_days = int(settings.duplicate_application_window_days or 0)
     if window_days <= 0:
         return False
@@ -445,3 +458,583 @@ def send_refusal_email(
         body=body,
         template=template,
     )
+
+
+def notify_internal_job_posted(
+    *,
+    job: JobPosition,
+    employer: EmployerProfile,
+    settings_obj: RecruitmentSettings = None,
+    actor_user_id: int = None,
+) -> int:
+    """
+    Notify active employees when a job is posted for internal visibility.
+    Returns number of notifications created.
+    """
+    if not job or not job.is_published:
+        return 0
+
+    tenant_db = job._state.db or "default"
+    settings_obj = settings_obj or ensure_recruitment_settings(job.employer_id, tenant_db)
+    if not job_scope_allows_internal(job, settings_obj):
+        return 0
+
+    memberships = (
+        EmployeeMembership.objects.filter(
+            employer_profile_id=employer.id,
+            status=EmployeeMembership.STATUS_ACTIVE,
+        )
+        .select_related("user")
+    )
+
+    recipients = []
+    for membership in memberships:
+        user = membership.user
+        if not user or not user.is_active:
+            continue
+        if actor_user_id and user.id == actor_user_id:
+            continue
+        recipients.append(user)
+
+    if not recipients:
+        return 0
+
+    title = f"New internal role: {job.title}"
+    body = f"{employer.company_name} posted a new internal opportunity."
+    payload = {
+        "job_id": str(job.id),
+        "job_title": job.title,
+        "path": f"/employee/jobs/{job.id}",
+        "event": "recruitment.job_posted",
+        "publish_scope": job.publish_scope or settings_obj.job_publish_scope,
+    }
+
+    for user in recipients:
+        create_notification(
+            user=user,
+            title=title,
+            body=body,
+            type="INFO",
+            data=payload,
+            employer_profile=employer,
+        )
+
+    return len(recipients)
+
+
+def _get_employer_notification_recipients(
+    employer: EmployerProfile,
+    *,
+    exclude_user_id: int = None,
+) -> list:
+    recipients = {}
+    if employer and getattr(employer, "user", None) and employer.user.is_active:
+        recipients[employer.user.id] = employer.user
+
+    memberships = (
+        EmployeeMembership.objects.filter(
+            employer_profile_id=employer.id,
+            status=EmployeeMembership.STATUS_ACTIVE,
+            role__in=[
+                EmployeeMembership.ROLE_HR,
+                EmployeeMembership.ROLE_ADMIN,
+                EmployeeMembership.ROLE_MANAGER,
+            ],
+        )
+        .select_related("user")
+    )
+    for membership in memberships:
+        user = membership.user
+        if not user or not user.is_active:
+            continue
+        recipients[user.id] = user
+
+    if exclude_user_id:
+        recipients.pop(exclude_user_id, None)
+
+    return list(recipients.values())
+
+
+def notify_employer_application_received(
+    *,
+    applicant: RecruitmentApplicant,
+    employer: EmployerProfile,
+    actor_user_id: int = None,
+    source: str = "public",
+    is_duplicate: bool = False,
+) -> int:
+    if not applicant or not employer:
+        return 0
+
+    recipients = _get_employer_notification_recipients(
+        employer,
+        exclude_user_id=actor_user_id,
+    )
+    if not recipients:
+        return 0
+
+    job_title = applicant.job.title if applicant.job else "a role"
+    title = "New job application"
+    if applicant.is_internal_applicant or source == "internal":
+        title = "Internal application submitted"
+    if is_duplicate:
+        title = "Duplicate application received"
+    body = f"{applicant.full_name} applied for {job_title}."
+    if is_duplicate:
+        body = f"{applicant.full_name} submitted a duplicate application for {job_title}."
+    data = {
+        "applicant_id": str(applicant.id),
+        "job_id": str(applicant.job_id) if applicant.job_id else None,
+        "path": "/employer/recruitment",
+        "event": "recruitment.application_submitted",
+        "source": source,
+        "is_internal": bool(applicant.is_internal_applicant),
+        "is_duplicate": bool(is_duplicate),
+    }
+
+    for user in recipients:
+        create_notification(
+            user=user,
+            title=title,
+            body=body,
+            type="ACTION",
+            data=data,
+            employer_profile=employer,
+        )
+
+    return len(recipients)
+
+
+def notify_applicant_application_received(
+    *,
+    applicant: RecruitmentApplicant,
+    user,
+    employer: EmployerProfile,
+) -> bool:
+    if not applicant or not user:
+        return False
+
+    job_title = applicant.job.title if applicant.job else "the role"
+    title = "Application submitted"
+    body = f"We received your application for {job_title}."
+    data = {
+        "applicant_id": str(applicant.id),
+        "job_id": str(applicant.job_id) if applicant.job_id else None,
+        "path": f"/employee/jobs/{applicant.job_id}" if applicant.job_id else "/employee/jobs",
+        "event": "recruitment.application_submitted",
+    }
+
+    create_notification(
+        user=user,
+        title=title,
+        body=body,
+        type="INFO",
+        data=data,
+        employer_profile=employer,
+    )
+    return True
+
+
+def _get_applicant_user(applicant: RecruitmentApplicant):
+    if not applicant or not applicant.user_id:
+        return None
+    User = get_user_model()
+    return User.objects.filter(id=applicant.user_id, is_active=True).first()
+
+
+def notify_recruitment_stage_moved(
+    *,
+    applicant: RecruitmentApplicant,
+    employer: EmployerProfile,
+    from_stage: RecruitmentStage = None,
+    to_stage: RecruitmentStage = None,
+    actor_user_id: int = None,
+) -> None:
+    if not applicant or not employer or not to_stage:
+        return
+
+    job_title = applicant.job.title if applicant.job else "a role"
+    stage_name = to_stage.name
+
+    recipients = _get_employer_notification_recipients(
+        employer,
+        exclude_user_id=actor_user_id,
+    )
+    if recipients:
+        for user in recipients:
+            create_notification(
+                user=user,
+                title="Applicant moved stage",
+                body=f"{applicant.full_name} moved to {stage_name} for {job_title}.",
+                type="ACTION",
+                data={
+                    "applicant_id": str(applicant.id),
+                    "job_id": str(applicant.job_id) if applicant.job_id else None,
+                    "path": "/employer/recruitment",
+                    "event": "recruitment.stage_moved",
+                    "to_stage": stage_name,
+                    "from_stage": from_stage.name if from_stage else None,
+                },
+                employer_profile=employer,
+            )
+
+    user = _get_applicant_user(applicant)
+    if user:
+        create_notification(
+            user=user,
+            title="Application update",
+            body=f"Your application for {job_title} moved to {stage_name}.",
+            type="INFO",
+            data={
+                "applicant_id": str(applicant.id),
+                "job_id": str(applicant.job_id) if applicant.job_id else None,
+                "path": f"/employee/jobs/{applicant.job_id}" if applicant.job_id else "/employee/jobs",
+                "event": "recruitment.stage_moved",
+                "to_stage": stage_name,
+                "from_stage": from_stage.name if from_stage else None,
+            },
+            employer_profile=employer,
+        )
+
+
+def notify_recruitment_refused(
+    *,
+    applicant: RecruitmentApplicant,
+    employer: EmployerProfile,
+    actor_user_id: int = None,
+    reason_name: str = "",
+) -> None:
+    if not applicant or not employer:
+        return
+
+    job_title = applicant.job.title if applicant.job else "the role"
+
+    recipients = _get_employer_notification_recipients(
+        employer,
+        exclude_user_id=actor_user_id,
+    )
+    if recipients:
+        for user in recipients:
+            create_notification(
+                user=user,
+                title="Application refused",
+                body=f"{applicant.full_name} was marked refused for {job_title}.",
+                type="ALERT",
+                data={
+                    "applicant_id": str(applicant.id),
+                    "job_id": str(applicant.job_id) if applicant.job_id else None,
+                    "path": "/employer/recruitment",
+                    "event": "recruitment.refused",
+                    "reason": reason_name or None,
+                },
+                employer_profile=employer,
+            )
+
+    user = _get_applicant_user(applicant)
+    if user:
+        create_notification(
+            user=user,
+            title="Application update",
+            body=f"Your application for {job_title} was not selected.",
+            type="INFO",
+            data={
+                "applicant_id": str(applicant.id),
+                "job_id": str(applicant.job_id) if applicant.job_id else None,
+                "path": f"/employee/jobs/{applicant.job_id}" if applicant.job_id else "/employee/jobs",
+                "event": "recruitment.refused",
+            },
+            employer_profile=employer,
+        )
+
+
+def notify_recruitment_hired(
+    *,
+    applicant: RecruitmentApplicant,
+    employer: EmployerProfile,
+    actor_user_id: int = None,
+) -> None:
+    if not applicant or not employer:
+        return
+
+    job_title = applicant.job.title if applicant.job else "the role"
+
+    recipients = _get_employer_notification_recipients(
+        employer,
+        exclude_user_id=actor_user_id,
+    )
+    if recipients:
+        for user in recipients:
+            create_notification(
+                user=user,
+                title="Applicant hired",
+                body=f"{applicant.full_name} was marked hired for {job_title}.",
+                type="ACTION",
+                data={
+                    "applicant_id": str(applicant.id),
+                    "job_id": str(applicant.job_id) if applicant.job_id else None,
+                    "path": "/employer/recruitment",
+                    "event": "recruitment.hired",
+                },
+                employer_profile=employer,
+            )
+
+    user = _get_applicant_user(applicant)
+    if user:
+        create_notification(
+            user=user,
+            title="Congratulations!",
+            body=f"You have been marked hired for {job_title}.",
+            type="INFO",
+            data={
+                "applicant_id": str(applicant.id),
+                "job_id": str(applicant.job_id) if applicant.job_id else None,
+                "path": f"/employee/jobs/{applicant.job_id}" if applicant.job_id else "/employee/jobs",
+                "event": "recruitment.hired",
+            },
+            employer_profile=employer,
+        )
+
+
+def notify_recruitment_offer_sent(
+    *,
+    offer,
+    employer: EmployerProfile,
+    actor_user_id: int = None,
+    settings_obj: RecruitmentSettings = None,
+) -> None:
+    if not offer or not employer:
+        return
+
+    applicant = getattr(offer, "applicant", None)
+    if not applicant:
+        return
+
+    tenant_db = offer._state.db
+    if not tenant_db and getattr(applicant, "_state", None):
+        tenant_db = applicant._state.db
+    tenant_db = tenant_db or "default"
+    if settings_obj is None and employer:
+        try:
+            settings_obj = ensure_recruitment_settings(employer.id, tenant_db)
+        except Exception:
+            settings_obj = None
+
+    job_title = applicant.job.title if applicant.job else "the role"
+    esign_enabled = bool(getattr(settings_obj, "integration_offers_esign_enabled", False))
+
+    recipients = _get_employer_notification_recipients(
+        employer,
+        exclude_user_id=actor_user_id,
+    )
+    if recipients:
+        title = "Offer sent"
+        body = f"Offer sent to {applicant.full_name} for {job_title}."
+        if esign_enabled:
+            title = "Offer sent for e-signature"
+            body = f"Offer sent to {applicant.full_name} for e-signature on {job_title}."
+        for user in recipients:
+            create_notification(
+                user=user,
+                title=title,
+                body=body,
+                type="ACTION",
+                data={
+                    "applicant_id": str(applicant.id),
+                    "job_id": str(applicant.job_id) if applicant.job_id else None,
+                    "offer_id": str(getattr(offer, "id", "")) or None,
+                    "path": "/employer/recruitment",
+                    "event": "recruitment.offer_sent",
+                    "integration_esign_enabled": esign_enabled,
+                },
+                employer_profile=employer,
+            )
+
+    user = _get_applicant_user(applicant)
+    if user:
+        title = "Offer sent"
+        body = f"An offer has been sent to you for {job_title}."
+        if esign_enabled:
+            title = "Offer ready for signature"
+            body = f"Your offer for {job_title} is ready for e-signature."
+        create_notification(
+            user=user,
+            title=title,
+            body=body,
+            type="INFO",
+            data={
+                "applicant_id": str(applicant.id),
+                "job_id": str(applicant.job_id) if applicant.job_id else None,
+                "offer_id": str(getattr(offer, "id", "")) or None,
+                "path": f"/employee/jobs/{applicant.job_id}" if applicant.job_id else "/employee/jobs",
+                "event": "recruitment.offer_sent",
+                "integration_esign_enabled": esign_enabled,
+            },
+            employer_profile=employer,
+        )
+
+
+def _is_interview_stage(stage: RecruitmentStage) -> bool:
+    if not stage:
+        return False
+    name = (stage.name or "").lower()
+    return "interview" in name
+
+
+def notify_integration_job_board_ingest(
+    *,
+    job: JobPosition,
+    employer: EmployerProfile,
+    settings_obj: RecruitmentSettings = None,
+    actor_user_id: int = None,
+) -> int:
+    if not job or not employer:
+        return 0
+
+    tenant_db = job._state.db or "default"
+    settings_obj = settings_obj or ensure_recruitment_settings(employer.id, tenant_db)
+    if not settings_obj.integration_job_board_ingest_enabled:
+        return 0
+    if not job.is_published:
+        return 0
+    if not job_scope_allows_public(job, settings_obj):
+        return 0
+
+    recipients = _get_employer_notification_recipients(
+        employer,
+        exclude_user_id=actor_user_id,
+    )
+    if not recipients:
+        return 0
+
+    title = "Job board sync queued"
+    body = f"{job.title} is queued for job board distribution."
+    payload = {
+        "job_id": str(job.id),
+        "job_title": job.title,
+        "path": "/employer/recruitment",
+        "event": "recruitment.integration.job_board_ingest",
+    }
+
+    for user in recipients:
+        create_notification(
+            user=user,
+            title=title,
+            body=body,
+            type="INFO",
+            data=payload,
+            employer_profile=employer,
+        )
+
+    return len(recipients)
+
+
+def notify_integration_resume_ocr_queued(
+    *,
+    applicant: RecruitmentApplicant,
+    employer: EmployerProfile,
+    settings_obj: RecruitmentSettings = None,
+    actor_user_id: int = None,
+) -> int:
+    if not applicant or not employer:
+        return 0
+
+    tenant_db = applicant._state.db or "default"
+    settings_obj = settings_obj or ensure_recruitment_settings(employer.id, tenant_db)
+    if not settings_obj.integration_resume_ocr_enabled:
+        return 0
+
+    has_cv = RecruitmentAttachment.objects.using(tenant_db).filter(
+        applicant=applicant,
+        purpose=RecruitmentAttachment.PURPOSE_CV,
+    ).exists()
+    if not has_cv:
+        return 0
+
+    recipients = _get_employer_notification_recipients(
+        employer,
+        exclude_user_id=actor_user_id,
+    )
+    if not recipients:
+        return 0
+
+    job_title = applicant.job.title if applicant.job else "the role"
+    title = "Resume parsing queued"
+    body = f"Resume OCR queued for {applicant.full_name} ({job_title})."
+    payload = {
+        "applicant_id": str(applicant.id),
+        "job_id": str(applicant.job_id) if applicant.job_id else None,
+        "path": "/employer/recruitment",
+        "event": "recruitment.integration.resume_ocr",
+    }
+
+    for user in recipients:
+        create_notification(
+            user=user,
+            title=title,
+            body=body,
+            type="INFO",
+            data=payload,
+            employer_profile=employer,
+        )
+
+    return len(recipients)
+
+
+def notify_integration_interview_scheduling(
+    *,
+    applicant: RecruitmentApplicant,
+    employer: EmployerProfile,
+    stage: RecruitmentStage,
+    settings_obj: RecruitmentSettings = None,
+    actor_user_id: int = None,
+) -> None:
+    if not applicant or not employer or not stage:
+        return
+
+    tenant_db = applicant._state.db or "default"
+    settings_obj = settings_obj or ensure_recruitment_settings(employer.id, tenant_db)
+    if not settings_obj.integration_interview_scheduling_enabled:
+        return
+    if not _is_interview_stage(stage):
+        return
+
+    job_title = applicant.job.title if applicant.job else "the role"
+    stage_name = stage.name
+
+    recipients = _get_employer_notification_recipients(
+        employer,
+        exclude_user_id=actor_user_id,
+    )
+    if recipients:
+        for user in recipients:
+            create_notification(
+                user=user,
+                title="Interview scheduling needed",
+                body=f"Schedule {stage_name} for {applicant.full_name} ({job_title}).",
+                type="ACTION",
+                data={
+                    "applicant_id": str(applicant.id),
+                    "job_id": str(applicant.job_id) if applicant.job_id else None,
+                    "path": "/employer/recruitment",
+                    "event": "recruitment.integration.interview_scheduling",
+                    "stage": stage_name,
+                },
+                employer_profile=employer,
+            )
+
+    user = _get_applicant_user(applicant)
+    if user:
+        create_notification(
+            user=user,
+            title="Interview scheduling",
+            body=f"We will contact you to schedule your {stage_name} for {job_title}.",
+            type="INFO",
+            data={
+                "applicant_id": str(applicant.id),
+                "job_id": str(applicant.job_id) if applicant.job_id else None,
+                "path": f"/employee/jobs/{applicant.job_id}" if applicant.job_id else "/employee/jobs",
+                "event": "recruitment.integration.interview_scheduling",
+                "stage": stage_name,
+            },
+            employer_profile=employer,
+        )

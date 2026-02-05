@@ -335,6 +335,15 @@ class JobPositionSerializer(serializers.ModelSerializer):
 class JobPositionPublicSerializer(serializers.ModelSerializer):
     department_name = serializers.CharField(source="department.name", read_only=True)
     employer_name = serializers.SerializerMethodField()
+    employer_slug = serializers.SerializerMethodField()
+    company_name = serializers.SerializerMethodField()
+    company_logo = serializers.SerializerMethodField()
+    company_tagline = serializers.SerializerMethodField()
+    company_overview = serializers.SerializerMethodField()
+    company_website = serializers.SerializerMethodField()
+    company_size = serializers.SerializerMethodField()
+    careers_email = serializers.SerializerMethodField()
+    linkedin_url = serializers.SerializerMethodField()
 
     class Meta:
         model = JobPosition
@@ -346,19 +355,81 @@ class JobPositionPublicSerializer(serializers.ModelSerializer):
             "department",
             "department_name",
             "employer_name",
+            "employer_slug",
+            "company_name",
+            "company_logo",
+            "company_tagline",
+            "company_overview",
+            "company_website",
+            "company_size",
+            "careers_email",
+            "linkedin_url",
             "location",
             "employment_type",
             "is_remote",
             "published_at",
         ]
 
-    def get_employer_name(self, obj):
+    def _get_employer_profile(self, obj):
+        cache = getattr(self, "_employer_cache", None)
+        if cache is None:
+            cache = {}
+            self._employer_cache = cache
+
+        employer_id = obj.employer_id
+        if employer_id in cache:
+            return cache[employer_id]
+
         from accounts.models import EmployerProfile
 
-        try:
-            return EmployerProfile.objects.get(id=obj.employer_id).company_name
-        except EmployerProfile.DoesNotExist:
-            return None
+        profile = EmployerProfile.objects.filter(id=employer_id).first()
+        cache[employer_id] = profile
+        return profile
+
+    def get_employer_name(self, obj):
+        profile = self._get_employer_profile(obj)
+        return profile.company_name if profile else None
+
+    def get_employer_slug(self, obj):
+        profile = self._get_employer_profile(obj)
+        return profile.slug if profile else None
+
+    def get_company_name(self, obj):
+        profile = self._get_employer_profile(obj)
+        return profile.company_name if profile else None
+
+    def get_company_logo(self, obj):
+        profile = self._get_employer_profile(obj)
+        if profile and profile.company_logo:
+            try:
+                return profile.company_logo.url
+            except Exception:
+                return None
+        return None
+
+    def get_company_tagline(self, obj):
+        profile = self._get_employer_profile(obj)
+        return profile.company_tagline if profile else None
+
+    def get_company_overview(self, obj):
+        profile = self._get_employer_profile(obj)
+        return profile.company_overview if profile else None
+
+    def get_company_website(self, obj):
+        profile = self._get_employer_profile(obj)
+        return profile.company_website if profile else None
+
+    def get_company_size(self, obj):
+        profile = self._get_employer_profile(obj)
+        return profile.company_size if profile else None
+
+    def get_careers_email(self, obj):
+        profile = self._get_employer_profile(obj)
+        return profile.careers_email if profile else None
+
+    def get_linkedin_url(self, obj):
+        profile = self._get_employer_profile(obj)
+        return profile.linkedin_url if profile else None
 
 
 class RecruitmentAttachmentSerializer(serializers.ModelSerializer):
@@ -538,6 +609,8 @@ class RecruitmentApplySerializer(serializers.Serializer):
     source = serializers.CharField(required=False, allow_blank=True)
     medium = serializers.CharField(required=False, allow_blank=True)
     referral = serializers.CharField(required=False, allow_blank=True)
+    captcha_token = serializers.CharField(required=False, allow_blank=True)
+    website = serializers.CharField(required=False, allow_blank=True)
 
     def validate_intro(self, value):
         return sanitize_rich_text(value)

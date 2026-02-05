@@ -193,23 +193,53 @@ def detect_duplicate_employees(employer, national_id=None, email=None, phone=Non
     same_institution_matches = []
     cross_institution_matches = []
     
-    # Process registry matches
+    # Process registry matches using memberships when available
+    from accounts.models import EmployeeMembership
+    registry_user_ids = [profile.user_id for profile in registry_matches if getattr(profile, 'user_id', None)]
+    memberships_by_user = {}
+    if registry_user_ids:
+        memberships = (
+            EmployeeMembership.objects
+            .filter(user_id__in=registry_user_ids, status=EmployeeMembership.STATUS_ACTIVE)
+            .select_related('employer_profile')
+        )
+        for membership in memberships:
+            memberships_by_user.setdefault(membership.user_id, []).append(membership)
+
     for profile in registry_matches:
-        try:
-            Employee.objects.using(current_tenant_db).get(user_id=profile.user_id)
-            same_institution_matches.append({
-                'type': 'registry',
-                'data': profile,
-                'employer_id': employer.id,
-                'employer_name': employer.company_name
-            })
-        except Employee.DoesNotExist:
-            cross_institution_matches.append({
-                'type': 'registry',
-                'data': profile,
-                'employer_id': 'unknown',
-                'employer_name': 'Other Institution'
-            })
+        memberships = memberships_by_user.get(profile.user_id, [])
+        if memberships:
+            for membership in memberships:
+                employer_profile = membership.employer_profile
+                employer_id = employer_profile.id if employer_profile else None
+                employer_name = employer_profile.company_name if employer_profile else 'Unknown'
+                match_entry = {
+                    'type': 'registry',
+                    'data': profile,
+                    'employer_id': employer_id,
+                    'employer_name': employer_name
+                }
+                if employer_id == employer.id:
+                    same_institution_matches.append(match_entry)
+                else:
+                    cross_institution_matches.append(match_entry)
+        else:
+            # Fallback to tenant lookup if membership not available
+            try:
+                Employee.objects.using(current_tenant_db).get(user_id=profile.user_id)
+                same_institution_matches.append({
+                    'type': 'registry',
+                    'data': profile,
+                    'employer_id': employer.id,
+                    'employer_name': employer.company_name
+                })
+            except Employee.DoesNotExist:
+                cross_institution_matches.append({
+                    'type': 'registry',
+                    'data': profile,
+                    'employer_id': None,
+                    'employer_name': 'Unknown'
+                })
     
     # Process tenant matches
     for match in tenant_matches:
@@ -618,7 +648,8 @@ def get_cross_institution_summary(employee, config):
     return {
         'has_other_institutions': records.exists(),
         'count': records.count(),
-        'records': summary
+        'records': summary,
+        'institutions': summary  # Backward-compatible alias for frontend consumers
     }
 
 
@@ -1034,59 +1065,89 @@ def check_concurrent_employment(employee_registry_id, new_employer_id, config):
     Returns:
         dict: {'allowed': bool, 'reason': str, 'existing_employers': list}
     """
-    from accounts.models import EmployerProfile
+    from accounts.models import EmployerProfile, EmployeeMembership, EmployeeRegistry
     from employees.models import Employee
     from accounts.database_utils import get_tenant_database_alias
     
     existing_employers = []
-    
-    # Search all tenant databases for this employee
-    all_employers = EmployerProfile.objects.filter(user__is_active=True)
-    
-    for employer in all_employers:
-        if employer.id == new_employer_id:
+
+    # Resolve contract-level gating for multi-institution employment
+    contract_allows_multi = False
+    try:
+        new_employer = EmployerProfile.objects.get(id=new_employer_id)
+        tenant_db = get_tenant_database_alias(new_employer)
+        from contracts.models import ContractConfiguration
+        contract_config = ContractConfiguration.objects.using(tenant_db).filter(
+            employer_id=new_employer_id,
+            contract_type__isnull=True
+        ).first()
+        contract_allows_multi = bool(contract_config and contract_config.allow_multi_institution_employment)
+    except EmployerProfile.DoesNotExist:
+        contract_allows_multi = False
+    except Exception:
+        contract_allows_multi = False
+
+    # Fetch registry and memberships for this user
+    try:
+        registry = EmployeeRegistry.objects.get(id=employee_registry_id)
+    except EmployeeRegistry.DoesNotExist:
+        return {
+            'allowed': True,
+            'reason': 'No concurrent employment detected',
+            'existing_employers': []
+        }
+
+    memberships = (
+        EmployeeMembership.objects
+        .filter(user_id=registry.user_id, status=EmployeeMembership.STATUS_ACTIVE)
+        .select_related('employer_profile')
+    )
+
+    for membership in memberships:
+        employer = membership.employer_profile
+        if not employer or employer.id == new_employer_id:
             continue
-            
-        try:
-            tenant_db = get_tenant_database_alias(employer)
-            # Check if employee exists in this tenant and is active
-            active_employee = Employee.objects.using(tenant_db).filter(
-                user_id__isnull=False,
-                employment_status='ACTIVE'
-            ).first()
-            
-            if active_employee:
-                # Get user_id from EmployeeRegistry
-                from accounts.models import EmployeeRegistry
-                try:
-                    registry = EmployeeRegistry.objects.get(id=employee_registry_id)
-                    if active_employee.user_id == registry.user_id:
-                        existing_employers.append({
-                            'employer_id': employer.id,
-                            'employer_name': employer.company_name,
-                            'employee_id': active_employee.employee_id,
-                            'hire_date': active_employee.hire_date,
-                        })
-                except EmployeeRegistry.DoesNotExist:
-                    pass
-        except Exception:
-            continue
+
+        entry = {
+            'employer_id': employer.id,
+            'employer_name': employer.company_name,
+        }
+
+        # Try to resolve employee details for context
+        if membership.tenant_employee_id:
+            try:
+                tenant_db = get_tenant_database_alias(employer)
+                matched = Employee.objects.using(tenant_db).filter(id=membership.tenant_employee_id).only(
+                    'employee_id', 'hire_date'
+                ).first()
+                if matched:
+                    entry['employee_id'] = matched.employee_id
+                    entry['hire_date'] = matched.hire_date
+                else:
+                    entry['employee_id'] = membership.tenant_employee_id
+            except Exception:
+                entry['employee_id'] = membership.tenant_employee_id
+
+        existing_employers.append(entry)
     
     # If there are existing active employments
     if existing_employers:
-        if not config.allow_concurrent_employment:
+        allow_concurrent = bool(config and config.allow_concurrent_employment)
+        if not allow_concurrent or not contract_allows_multi:
+            reason = 'Concurrent employment is not allowed by this employer'
+            if not contract_allows_multi:
+                reason = 'Concurrent employment is not allowed by contract configuration'
             return {
                 'allowed': False,
-                'reason': 'Concurrent employment is not allowed by this employer',
+                'reason': reason,
                 'existing_employers': existing_employers
             }
-        else:
-            return {
-                'allowed': True,
-                'reason': 'Concurrent employment allowed',
-                'existing_employers': existing_employers,
-                'requires_consent': config.require_employee_consent_cross_institution
-            }
+        return {
+            'allowed': True,
+            'reason': 'Concurrent employment allowed',
+            'existing_employers': existing_employers,
+            'requires_consent': bool(config and config.require_employee_consent_cross_institution)
+        }
     
     # No existing employments found
     return {

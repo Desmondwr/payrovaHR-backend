@@ -9,6 +9,7 @@ from django_ratelimit.decorators import ratelimit
 from django.utils.decorators import method_decorator
 from django.core.files.base import ContentFile
 from django.utils import timezone
+from django.db.models import Q
 from accounts.notifications import create_notification
 from .models import (
     ActivationToken,
@@ -26,6 +27,7 @@ from .serializers import (
     ActivateAccountSerializer,
     LoginSerializer,
     EmployerProfileSerializer,
+    EmployerPublicProfileSerializer,
     Enable2FASerializer,
     Disable2FASerializer,
     EmployeeRegistrySerializer,
@@ -459,6 +461,42 @@ class EmployerProfileView(generics.RetrieveUpdateAPIView):
             errors=serializer.errors,
             status=status.HTTP_400_BAD_REQUEST
         )
+
+
+class PublicEmployerProfileView(APIView):
+    """Public view to retrieve an employer profile by slug"""
+
+    permission_classes = [permissions.AllowAny]
+
+    def get(self, request, slug):
+        employer = EmployerProfile.objects.filter(slug=slug).first()
+        if not employer:
+            return Response({"detail": "Employer not found."}, status=status.HTTP_404_NOT_FOUND)
+
+        data = EmployerPublicProfileSerializer(employer).data
+
+        open_roles_count = 0
+        try:
+            from accounts.database_utils import ensure_tenant_database_loaded
+            from recruitment.models import JobPosition
+            from recruitment.services import ensure_recruitment_settings, job_visible_to_public
+
+            tenant_db = ensure_tenant_database_loaded(employer)
+            settings_obj = ensure_recruitment_settings(employer.id, tenant_db)
+            if job_visible_to_public(settings_obj):
+                qs = JobPosition.objects.using(tenant_db).filter(
+                    employer_id=employer.id,
+                    status=JobPosition.STATUS_OPEN,
+                    is_published=True,
+                )
+                qs = qs.filter(Q(publish_scope__in=["PUBLIC_ONLY", "BOTH"]) | Q(publish_scope__isnull=True))
+                open_roles_count = qs.count()
+        except Exception:
+            open_roles_count = 0
+
+        data["open_roles_count"] = open_roles_count
+
+        return Response(data, status=status.HTTP_200_OK)
 
 
 class CompleteEmployerProfileView(APIView):

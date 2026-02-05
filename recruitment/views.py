@@ -39,6 +39,14 @@ from .services import (
     get_required_custom_question_ids,
     get_recruitment_settings_cached,
     invalidate_recruitment_settings_cache,
+    job_scope_allows_internal,
+    job_scope_allows_public,
+    notify_integration_interview_scheduling,
+    notify_integration_job_board_ingest,
+    notify_internal_job_posted,
+    notify_recruitment_hired,
+    notify_recruitment_refused,
+    notify_recruitment_stage_moved,
     publish_scope_allowed,
     send_application_ack_email,
     send_stage_email_if_enabled,
@@ -249,6 +257,21 @@ class JobPositionViewSet(viewsets.ModelViewSet):
 
         serializer.instance = instance
 
+        if instance.is_published and job_scope_allows_internal(instance, settings_obj):
+            notify_internal_job_posted(
+                job=instance,
+                employer=employer,
+                settings_obj=settings_obj,
+                actor_user_id=self.request.user.id,
+            )
+        if instance.is_published and job_scope_allows_public(instance, settings_obj):
+            notify_integration_job_board_ingest(
+                job=instance,
+                employer=employer,
+                settings_obj=settings_obj,
+                actor_user_id=self.request.user.id,
+            )
+
     def perform_update(self, serializer):
         employer = get_active_employer(self.request, require_context=True)
         tenant_db = get_tenant_database_alias(employer)
@@ -290,8 +313,13 @@ class JobPositionViewSet(viewsets.ModelViewSet):
         validated_data.pop('department', None)
         validated_data.pop('branch', None)
 
-        # Update instance fields
+        # Track visibility changes before mutating
         instance = serializer.instance
+        was_published = instance.is_published
+        was_internal_visible = job_scope_allows_internal(instance, settings_obj)
+        was_public_visible = job_scope_allows_public(instance, settings_obj)
+
+        # Update instance fields
         for attr, value in validated_data.items():
             setattr(instance, attr, value)
 
@@ -310,6 +338,26 @@ class JobPositionViewSet(viewsets.ModelViewSet):
                 instance.status = JobPosition.STATUS_OPEN
             instance.save(using=tenant_db, update_fields=["published_at", "status"])
 
+        is_internal_visible = job_scope_allows_internal(instance, settings_obj)
+        is_public_visible = job_scope_allows_public(instance, settings_obj)
+        newly_published = instance.is_published and not was_published
+        became_internal = is_internal_visible and not was_internal_visible
+        became_public = is_public_visible and not was_public_visible
+        if instance.is_published and is_internal_visible and (newly_published or became_internal):
+            notify_internal_job_posted(
+                job=instance,
+                employer=employer,
+                settings_obj=settings_obj,
+                actor_user_id=self.request.user.id,
+            )
+        if instance.is_published and is_public_visible and (newly_published or became_public):
+            notify_integration_job_board_ingest(
+                job=instance,
+                employer=employer,
+                settings_obj=settings_obj,
+                actor_user_id=self.request.user.id,
+            )
+
     def destroy(self, request, *args, **kwargs):
         instance = self.get_object()
         tenant_db = instance._state.db or "default"
@@ -325,6 +373,7 @@ class JobPositionViewSet(viewsets.ModelViewSet):
         tenant_db = job._state.db or "default"
         employer = get_active_employer(request, require_context=True)
         settings_obj = ensure_recruitment_settings(employer.id, tenant_db)
+        was_published = job.is_published
 
         publish = request.data.get("publish")
         is_published = request.data.get("is_published")
@@ -344,6 +393,21 @@ class JobPositionViewSet(viewsets.ModelViewSet):
             job.is_published = False
         job.updated_by = request.user.id
         job.save(using=tenant_db)
+
+        if flag and not was_published and job_scope_allows_internal(job, settings_obj):
+            notify_internal_job_posted(
+                job=job,
+                employer=employer,
+                settings_obj=settings_obj,
+                actor_user_id=request.user.id,
+            )
+        if flag and not was_published and job_scope_allows_public(job, settings_obj):
+            notify_integration_job_board_ingest(
+                job=job,
+                employer=employer,
+                settings_obj=settings_obj,
+                actor_user_id=request.user.id,
+            )
         serializer = self.get_serializer(job)
         return Response(serializer.data)
 
@@ -591,6 +655,34 @@ class RecruitmentApplicantViewSet(viewsets.ModelViewSet):
             default_body=settings_obj.default_ack_email_body,
         )
 
+        if stage.is_refused_stage:
+            notify_recruitment_refused(
+                applicant=applicant,
+                employer=employer,
+                actor_user_id=request.user.id,
+            )
+        elif stage.is_hired_stage:
+            notify_recruitment_hired(
+                applicant=applicant,
+                employer=employer,
+                actor_user_id=request.user.id,
+            )
+        else:
+            notify_recruitment_stage_moved(
+                applicant=applicant,
+                employer=employer,
+                from_stage=from_stage,
+                to_stage=stage,
+                actor_user_id=request.user.id,
+            )
+            notify_integration_interview_scheduling(
+                applicant=applicant,
+                employer=employer,
+                stage=stage,
+                settings_obj=settings_obj,
+                actor_user_id=request.user.id,
+            )
+
         output = RecruitmentApplicantSerializer(applicant)
         return Response(output.data)
 
@@ -648,6 +740,13 @@ class RecruitmentApplicantViewSet(viewsets.ModelViewSet):
                 applicant=applicant,
                 reason_name=refuse_reason.name if refuse_reason else "",
             )
+
+        notify_recruitment_refused(
+            applicant=applicant,
+            employer=employer,
+            actor_user_id=request.user.id,
+            reason_name=refuse_reason.name if refuse_reason else "",
+        )
 
         output = RecruitmentApplicantSerializer(applicant)
         return Response(output.data)

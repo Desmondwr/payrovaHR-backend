@@ -1,6 +1,7 @@
 from django.contrib.auth.models import AbstractUser, BaseUserManager
 from django.db import models
 from django.utils import timezone
+from django.utils.text import slugify
 from datetime import timedelta
 import secrets
 import uuid
@@ -173,13 +174,32 @@ class EmployerProfile(models.Model):
     ]
 
     user = models.OneToOneField(User, on_delete=models.CASCADE, related_name='employer_profile')
+
+    COMPANY_SIZES = [
+        ('1-10', '1-10'),
+        ('11-50', '11-50'),
+        ('51-200', '51-200'),
+        ('201-500', '201-500'),
+        ('501-1000', '501-1000'),
+        ('1000+', '1000+'),
+    ]
     
     # Company Information
     company_name = models.CharField(max_length=255)
+    company_logo = models.ImageField(upload_to='company_logos/', blank=True, null=True)
     employer_name_or_group = models.CharField(max_length=255)
     organization_type = models.CharField(max_length=50, choices=ORGANIZATION_TYPES)
     industry_sector = models.CharField(max_length=255)
     date_of_incorporation = models.DateField()
+    company_size = models.CharField(max_length=50, choices=COMPANY_SIZES, blank=True, null=True)
+    company_tagline = models.CharField(max_length=255, blank=True, null=True)
+    company_overview = models.TextField(blank=True, null=True)
+    company_mission = models.TextField(blank=True, null=True)
+    company_values = models.TextField(blank=True, null=True)
+    company_benefits = models.TextField(blank=True, null=True)
+    company_website = models.URLField(blank=True, null=True)
+    careers_email = models.EmailField(blank=True, null=True)
+    linkedin_url = models.URLField(blank=True, null=True)
     
     # Contact Information
     company_location = models.CharField(max_length=255, help_text='City/Region')
@@ -196,8 +216,8 @@ class EmployerProfile(models.Model):
     business_license = models.CharField(max_length=100, help_text='Patente')
     
     # Financial Information
-    bank_name = models.CharField(max_length=255)
-    bank_account_number = models.CharField(max_length=50)
+    bank_name = models.CharField(max_length=255, blank=True, null=True)
+    bank_account_number = models.CharField(max_length=50, blank=True, null=True)
     bank_iban_swift = models.CharField(max_length=50, blank=True, null=True, help_text='IBAN/SWIFT code if applicable')
     
     # Database Information (for multi-tenancy)
@@ -223,6 +243,17 @@ class EmployerProfile(models.Model):
     def get_database_alias(self):
         """Get the database alias for this employer's tenant database"""
         return f"tenant_{self.id}" if self.database_name else 'default'
+
+    def save(self, *args, **kwargs):
+        if not self.slug and self.company_name:
+            base = slugify(self.company_name)[:90] or "employer"
+            slug = base
+            counter = 1
+            while EmployerProfile.objects.filter(slug=slug).exclude(pk=self.pk).exists():
+                slug = f"{base}-{counter}"
+                counter += 1
+            self.slug = slug
+        super().save(*args, **kwargs)
 
 
 class EmployeeMembership(models.Model):

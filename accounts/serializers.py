@@ -27,7 +27,14 @@ class EmployerProfileSerializer(serializers.ModelSerializer):
         fields = '__all__'
         read_only_fields = ('user', 'created_at', 'updated_at')
     def validate(self, data):
-        # Custom validation can be added here
+        if self.instance is None and not self.partial:
+            missing = {}
+            if not data.get("company_logo"):
+                missing["company_logo"] = "Company logo is required."
+            if not data.get("company_size"):
+                missing["company_size"] = "Company size is required."
+            if missing:
+                raise serializers.ValidationError(missing)
         return data
     def create(self, validated_data):
         user = self.context['request'].user
@@ -200,7 +207,14 @@ class EmployerProfileSerializer(serializers.ModelSerializer):
         read_only_fields = ('user', 'created_at', 'updated_at')
     
     def validate(self, data):
-        # Custom validation can be added here
+        if self.instance is None and not self.partial:
+            missing = {}
+            if not data.get("company_logo"):
+                missing["company_logo"] = "Company logo is required."
+            if not data.get("company_size"):
+                missing["company_size"] = "Company size is required."
+            if missing:
+                raise serializers.ValidationError(missing)
         return data
     
     def create(self, validated_data):
@@ -234,6 +248,35 @@ class EmployerProfileSerializer(serializers.ModelSerializer):
         instance.user.save()
         
         return instance
+
+
+class EmployerPublicProfileSerializer(serializers.ModelSerializer):
+    """Public-safe serializer for EmployerProfile"""
+
+    class Meta:
+        model = EmployerProfile
+        fields = (
+            'id',
+            'company_name',
+            'employer_name_or_group',
+            'slug',
+            'company_logo',
+            'company_tagline',
+            'company_overview',
+            'company_mission',
+            'company_values',
+            'company_benefits',
+            'company_website',
+            'company_size',
+            'careers_email',
+            'linkedin_url',
+            'company_location',
+            'physical_address',
+            'industry_sector',
+            'organization_type',
+            'date_of_incorporation',
+            'phone_number',
+        )
 
 
 class Enable2FASerializer(serializers.Serializer):

@@ -1328,7 +1328,18 @@ class CreateEmployeeWithDetectionSerializer(serializers.ModelSerializer):
         # Handle cross-institution records if detected
         if duplicate_info and duplicate_info.get('cross_institution_matches'):
             for match in duplicate_info['cross_institution_matches']:
-                employer_id = match.get('employer_id')
+                raw_employer_id = match.get('employer_id')
+                employer_id = None
+                if isinstance(raw_employer_id, int):
+                    employer_id = raw_employer_id
+                else:
+                    try:
+                        if raw_employer_id is not None and str(raw_employer_id).isdigit():
+                            employer_id = int(raw_employer_id)
+                    except (TypeError, ValueError):
+                        employer_id = None
+                if not employer_id:
+                    continue
                 data = match.get('data')
                 detected_employee_id = None
                 status_val = 'PENDING'
@@ -1346,13 +1357,20 @@ class CreateEmployeeWithDetectionSerializer(serializers.ModelSerializer):
                 else:
                     match_key = getattr(data, 'id', None) or getattr(data, 'pk', None)
 
+                # Resolve match reasons with fallback for registry/tenant prefixes
+                reason_key = str(match_key)
+                reasons = duplicate_info['match_reasons'].get(reason_key)
+                if not reasons:
+                    reason_prefix = 'registry_' if match.get('type') == 'registry' else 'tenant_'
+                    reasons = duplicate_info['match_reasons'].get(f"{reason_prefix}{match_key}", [])
+
                 EmployeeCrossInstitutionRecord.objects.using(tenant_db).create(
                     employee=employee,
                     detected_employer_id=employer_id,
                     detected_employee_id=str(detected_employee_id) if detected_employee_id is not None else '',
                     status=status_val or 'PENDING',
                     consent_status='PENDING' if config and config.require_employee_consent_cross_institution else 'NOT_REQUIRED',
-                    notes=f"Detected during employee creation. Match reasons: {', '.join(duplicate_info['match_reasons'].get(str(match_key), []))}"
+                    notes=f"Detected during employee creation. Match reasons: {', '.join(reasons or [])}"
                 )
         
         # Store flags for view to handle

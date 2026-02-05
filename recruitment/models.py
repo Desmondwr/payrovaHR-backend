@@ -762,4 +762,22 @@ class RecruitmentOffer(models.Model):
     def save(self, *args, **kwargs):
         if self.tenant_id is None:
             self.tenant_id = self.employer_id
+        using = kwargs.get("using") or self._state.db or "default"
+        previous_status = None
+        if self.pk:
+            previous = RecruitmentOffer.objects.using(using).filter(id=self.id).only("status").first()
+            if previous:
+                previous_status = previous.status
         super().save(*args, **kwargs)
+
+        if self.status == self.STATUS_SENT and previous_status != self.STATUS_SENT:
+            try:
+                from accounts.models import EmployerProfile
+                from .services import notify_recruitment_offer_sent
+
+                employer = EmployerProfile.objects.filter(id=self.employer_id).first()
+                if employer:
+                    notify_recruitment_offer_sent(offer=self, employer=employer)
+            except Exception:
+                # Avoid blocking offer persistence on notification failures
+                pass
