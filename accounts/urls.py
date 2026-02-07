@@ -10,7 +10,7 @@ from .views import (
     RequestPasswordResetView, VerifyResetCodeView, ResendResetCodeView,
     ChangePasswordView, MyEmployersView, SetActiveEmployerView,
     PermissionViewSet, RoleViewSet, EmployeeRoleViewSet, UserPermissionOverrideViewSet,
-    PortalContextView
+    PortalContextView, AdminDashboardStatsView, AdminAllEmployeesView, AdminAllUsersView
 )
 
 app_name = 'accounts'
@@ -30,7 +30,10 @@ urlpatterns = [
     path('admin/create-employer/', CreateEmployerView.as_view(), name='create-employer'),
     path('admin/employers/', ListEmployersView.as_view(), name='list-employers'),
     path('admin/employers/<int:pk>/status/', EmployerStatusView.as_view(), name='employer-status'),
-    
+    path('admin/dashboard/stats/', AdminDashboardStatsView.as_view(), name='admin-dashboard-stats'),
+    path('admin/employees/', AdminAllEmployeesView.as_view(), name='admin-all-employees'),
+    path('admin/users/', AdminAllUsersView.as_view(), name='admin-all-users'),
+
     # Authentication endpoints
     path('auth/activate/', ActivateAccountView.as_view(), name='activate-account'),
     path('auth/login/', LoginView.as_view(), name='login'),

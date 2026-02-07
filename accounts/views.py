@@ -1036,3 +1036,338 @@ class PortalContextView(APIView):
                 "is_employer_owner": bool(getattr(user, "is_employer_owner", False)),
             }
         )
+
+
+class AdminDashboardStatsView(APIView):
+    """
+    Comprehensive admin dashboard statistics endpoint.
+    Returns counts and lists for all major entities in the system.
+    """
+    permission_classes = [IsAdminUser]
+
+    def get(self, request):
+        from django.db import connections
+        from django.conf import settings
+        import logging
+
+        logger = logging.getLogger(__name__)
+
+        # Get all employers
+        employers = EmployerProfile.objects.all().order_by('-created_at')
+        employers_data = EmployerListSerializer(employers, many=True).data
+
+        # Initialize counters
+        total_employees = 0
+        total_contracts_issued = 0
+        total_contracts_active = 0
+        total_contracts_terminated = 0
+        total_jobs_posted = 0
+        total_active_jobs = 0
+        total_employees_recruited = 0
+        total_attendance_records = 0
+        total_frontdesk_checkins = 0
+        total_frontdesk_checkouts = 0
+        total_timeoff_requests = 0
+
+        # Track errors for debugging
+        errors = []
+        successful_dbs = 0
+
+        # Aggregate statistics across all tenant databases
+        for employer in employers:
+            if not employer.database_created:
+                continue
+
+            try:
+                # Use the correct alias format: tenant_{employer_id}
+                alias = f"tenant_{employer.id}"
+
+                # Dynamically add database connection if not already configured
+                if alias not in connections.databases:
+                    default_db = settings.DATABASES['default']
+                    tenant_db_config = default_db.copy()
+                    tenant_db_config['NAME'] = employer.database_name
+                    settings.DATABASES[alias] = tenant_db_config
+                    connections.databases[alias] = settings.DATABASES[alias]
+                    logger.info(f"Dynamically added database '{alias}' for employer {employer.id}")
+
+                # Use tenant database connection
+                with connections[alias].cursor() as cursor:
+                    # Count employees
+                    try:
+                        cursor.execute("SELECT COUNT(*) FROM employees_employee")
+                        count = cursor.fetchone()[0]
+                        total_employees += count
+                        logger.info(f"Employer {employer.id}: {count} employees")
+                    except Exception as e:
+                        logger.warning(f"Could not count employees for {employer.id}: {str(e)}")
+
+                    # Count contracts by status
+                    try:
+                        cursor.execute("SELECT COUNT(*) FROM contracts_contract")
+                        total_contracts_issued += cursor.fetchone()[0]
+
+                        cursor.execute("SELECT COUNT(*) FROM contracts_contract WHERE status = 'ACTIVE'")
+                        total_contracts_active += cursor.fetchone()[0]
+
+                        cursor.execute("SELECT COUNT(*) FROM contracts_contract WHERE status = 'TERMINATED'")
+                        total_contracts_terminated += cursor.fetchone()[0]
+                    except Exception as e:
+                        logger.warning(f"Could not count contracts for {employer.id}: {str(e)}")
+
+                    # Count jobs
+                    try:
+                        cursor.execute("SELECT COUNT(*) FROM recruitment_jobposition")
+                        total_jobs_posted += cursor.fetchone()[0]
+
+                        cursor.execute("SELECT COUNT(*) FROM recruitment_jobposition WHERE status = 'OPEN'")
+                        total_active_jobs += cursor.fetchone()[0]
+                    except Exception as e:
+                        logger.warning(f"Could not count jobs for {employer.id}: {str(e)}")
+
+                    # Count recruited employees (accepted applicants who became employees)
+                    try:
+                        cursor.execute("""
+                            SELECT COUNT(*) FROM recruitment_recruitmentapplicant
+                            WHERE status = 'HIRED'
+                        """)
+                        total_employees_recruited += cursor.fetchone()[0]
+                    except Exception as e:
+                        logger.warning(f"Could not count recruitment for {employer.id}: {str(e)}")
+
+                    # Count attendance records
+                    try:
+                        cursor.execute("SELECT COUNT(*) FROM attendance_attendancerecord")
+                        total_attendance_records += cursor.fetchone()[0]
+                    except Exception as e:
+                        logger.warning(f"Could not count attendance for {employer.id}: {str(e)}")
+
+                    # Count frontdesk check-ins and check-outs
+                    try:
+                        cursor.execute("SELECT COUNT(*) FROM frontdesk_visit WHERE check_in_time IS NOT NULL")
+                        total_frontdesk_checkins += cursor.fetchone()[0]
+
+                        cursor.execute("SELECT COUNT(*) FROM frontdesk_visit WHERE check_out_time IS NOT NULL")
+                        total_frontdesk_checkouts += cursor.fetchone()[0]
+                    except Exception as e:
+                        logger.warning(f"Could not count frontdesk for {employer.id}: {str(e)}")
+
+                    # Count time-off requests
+                    try:
+                        cursor.execute("SELECT COUNT(*) FROM timeoff_timeoffrequest")
+                        total_timeoff_requests += cursor.fetchone()[0]
+                    except Exception as e:
+                        logger.warning(f"Could not count timeoff for {employer.id}: {str(e)}")
+
+                successful_dbs += 1
+
+            except Exception as e:
+                # Skip this employer if there's an error accessing their database
+                error_msg = f"Error accessing database for employer {employer.company_name or employer.email} (ID: {employer.id}): {str(e)}"
+                logger.error(error_msg)
+                errors.append(error_msg)
+                continue
+
+        response_data = {
+            'employers': {
+                'total': employers.count(),
+                'list': employers_data
+            },
+            'employees': {
+                'total': total_employees
+            },
+            'contracts': {
+                'total_issued': total_contracts_issued,
+                'active': total_contracts_active,
+                'terminated': total_contracts_terminated
+            },
+            'jobs': {
+                'total_posted': total_jobs_posted,
+                'active': total_active_jobs
+            },
+            'recruitment': {
+                'employees_recruited': total_employees_recruited
+            },
+            'attendance': {
+                'total_records': total_attendance_records
+            },
+            'frontdesk': {
+                'total_checkins': total_frontdesk_checkins,
+                'total_checkouts': total_frontdesk_checkouts
+            },
+            'timeoff': {
+                'total_requests': total_timeoff_requests
+            },
+            'debug': {
+                'total_employers': employers.count(),
+                'employers_with_db': employers.filter(database_created=True).count(),
+                'successful_db_queries': successful_dbs,
+                'errors': errors if errors else None
+            }
+        }
+
+        return api_response(
+            success=True,
+            message='Dashboard statistics retrieved successfully',
+            data=response_data,
+            status=status.HTTP_200_OK
+        )
+
+
+class AdminAllEmployeesView(APIView):
+    """
+    List all employees across all tenant databases (Admin only)
+    """
+    permission_classes = [IsAdminUser]
+
+    def get(self, request):
+        from django.db import connections
+        from django.conf import settings
+        import logging
+
+        logger = logging.getLogger(__name__)
+
+        # Get all employers
+        employers = EmployerProfile.objects.filter(database_created=True)
+
+        all_employees = []
+
+        for employer in employers:
+            try:
+                # Use the correct alias format: tenant_{employer_id}
+                alias = f"tenant_{employer.id}"
+
+                # Dynamically add database connection if not already configured
+                if alias not in connections.databases:
+                    default_db = settings.DATABASES['default']
+                    tenant_db_config = default_db.copy()
+                    tenant_db_config['NAME'] = employer.database_name
+                    settings.DATABASES[alias] = tenant_db_config
+                    connections.databases[alias] = settings.DATABASES[alias]
+
+                # Query employees from this tenant database
+                with connections[alias].cursor() as cursor:
+                    cursor.execute("""
+                        SELECT
+                            e.id,
+                            e.full_name,
+                            e.email,
+                            e.phone_number,
+                            e.employee_id,
+                            e.job_title,
+                            e.hire_date,
+                            e.work_location,
+                            e.is_active,
+                            d.name as department_name
+                        FROM employees_employee e
+                        LEFT JOIN employees_department d ON e.department_id = d.id
+                        ORDER BY e.full_name
+                    """)
+
+                    columns = [col[0] for col in cursor.description]
+                    for row in cursor.fetchall():
+                        employee_data = dict(zip(columns, row))
+                        employee_data['employer_id'] = employer.id
+                        employee_data['employer_name'] = employer.company_name or employer.email
+                        all_employees.append(employee_data)
+
+            except Exception as e:
+                logger.error(f"Error fetching employees from employer {employer.id}: {str(e)}")
+                continue
+
+        return api_response(
+            success=True,
+            message=f'Retrieved {len(all_employees)} employees',
+            data=all_employees,
+            status=status.HTTP_200_OK
+        )
+
+
+class AdminAllUsersView(APIView):
+    """
+    List all users in the system (Admin only)
+    """
+    permission_classes = [IsAdminUser]
+
+    def get_user_role(self, user):
+        """Derive user role from boolean flags"""
+        if user.is_admin:
+            return 'Admin'
+        elif user.is_employer:
+            return 'Employer'
+        elif user.is_employee:
+            return 'Employee'
+        return 'Unknown'
+
+    def get_user_name(self, user):
+        """Get user's display name from various sources"""
+        name = None
+
+        # Try to get name from User model first
+        if user.first_name or user.last_name:
+            name = f"{user.first_name} {user.last_name}".strip()
+
+        # If no name yet, try employer profile
+        if not name and user.is_employer:
+            try:
+                employer_profile = EmployerProfile.objects.get(user=user)
+                name = employer_profile.company_name or employer_profile.employer_name_or_group
+            except EmployerProfile.DoesNotExist:
+                pass
+
+        # If no name yet, try employee registry
+        if not name and user.is_employee:
+            try:
+                employee_registry = EmployeeRegistry.objects.get(user=user)
+                name = f"{employee_registry.first_name} {employee_registry.last_name}".strip()
+            except EmployeeRegistry.DoesNotExist:
+                pass
+
+        return name
+
+    def get(self, request):
+        users = User.objects.all().order_by('-created_at')
+
+        users_data = []
+        for user in users:
+            # Get user's full name from various sources
+            name = self.get_user_name(user)
+
+            # Get last active employer name if exists
+            last_active_employer_name = None
+            if user.last_active_employer_id:
+                try:
+                    employer = EmployerProfile.objects.get(id=user.last_active_employer_id)
+                    last_active_employer_name = employer.company_name
+                except EmployerProfile.DoesNotExist:
+                    pass
+
+            users_data.append({
+                'id': user.id,
+                'email': user.email,
+                'first_name': user.first_name,
+                'last_name': user.last_name,
+                'name': name,
+                'role': self.get_user_role(user),
+                'is_active': user.is_active,
+                'is_staff': user.is_staff,
+                'is_superuser': user.is_superuser,
+                'is_admin': user.is_admin,
+                'is_employer': user.is_employer,
+                'is_employee': user.is_employee,
+                'is_employer_owner': user.is_employer_owner,
+                'profile_completed': user.profile_completed,
+                'two_factor_enabled': user.two_factor_enabled,
+                'last_active_employer_id': user.last_active_employer_id,
+                'last_active_employer_name': last_active_employer_name,
+                'created_at': user.created_at.isoformat() if user.created_at else None,
+                'updated_at': user.updated_at.isoformat() if user.updated_at else None,
+                'last_login': user.last_login.isoformat() if user.last_login else None,
+            })
+
+        return api_response(
+            success=True,
+            message=f'Retrieved {len(users_data)} users',
+            data=users_data,
+            status=status.HTTP_200_OK
+        )
