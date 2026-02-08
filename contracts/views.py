@@ -2,11 +2,23 @@ from rest_framework import viewsets, permissions, status
 from rest_framework.decorators import action
 from rest_framework.response import Response
 from .models import (
-    Contract, ContractConfiguration, ContractTemplate, SalaryScale,
+    Contract, ContractConfiguration, ContractTemplate, ContractTemplateVersion, SalaryScale,
     ContractDocument, ContractSignature
 )
 from .serializers import (
-    ContractSerializer, ContractConfigurationSerializer, SalaryScaleSerializer
+    ContractSerializer,
+    ContractConfigurationSerializer,
+    SalaryScaleSerializer,
+    ContractTemplateSerializer,
+    ContractTemplateVersionSerializer,
+)
+from .notifications import (
+    notify_contract_created,
+    notify_sent_for_approval,
+    notify_signature_captured,
+    notify_terminated,
+    notify_expired,
+    notify_renewed,
 )
 from timeoff.defaults import merge_time_off_defaults
 from django.utils import timezone
@@ -16,6 +28,7 @@ from accounts.models import EmployerProfile, User
 from accounts.permissions import EmployerAccessPermission, EmployerOrEmployeeAccessPermission
 from accounts.rbac import get_active_employer, is_delegate_user, get_delegate_scope, apply_scope_filter
 from contracts.management.commands.seed_contract_template import TYPE_BODIES, BASE_BODY
+from rest_framework.parsers import MultiPartParser, FormParser, JSONParser
 
 class ContractViewSet(viewsets.ModelViewSet):
     """
@@ -151,6 +164,13 @@ class ContractViewSet(viewsets.ModelViewSet):
         else:
             instance.delete()
 
+    def perform_create(self, serializer):
+        contract = serializer.save()
+        try:
+            notify_contract_created(contract)
+        except Exception:
+            pass
+
     @action(detail=False, methods=['get', 'patch'], url_path='template/default')
     def default_template(self, request):
         """Get or update the default template body for the employer by contract_type (no uploads)."""
@@ -177,16 +197,14 @@ class ContractViewSet(viewsets.ModelViewSet):
             .order_by('-created_at')
             .first()
         )
-        if not template:
-            return Response({'error': 'Default template not found for this contract type.'}, status=status.HTTP_404_NOT_FOUND)
-
-        if request.method.lower() == 'get':
+        if not template and request.method.lower() == 'get':
             fallback = TYPE_BODIES.get(contract_type, BASE_BODY)
             return Response({
-                'id': template.id,
+                'id': None,
                 'contract_type': contract_type,
-                'body': template.body_override or fallback,
-                'updated_at': template.updated_at,
+                'body': fallback,
+                'updated_at': None,
+                'template_missing': True,
             })
 
         # PATCH
@@ -194,8 +212,17 @@ class ContractViewSet(viewsets.ModelViewSet):
         if not body:
             return Response({'error': 'body is required.'}, status=status.HTTP_400_BAD_REQUEST)
 
-        template.body_override = body
-        template.save(using=tenant_db)
+        if not template:
+            template = ContractTemplate.objects.using(tenant_db).create(
+                employer_id=employer.id,
+                contract_type=contract_type,
+                name=f"Default {contract_type.title().replace('_', ' ')} Template",
+                body_override=body,
+                is_default=True,
+            )
+        else:
+            template.body_override = body
+            template.save(using=tenant_db)
         return Response({
             'id': template.id,
             'contract_type': contract_type,
@@ -254,16 +281,32 @@ class ContractViewSet(viewsets.ModelViewSet):
         if not (request.user.is_staff or self._is_employer_user(request.user, contract)):
             return Response({'error': 'Only staff or the employer can send contracts for approval.'}, status=status.HTTP_403_FORBIDDEN)
 
+        if not contract.get_effective_config('approval_enabled', False):
+            return Response({'error': 'Approval workflow is disabled by configuration.'}, status=status.HTTP_400_BAD_REQUEST)
+
         try:
             contract.send_for_approval(request.user)
+            try:
+                notify_sent_for_approval(contract)
+            except Exception:
+                pass
             return Response(self.get_serializer(contract).data)
         except ValidationError as e:
             return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
 
     @action(detail=True, methods=['post'], url_path='send-for-signature')
     def send_for_signature_alias(self, request, pk=None):
-        """Compatibility alias - routes to send-for-approval"""
-        return self.send_for_approval(request, pk)
+        """Send contract for signature (approval/signature workflow)."""
+        contract = self.get_object()
+        self._set_tenant_context(contract)
+        if not (request.user.is_staff or self._is_employer_user(request.user, contract)):
+            return Response({'error': 'Only staff or the employer can send contracts for signature.'}, status=status.HTTP_403_FORBIDDEN)
+
+        try:
+            contract.send_for_signature(request.user)
+            return Response(self.get_serializer(contract).data)
+        except ValidationError as e:
+            return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
 
     @action(detail=True, methods=['post'], url_path='generate-document')
     def generate_document(self, request, pk=None):
@@ -359,6 +402,11 @@ class ContractViewSet(viewsets.ModelViewSet):
             document_hash=request.data.get('document_hash')
         )
 
+        try:
+            notify_signature_captured(contract, role=role)
+        except Exception:
+            pass
+
         signatures = ContractSignature.objects.using(db_alias).filter(contract=contract)
         has_employee_sign = signatures.filter(role='EMPLOYEE').exists()
         has_employer_sign = signatures.filter(role='EMPLOYER').exists()
@@ -391,6 +439,9 @@ class ContractViewSet(viewsets.ModelViewSet):
         
         if not new_end_date:
             return Response({'error': 'new_end_date is required'}, status=status.HTTP_400_BAD_REQUEST)
+
+        if not contract.get_effective_config('auto_renew_option_available', False):
+            return Response({'error': 'Renewals are disabled by configuration.'}, status=status.HTTP_400_BAD_REQUEST)
             
         if extend and create_new:
              return Response({'error': 'Cannot extend and create new at the same time'}, status=status.HTTP_400_BAD_REQUEST)
@@ -429,22 +480,24 @@ class ContractViewSet(viewsets.ModelViewSet):
                 changed_fields={'end_date': {'old': old_end_date, 'new': new_end_date}},
                 created_by_id=request.user.id
             )
+
+            try:
+                notify_renewed(contract, mode='extend')
+            except Exception:
+                pass
             
             return Response({'status': 'extended', 'new_end_date': new_end_date})
             
         elif create_new:
             # 2. Create New Contract
-            import uuid
+            from datetime import timedelta
             new_contract = Contract(
                 employer_id=contract.employer_id,
-                contract_id=f"CNT-REN-{uuid.uuid4().hex[:8].upper()}", # temporary ID logic
                 employee=contract.employee,
                 branch=contract.branch,
                 department=contract.department,
                 contract_type=contract.contract_type,
-                start_date=contract.end_date, # Starts when old one ends? Or strictly provided? 
-                # Ideally start_date = old_end_date + 1 day, but let's assume immediate continuation
-                # For MVP let's require start_date in input or default to old end_date
+                start_date=contract.end_date,  # will be adjusted below if needed
                 end_date=new_end_date,
                 salary_scale=contract.salary_scale,
                 base_salary=contract.base_salary,
@@ -457,9 +510,34 @@ class ContractViewSet(viewsets.ModelViewSet):
             
             # Allow overriding start_date
             if 'start_date' in data:
-                 new_contract.start_date = data['start_date']
+                new_contract.start_date = data['start_date']
+            elif contract.end_date:
+                try:
+                    new_contract.start_date = contract.end_date + timedelta(days=1)
+                except Exception:
+                    new_contract.start_date = contract.end_date
+
+            # Generate ID using configuration sequence
+            db_alias = contract._state.db or 'default'
+            new_contract._state.db = db_alias
+            global_config, type_config = Contract.get_config_for(
+                employer_id=contract.employer_id,
+                contract_type=contract.contract_type,
+                db_alias=db_alias
+            )
+            config = type_config or global_config
+            if config:
+                new_contract.contract_id = new_contract.generate_contract_id(config)
+            else:
+                import uuid
+                new_contract.contract_id = f"CNT-REN-{uuid.uuid4().hex[:8].upper()}"
             
             new_contract.save(using=contract._state.db)
+
+            try:
+                notify_renewed(new_contract, mode='create_new')
+            except Exception:
+                pass
             
             return Response({
                 'status': 'renewed',
@@ -485,6 +563,13 @@ class ContractViewSet(viewsets.ModelViewSet):
         termination_date = data.get('termination_date')
         if not termination_date:
             return Response({'error': 'termination_date is required'}, status=status.HTTP_400_BAD_REQUEST)
+        try:
+            from django.utils.dateparse import parse_date
+            parsed = parse_date(str(termination_date))
+            if parsed:
+                termination_date = parsed
+        except Exception:
+            pass
             
         reason = data.get('reason')
         notice_served = data.get('notice_served', False)
@@ -495,7 +580,103 @@ class ContractViewSet(viewsets.ModelViewSet):
         # Validation: termination date should probably be >= start_date
         # But we'll trust the input for now or could add checks.
         
-        # Update Contract
+        # Validate against employee termination configuration (reason/date)
+        config = None
+        employer_profile = None
+        try:
+            from employees.utils import get_or_create_employee_config, create_termination_approval_request
+            from employees.serializers import TerminateEmployeeSerializer, TerminationApprovalSerializer
+            from employees.utils import notify_employer_users, notify_employee_user
+            employer_profile = EmployerProfile.objects.using('default').filter(id=contract.employer_id).first()
+            config = get_or_create_employee_config(contract.employer_id, db_alias)
+            term_serializer = TerminateEmployeeSerializer(
+                data={
+                    'termination_date': termination_date,
+                    'termination_reason': reason,
+                },
+                context={'config': config},
+            )
+            term_serializer.is_valid(raise_exception=True)
+            termination_date = term_serializer.validated_data['termination_date']
+            reason = term_serializer.validated_data.get('termination_reason')
+        except Exception as e:
+            return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
+
+        if config and config.termination_approval_required:
+            # Route through employee termination approval workflow
+            approval = create_termination_approval_request(
+                employee=contract.employee,
+                requested_by=request.user,
+                termination_date=termination_date,
+                termination_reason=reason,
+                config=config,
+                tenant_db=db_alias,
+            )
+
+            contract.log_action(
+                user=request.user,
+                action='TERMINATION_REQUESTED',
+                metadata={
+                    'reason': reason,
+                    'termination_date': str(termination_date),
+                    'approval_id': str(approval.id) if approval else None,
+                },
+            )
+
+            try:
+                notify_employer_users(
+                    employer_profile,
+                    title="Termination requested",
+                    body=f"Termination requested for {contract.employee.full_name}.",
+                    type="ACTION",
+                    data={
+                        "event": "employees.termination_requested",
+                        "employee_id": str(contract.employee.id),
+                        "employee_number": contract.employee.employee_id,
+                        "termination_date": str(termination_date),
+                        "approval_id": str(approval.id) if approval else None,
+                        "contract_id": str(contract.id),
+                        "contract_display_id": contract.contract_id,
+                        "path": f"/employer/employees/{contract.employee.id}",
+                    },
+                )
+            except Exception:
+                pass
+
+            try:
+                notify_employee_user(
+                    contract.employee,
+                    title="Termination requested",
+                    body="A termination request has been initiated for your employment.",
+                    type="ALERT",
+                    data={
+                        "event": "employees.termination_requested",
+                        "termination_date": str(termination_date),
+                        "contract_id": str(contract.id),
+                        "contract_display_id": contract.contract_id,
+                        "path": "/employee/profile",
+                    },
+                    employer_profile=employer_profile,
+                )
+            except Exception:
+                pass
+
+            approval_data = None
+            try:
+                approval_data = TerminationApprovalSerializer(approval).data if approval else None
+            except Exception:
+                approval_data = None
+
+            return Response(
+                {
+                    'message': 'Termination request submitted for approval',
+                    'approval_required': True,
+                    'approval': approval_data,
+                },
+                status=status.HTTP_201_CREATED
+            )
+
+        # Update Contract (no approval required)
         contract.status = 'TERMINATED'
         contract.termination_date = termination_date
         contract.termination_reason = reason
@@ -509,6 +690,15 @@ class ContractViewSet(viewsets.ModelViewSet):
             action='TERMINATED',
             metadata={'reason': reason, 'termination_date': str(termination_date)}
         )
+
+        try:
+            notify_terminated(contract)
+        except Exception:
+            pass
+        try:
+            contract._sync_employee_after_status_change('terminated', user=request.user)
+        except Exception:
+            pass
         
         return Response({
             'status': 'terminated',
@@ -526,6 +716,10 @@ class ContractViewSet(viewsets.ModelViewSet):
 
         try:
             contract.expire(request.user)
+            try:
+                notify_expired(contract)
+            except Exception:
+                pass
             return Response(self.get_serializer(contract).data)
         except ValidationError as e:
             return Response({'error': str(e)}, status=status.HTTP_400_BAD_REQUEST)
@@ -770,4 +964,137 @@ class SalaryScaleViewSet(viewsets.ModelViewSet):
         employer = get_active_employer(self.request, require_context=True)
         tenant_db = get_tenant_database_alias(employer)
         instance.delete(using=tenant_db)
+
+
+class ContractTemplateViewSet(viewsets.ModelViewSet):
+    """API endpoint for managing contract templates."""
+
+    permission_classes = [permissions.IsAuthenticated, EmployerAccessPermission]
+    permission_map = {
+        "list": ["contracts.template.view", "contracts.manage"],
+        "retrieve": ["contracts.template.view", "contracts.manage"],
+        "create": ["contracts.template.update", "contracts.manage"],
+        "update": ["contracts.template.update", "contracts.manage"],
+        "partial_update": ["contracts.template.update", "contracts.manage"],
+        "destroy": ["contracts.template.update", "contracts.manage"],
+        "*": ["contracts.manage"],
+    }
+    serializer_class = ContractTemplateSerializer
+    parser_classes = [MultiPartParser, FormParser, JSONParser]
+
+    def _get_tenant_db(self):
+        from accounts.database_utils import get_tenant_database_alias
+        user = self.request.user
+        employer = None
+        if getattr(user, 'employer_profile', None):
+            employer = user.employer_profile
+        else:
+            resolved = get_active_employer(self.request, require_context=False)
+            if resolved and (user.is_admin or user.is_superuser or is_delegate_user(user, resolved.id)):
+                employer = resolved
+        if employer:
+            return get_tenant_database_alias(employer), employer
+        return None, None
+
+    def _snapshot_version(self, instance, tenant_db):
+        try:
+            ContractTemplateVersion.objects.using(tenant_db).create(
+                template=instance,
+                name=instance.name,
+                category=instance.category,
+                version=instance.version,
+                contract_type=instance.contract_type,
+                body_override=instance.body_override,
+                file=instance.file,
+            )
+        except Exception:
+            pass
+
+    def get_serializer_context(self):
+        context = super().get_serializer_context()
+        tenant_db, employer = self._get_tenant_db()
+        if tenant_db:
+            from accounts.database_utils import ensure_tenant_database_loaded
+            tenant_db = ensure_tenant_database_loaded(employer)
+            context['tenant_db'] = tenant_db
+        return context
+
+    def get_queryset(self):
+        tenant_db, employer = self._get_tenant_db()
+        if tenant_db and employer:
+            qs = ContractTemplate.objects.using(tenant_db).filter(employer_id=employer.id)
+            contract_type = self.request.query_params.get('contract_type')
+            category = self.request.query_params.get('category')
+            search = self.request.query_params.get('search')
+            if contract_type:
+                qs = qs.filter(contract_type=contract_type)
+            if category:
+                qs = qs.filter(category__iexact=category)
+            if search:
+                qs = qs.filter(name__icontains=search)
+            return qs
+        return ContractTemplate.objects.none()
+
+    def perform_create(self, serializer):
+        employer = get_active_employer(self.request, require_context=True)
+        serializer.save(employer_id=employer.id)
+
+    def perform_update(self, serializer):
+        instance = serializer.instance
+        tenant_db, _ = self._get_tenant_db()
+        if tenant_db and instance:
+            self._snapshot_version(instance, tenant_db)
+        serializer.save()
+
+    def perform_destroy(self, instance):
+        from accounts.database_utils import get_tenant_database_alias
+        employer = get_active_employer(self.request, require_context=True)
+        tenant_db = get_tenant_database_alias(employer)
+        instance.delete(using=tenant_db)
+
+    @action(detail=True, methods=['get'], url_path='versions')
+    def versions(self, request, pk=None):
+        tenant_db, _ = self._get_tenant_db()
+        if not tenant_db:
+            return Response([], status=status.HTTP_200_OK)
+        template = self.get_object()
+        qs = ContractTemplateVersion.objects.using(tenant_db).filter(template=template)
+        serializer = ContractTemplateVersionSerializer(qs, many=True, context={'request': request})
+        return Response(serializer.data)
+
+    @action(detail=True, methods=['post'], url_path='restore')
+    def restore(self, request, pk=None):
+        tenant_db, _ = self._get_tenant_db()
+        if not tenant_db:
+            return Response({'error': 'Tenant context not found.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        template = self.get_object()
+        version_id = request.data.get('version_id')
+        if not version_id:
+            return Response({'error': 'version_id is required.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        version = (
+            ContractTemplateVersion.objects.using(tenant_db)
+            .filter(id=version_id, template=template)
+            .first()
+        )
+        if not version:
+            return Response({'error': 'Template version not found.'}, status=status.HTTP_404_NOT_FOUND)
+
+        # Snapshot current state before restore
+        self._snapshot_version(template, tenant_db)
+
+        template.name = version.name
+        template.category = version.category
+        template.version = version.version
+        template.contract_type = version.contract_type
+        template.body_override = version.body_override
+        if version.file:
+            template.file = version.file
+        else:
+            template.file = None
+        template.save(using=tenant_db)
+
+        serializer = self.get_serializer(template)
+        return Response(serializer.data, status=status.HTTP_200_OK)
 

@@ -63,17 +63,62 @@ def detect_duplicate_employees(employer, national_id=None, email=None, phone=Non
     """
     from employees.models import Employee, EmployeeConfiguration
     from accounts.models import EmployeeRegistry, EmployerProfile
-    from accounts.database_utils import get_tenant_database_alias
+    from accounts.database_utils import get_tenant_database_alias, ensure_tenant_database_loaded
     
     # Get configuration from tenant database
     if config is None:
         from employees.models import EmployeeConfiguration
         from accounts.database_utils import get_tenant_database_alias
         tenant_db = get_tenant_database_alias(employer)
+        ensure_tenant_database_loaded(employer)
         config = get_or_create_employee_config(employer.id, tenant_db)
     
     all_matches = []
     match_reasons = {}
+
+    # Normalize inputs for consistent matching
+    import re
+    normalized_national_id = national_id.strip() if isinstance(national_id, str) else national_id
+    normalized_email = email.strip().lower() if isinstance(email, str) else email
+    raw_phone = phone.strip() if isinstance(phone, str) else phone
+    normalized_phone = re.sub(r'\D', '', raw_phone) if isinstance(raw_phone, str) else raw_phone
+    phone_variants = [p for p in {raw_phone, normalized_phone} if p]
+    normalized_first = first_name.strip().lower() if isinstance(first_name, str) else first_name
+    normalized_last = last_name.strip().lower() if isinstance(last_name, str) else last_name
+    lenient_name_match = bool(
+        config and getattr(config, 'duplicate_detection_level', None) == EmployeeConfiguration.DUPLICATE_LENIENT
+    )
+
+    # Determine effective duplicate checks based on detection level and explicit toggles.
+    check_national_id = bool(getattr(config, 'duplicate_check_national_id', False))
+    check_email = bool(getattr(config, 'duplicate_check_email', False))
+    check_phone = bool(getattr(config, 'duplicate_check_phone', False))
+    check_name_dob = bool(getattr(config, 'duplicate_check_name_dob', False))
+
+    if config:
+        level = getattr(config, 'duplicate_detection_level', None)
+        if level == EmployeeConfiguration.DUPLICATE_STRICT:
+            check_email = False
+            check_phone = False
+            check_name_dob = False
+        elif level == EmployeeConfiguration.DUPLICATE_MODERATE:
+            check_name_dob = False
+
+    def _normalize_name(value):
+        return re.sub(r'[^a-z0-9]', '', (value or '').lower())
+
+    def _name_matches(candidate_first, candidate_last):
+        if not normalized_first or not normalized_last:
+            return False
+        first_norm = _normalize_name(candidate_first)
+        last_norm = _normalize_name(candidate_last)
+        target_first = _normalize_name(normalized_first)
+        target_last = _normalize_name(normalized_last)
+        if not first_norm or not last_norm:
+            return False
+        if lenient_name_match:
+            return similar(first_norm, target_first) >= 0.85 and similar(last_norm, target_last) >= 0.85
+        return first_norm == target_first and last_norm == target_last
     
     # PART 1: Search central EmployeeRegistry (employees with user accounts)
     registry_query = EmployeeRegistry.objects.all()
@@ -90,29 +135,41 @@ def detect_duplicate_employees(employer, national_id=None, email=None, phone=Non
     registry_matches = []
     
     if config:
-        if config.duplicate_check_national_id and national_id:
-            for profile in registry_query.filter(national_id_number=national_id):
+        if check_national_id and normalized_national_id:
+            for profile in registry_query.filter(national_id_number=normalized_national_id):
                 registry_matches.append(profile)
                 match_reasons[f'registry_{profile.id}'] = ['National ID match']
         
-        if config.duplicate_check_email and email:
-            for profile in registry_query.filter(Q(user__email=email) | Q(personal_email=email)):
+        if check_email and normalized_email:
+            for profile in registry_query.filter(
+                Q(user__email__iexact=normalized_email) | Q(personal_email__iexact=normalized_email)
+            ):
                 if profile not in registry_matches:
                     registry_matches.append(profile)
                     match_reasons[f'registry_{profile.id}'] = ['Email match']
                 elif f'registry_{profile.id}' in match_reasons:
                     match_reasons[f'registry_{profile.id}'].append('Email match')
         
-        if config.duplicate_check_phone and phone:
-            for profile in registry_query.filter(Q(phone_number=phone) | Q(alternative_phone=phone)):
+        if check_phone and phone_variants:
+            for profile in registry_query.filter(
+                Q(phone_number__in=phone_variants) | Q(alternative_phone__in=phone_variants)
+            ):
                 if profile not in registry_matches:
                     registry_matches.append(profile)
                     match_reasons[f'registry_{profile.id}'] = ['Phone match']
                 elif f'registry_{profile.id}' in match_reasons:
                     match_reasons[f'registry_{profile.id}'].append('Phone match')
+
+        if check_name_dob and normalized_first and normalized_last and date_of_birth:
+            for profile in registry_query.filter(date_of_birth=date_of_birth):
+                if profile in registry_matches:
+                    continue
+                if _name_matches(profile.first_name, profile.last_name):
+                    registry_matches.append(profile)
+                    match_reasons[f'registry_{profile.id}'] = ['Name + DOB match']
     else:
-        if national_id:
-            registry_matches = list(registry_query.filter(national_id_number=national_id))
+        if normalized_national_id:
+            registry_matches = list(registry_query.filter(national_id_number=normalized_national_id))
             for profile in registry_matches:
                 match_reasons[f'registry_{profile.id}'] = ['National ID match']
     
@@ -120,10 +177,12 @@ def detect_duplicate_employees(employer, national_id=None, email=None, phone=Non
     tenant_matches = []
     all_employers = EmployerProfile.objects.filter(user__is_active=True).select_related('user')
     current_tenant_db = get_tenant_database_alias(employer)
+    ensure_tenant_database_loaded(employer)
     
     for emp_profile in all_employers:
         try:
             tenant_db = get_tenant_database_alias(emp_profile)
+            ensure_tenant_database_loaded(emp_profile)
             employee_query = Employee.objects.using(tenant_db).all()
             
             # Exclude the employee being updated
@@ -134,8 +193,8 @@ def detect_duplicate_employees(employer, national_id=None, email=None, phone=Non
             employee_query = employee_query.filter(user_id__isnull=True)
             
             if config:
-                if config.duplicate_check_national_id and national_id:
-                    for emp in employee_query.filter(national_id_number=national_id):
+                if check_national_id and normalized_national_id:
+                    for emp in employee_query.filter(national_id_number=normalized_national_id):
                         tenant_matches.append({
                             'employee': emp,
                             'employer_id': emp_profile.id,
@@ -144,8 +203,10 @@ def detect_duplicate_employees(employer, national_id=None, email=None, phone=Non
                         })
                         match_reasons[f'tenant_{emp.id}'] = ['National ID match']
                 
-                if config.duplicate_check_email and email:
-                    for emp in employee_query.filter(Q(email=email) | Q(personal_email=email)):
+                if check_email and normalized_email:
+                    for emp in employee_query.filter(
+                        Q(email__iexact=normalized_email) | Q(personal_email__iexact=normalized_email)
+                    ):
                         match_key = f'tenant_{emp.id}'
                         if not any(m['employee'].id == emp.id for m in tenant_matches):
                             tenant_matches.append({
@@ -158,8 +219,10 @@ def detect_duplicate_employees(employer, national_id=None, email=None, phone=Non
                         elif match_key in match_reasons:
                             match_reasons[match_key].append('Email match')
                 
-                if config.duplicate_check_phone and phone:
-                    for emp in employee_query.filter(Q(phone_number=phone) | Q(alternative_phone=phone)):
+                if check_phone and phone_variants:
+                    for emp in employee_query.filter(
+                        Q(phone_number__in=phone_variants) | Q(alternative_phone__in=phone_variants)
+                    ):
                         match_key = f'tenant_{emp.id}'
                         if not any(m['employee'].id == emp.id for m in tenant_matches):
                             tenant_matches.append({
@@ -171,10 +234,24 @@ def detect_duplicate_employees(employer, national_id=None, email=None, phone=Non
                             match_reasons[match_key] = ['Phone match']
                         elif match_key in match_reasons:
                             match_reasons[match_key].append('Phone match')
+
+                if check_name_dob and normalized_first and normalized_last and date_of_birth:
+                    for emp in employee_query.filter(date_of_birth=date_of_birth):
+                        match_key = f'tenant_{emp.id}'
+                        if any(m['employee'].id == emp.id for m in tenant_matches):
+                            continue
+                        if _name_matches(emp.first_name, emp.last_name):
+                            tenant_matches.append({
+                                'employee': emp,
+                                'employer_id': emp_profile.id,
+                                'employer_name': emp_profile.company_name,
+                                'tenant_db': tenant_db
+                            })
+                            match_reasons[match_key] = ['Name + DOB match']
             else:
                 # Default: national ID only
-                if national_id:
-                    for emp in employee_query.filter(national_id_number=national_id):
+                if normalized_national_id:
+                    for emp in employee_query.filter(national_id_number=normalized_national_id):
                         tenant_matches.append({
                             'employee': emp,
                             'employer_id': emp_profile.id,
@@ -381,23 +458,51 @@ def check_required_documents(employee):
     }
 
 
-def check_expiring_documents(employee, days_ahead=30):
-    """Check for documents expiring within specified days"""
+def check_expiring_documents(employee, days_ahead=None, config=None):
+    """Check for documents expiring within specified days.
+
+    If days_ahead is not provided, use employer configuration if available.
+    """
     from employees.models import EmployeeDocument
-    
+    from accounts.models import EmployerProfile
+    from accounts.database_utils import get_tenant_database_alias
+
+    tenant_db = getattr(getattr(employee, "_state", None), "db", None) or "default"
+
+    if config is None:
+        try:
+            employer = EmployerProfile.objects.get(id=employee.employer_id)
+            tenant_db = get_tenant_database_alias(employer)
+            config = get_or_create_employee_config(employee.employer_id, tenant_db)
+        except EmployerProfile.DoesNotExist:
+            config = None
+
+    if config and not config.document_expiry_tracking_enabled:
+        return {
+            'expiring_soon': [],
+            'expired': [],
+            'expiring_count': 0,
+            'expired_count': 0
+        }
+
+    if days_ahead is None:
+        days_ahead = config.document_expiry_reminder_days if config else 30
+
     expiry_threshold = timezone.now().date() + timedelta(days=days_ahead)
-    
-    expiring_docs = employee.documents.filter(
+
+    expiring_docs = EmployeeDocument.objects.using(tenant_db).filter(
+        employee_id=employee.id,
         has_expiry=True,
         expiry_date__lte=expiry_threshold,
         expiry_date__gte=timezone.now().date()
     )
-    
-    expired_docs = employee.documents.filter(
+
+    expired_docs = EmployeeDocument.objects.using(tenant_db).filter(
+        employee_id=employee.id,
         has_expiry=True,
         expiry_date__lt=timezone.now().date()
     )
-    
+
     return {
         'expiring_soon': list(expiring_docs),
         'expired': list(expired_docs),
@@ -593,25 +698,62 @@ def create_employee_audit_log(employee, action, performed_by, changes=None, note
 
 def get_cross_institution_summary(employee, config):
     """Get summary of employee's presence in other institutions"""
-    from employees.models import EmployeeCrossInstitutionRecord
+    from employees.models import Employee, EmployeeCrossInstitutionRecord
     from accounts.models import EmployerProfile
-    from accounts.database_utils import get_tenant_database_alias
-    
+    from accounts.database_utils import get_tenant_database_alias, ensure_tenant_database_loaded
+    import uuid
+
     if not config:
         return {'has_other_institutions': False, 'records': []}
-    
+
+    visibility = getattr(config, 'cross_institution_visibility_level', 'BASIC')
+    require_consent = False  # Consent flow disabled
+
     # Get tenant database for the current employer
     try:
         current_employer = EmployerProfile.objects.get(id=employee.employer_id)
+        ensure_tenant_database_loaded(current_employer)
         tenant_db = get_tenant_database_alias(current_employer)
     except EmployerProfile.DoesNotExist:
         tenant_db = 'default'
-    
+
     # Query from tenant database - no select_related since detected_employer_id is IntegerField
-    records = EmployeeCrossInstitutionRecord.objects.using(tenant_db).filter(
-        employee_id=employee.id
+    records = list(
+        EmployeeCrossInstitutionRecord.objects.using(tenant_db).filter(employee_id=employee.id)
     )
-    
+
+    def _fetch_detected_employee(record):
+        if not record.detected_employer_id or not record.detected_employee_id:
+            return None
+        try:
+            detected_employer = EmployerProfile.objects.get(id=record.detected_employer_id)
+        except EmployerProfile.DoesNotExist:
+            return None
+        ensure_tenant_database_loaded(detected_employer)
+        detected_db = get_tenant_database_alias(detected_employer)
+        detected_employee_id = str(record.detected_employee_id)
+
+        employee_qs = Employee.objects.using(detected_db).select_related('department', 'branch')
+        candidate = None
+        try:
+            candidate_uuid = uuid.UUID(detected_employee_id)
+            candidate = employee_qs.filter(id=candidate_uuid).first()
+        except (ValueError, TypeError):
+            candidate = None
+
+        if not candidate:
+            candidate = employee_qs.filter(employee_id=detected_employee_id).first()
+
+        return candidate
+
+    if visibility == 'NONE':
+        return {
+            'has_other_institutions': bool(records),
+            'count': len(records),
+            'records': [],
+            'institutions': []
+        }
+
     summary = []
     for record in records:
         # Manually fetch employer info from main database using detected_employer_id
@@ -620,34 +762,55 @@ def get_cross_institution_summary(employee, config):
             employer_name = detected_employer.company_name
         except EmployerProfile.DoesNotExist:
             employer_name = 'Unknown'
-        
-        info = {
-            'employer_id': str(record.detected_employer_id),
-            'employee_id': record.detected_employee_id,
-            'status': record.status,
-            'consent_status': record.consent_status,
-        }
-        
-        # Add information based on visibility level
-        if config.cross_institution_visibility_level in ['BASIC', 'MODERATE', 'FULL']:
+
+        info = {}
+
+        if visibility in ['BASIC', 'MODERATE', 'FULL']:
+            info['employer_id'] = str(record.detected_employer_id)
             info['company_name'] = employer_name
-        
-        if config.cross_institution_visibility_level in ['MODERATE', 'FULL']:
-            # Would need to fetch from detected employee record
-            info['employment_dates'] = {
-                'detected_at': record.detected_at
-            }
-        
-        if config.cross_institution_visibility_level == 'FULL':
-            # Full details available
-            info['verified'] = record.verified
-            info['notes'] = record.notes
-        
+
+        # Flag restricted details for non-full visibility
+        if visibility != 'FULL':
+            info['details_restricted'] = True
+
+        if visibility in ['MODERATE', 'FULL']:
+            detected_employee = _fetch_detected_employee(record)
+            if detected_employee:
+                info['employment_start_date'] = detected_employee.hire_date
+                info['employment_end_date'] = detected_employee.termination_date
+                info['employment_dates'] = {
+                    'detected_at': record.detected_at,
+                    'hire_date': detected_employee.hire_date,
+                    'termination_date': detected_employee.termination_date,
+                }
+            else:
+                info['employment_dates'] = {'detected_at': record.detected_at}
+
+        if visibility == 'FULL':
+            detected_employee = _fetch_detected_employee(record)
+            info.update({
+                'employee_id': record.detected_employee_id,
+                'status': record.status,
+                'consent_status': record.consent_status,
+                'verified': record.verified,
+                'notes': record.notes,
+            })
+            if detected_employee:
+                info['employment_status'] = detected_employee.employment_status
+                info['employment_type'] = detected_employee.employment_type
+                info['job_title'] = detected_employee.job_title
+                info['department'] = (
+                    detected_employee.department.name if detected_employee.department else None
+                )
+                info['branch'] = (
+                    detected_employee.branch.name if detected_employee.branch else None
+                )
+
         summary.append(info)
-    
+
     return {
-        'has_other_institutions': records.exists(),
-        'count': records.count(),
+        'has_other_institutions': bool(records),
+        'count': len(records),
         'records': summary,
         'institutions': summary  # Backward-compatible alias for frontend consumers
     }
@@ -950,6 +1113,26 @@ def send_profile_completion_notification(employee, missing_fields_info, employer
         logger = logging.getLogger(__name__)
         logger.error(f"Failed to send profile completion email to {email}: {str(e)}")
 
+    # Also create in-app notification for the employee
+    try:
+        notify_employee_user(
+            employee,
+            title="Profile completion required",
+            body=f"{employer.company_name} requires additional profile details.",
+            type="ACTION",
+            data={
+                "event": "employees.profile_completion_required",
+                "missing_critical": context.get("missing_critical", []),
+                "missing_non_critical": context.get("missing_non_critical", []),
+                "missing_documents": context.get("missing_documents", []),
+                "is_blocking": context.get("is_blocking", False),
+                "path": "/employee/profile/complete",
+            },
+            employer_profile=employer,
+        )
+    except Exception:
+        pass
+
 
 def send_welcome_email(employee, employer):
     """Send welcome email to employee after accepting invitation"""
@@ -1047,6 +1230,78 @@ def send_probation_ending_reminder(employee, employer, days_until_end):
         logger.error(f"Failed to send probation ending reminder to {employee.email}: {str(e)}")
 
 
+def get_employer_notification_recipients(employer, *, exclude_user_id=None):
+    """Return employer users who should receive operational notifications."""
+    from accounts.models import EmployeeMembership
+
+    recipients = {}
+    if employer and getattr(employer, "user", None) and employer.user.is_active:
+        recipients[employer.user.id] = employer.user
+
+    memberships = (
+        EmployeeMembership.objects.filter(
+            employer_profile_id=employer.id,
+            status=EmployeeMembership.STATUS_ACTIVE,
+            role__in=[
+                EmployeeMembership.ROLE_HR,
+                EmployeeMembership.ROLE_ADMIN,
+                EmployeeMembership.ROLE_MANAGER,
+            ],
+        )
+        .select_related("user")
+    )
+    for membership in memberships:
+        user = membership.user
+        if not user or not user.is_active:
+            continue
+        recipients[user.id] = user
+
+    if exclude_user_id:
+        recipients.pop(exclude_user_id, None)
+
+    return list(recipients.values())
+
+
+def notify_employer_users(employer, title, body="", *, type="INFO", data=None, exclude_user_id=None):
+    """Send in-app notification to employer owner/HR/manager users."""
+    from accounts.notifications import create_notification
+
+    recipients = get_employer_notification_recipients(employer, exclude_user_id=exclude_user_id)
+    for user in recipients:
+        create_notification(
+            user=user,
+            title=title,
+            body=body,
+            type=type,
+            data=data or {},
+            employer_profile=employer,
+        )
+    return recipients
+
+
+def notify_employee_user(employee, title, body="", *, type="INFO", data=None, employer_profile=None):
+    """Send in-app notification to the employee's linked user (if any)."""
+    from accounts.notifications import create_notification
+    from django.contrib.auth import get_user_model
+
+    if not employee or not getattr(employee, "user_id", None):
+        return None
+
+    User = get_user_model()
+    user = User.objects.filter(id=employee.user_id, is_active=True).first()
+    if not user:
+        return None
+
+    return create_notification(
+        user=user,
+        title=title,
+        body=body,
+        type=type,
+        data=data or {},
+        employer_profile=employer_profile,
+    )
+
+
 def generate_consent_token():
     """Generate a secure random token for consent requests"""
     import secrets
@@ -1065,27 +1320,14 @@ def check_concurrent_employment(employee_registry_id, new_employer_id, config):
     Returns:
         dict: {'allowed': bool, 'reason': str, 'existing_employers': list}
     """
-    from accounts.models import EmployerProfile, EmployeeMembership, EmployeeRegistry
+    from accounts.models import EmployeeMembership, EmployeeRegistry
     from employees.models import Employee
     from accounts.database_utils import get_tenant_database_alias
     
     existing_employers = []
 
-    # Resolve contract-level gating for multi-institution employment
-    contract_allows_multi = False
-    try:
-        new_employer = EmployerProfile.objects.get(id=new_employer_id)
-        tenant_db = get_tenant_database_alias(new_employer)
-        from contracts.models import ContractConfiguration
-        contract_config = ContractConfiguration.objects.using(tenant_db).filter(
-            employer_id=new_employer_id,
-            contract_type__isnull=True
-        ).first()
-        contract_allows_multi = bool(contract_config and contract_config.allow_multi_institution_employment)
-    except EmployerProfile.DoesNotExist:
-        contract_allows_multi = False
-    except Exception:
-        contract_allows_multi = False
+    # Contract configuration is not enforced at employee creation time.
+    # Employee-level configuration is the source of truth for concurrent employment here.
 
     # Fetch registry and memberships for this user
     try:
@@ -1133,20 +1375,16 @@ def check_concurrent_employment(employee_registry_id, new_employer_id, config):
     # If there are existing active employments
     if existing_employers:
         allow_concurrent = bool(config and config.allow_concurrent_employment)
-        if not allow_concurrent or not contract_allows_multi:
-            reason = 'Concurrent employment is not allowed by this employer'
-            if not contract_allows_multi:
-                reason = 'Concurrent employment is not allowed by contract configuration'
+        if not allow_concurrent:
             return {
                 'allowed': False,
-                'reason': reason,
+                'reason': 'Concurrent employment is not allowed by this employer',
                 'existing_employers': existing_employers
             }
         return {
             'allowed': True,
             'reason': 'Concurrent employment allowed',
-            'existing_employers': existing_employers,
-            'requires_consent': bool(config and config.require_employee_consent_cross_institution)
+            'existing_employers': existing_employers
         }
     
     # No existing employments found
@@ -1180,7 +1418,7 @@ def create_termination_approval_request(employee, requested_by, termination_date
     
     # Determine what approvals are needed
     requires_manager = config.termination_approval_by in ['MANAGER', 'BOTH']
-    requires_hr = config.termination_approval_by in ['HR', 'BOTH']
+    requires_hr = config.termination_approval_by in ['HR', 'BOTH', 'ADMIN']
     
     # Create approval request in tenant database
     approval = TerminationApproval.objects.using(tenant_db).create(
@@ -1221,6 +1459,23 @@ def revoke_employee_access(employee, config, tenant_db):
             user = User.objects.get(id=employee.user_id)
             user.is_active = False
             user.save()
+            try:
+                from accounts.models import EmployerProfile
+                employer = EmployerProfile.objects.filter(id=employee.employer_id).first()
+                notify_employee_user(
+                    employee,
+                    title="Access revoked",
+                    body="Your access has been revoked due to termination.",
+                    type="ALERT",
+                    data={
+                        "event": "employees.access_revoked",
+                        "employee_id": str(employee.id),
+                        "path": "/login",
+                    },
+                    employer_profile=employer,
+                )
+            except Exception:
+                pass
         except User.DoesNotExist:
             pass
     
@@ -1233,4 +1488,61 @@ def revoke_employee_access(employee, config, tenant_db):
         delay_days = config.termination_access_delay_days or 0
         # Will be revoked after delay (handled by scheduled task)
         pass
+
+
+def terminate_employee_contracts(
+    employee,
+    *,
+    tenant_db,
+    termination_date,
+    termination_reason=None,
+    performed_by=None,
+):
+    """
+    Terminate all active/pending contracts for an employee.
+    Keeps contract audit logs and notifications consistent.
+    """
+    if not employee:
+        return 0
+
+    try:
+        from contracts.models import Contract
+        from contracts.notifications import notify_terminated
+    except Exception:
+        return 0
+
+    statuses = ['ACTIVE', 'SIGNED', 'PENDING_SIGNATURE', 'APPROVED', 'PENDING_APPROVAL']
+    contracts = Contract.objects.using(tenant_db).filter(
+        employee=employee,
+        status__in=statuses
+    )
+    count = 0
+    for contract in contracts:
+        try:
+            contract.status = 'TERMINATED'
+            contract.termination_date = termination_date
+            if termination_reason:
+                contract.termination_reason = termination_reason
+            contract.final_pay_flag = True
+            contract.save(using=tenant_db)
+            try:
+                contract.log_action(
+                    performed_by,
+                    'TERMINATED',
+                    metadata={
+                        'reason': termination_reason,
+                        'termination_date': str(termination_date),
+                        'source': 'employee_termination',
+                    },
+                )
+            except Exception:
+                pass
+            try:
+                notify_terminated(contract)
+            except Exception:
+                pass
+            count += 1
+        except Exception:
+            continue
+    return count
 

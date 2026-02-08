@@ -12,7 +12,7 @@ from datetime import timedelta
 from .models import (
     Department, Branch, Employee, EmployeeDocument,
     EmployeeCrossInstitutionRecord, EmployeeAuditLog,
-    EmployeeInvitation, EmployeeConfiguration
+    EmployeeInvitation, EmployeeConfiguration, CrossInstitutionConsent
 )
 from .serializers import (
     DepartmentSerializer, BranchSerializer,
@@ -25,13 +25,15 @@ from .serializers import (
     CreateEmployeeWithDetectionSerializer, EmployeeDocumentUploadSerializer,
     AcceptInvitationSerializer, EmployeeProfileCompletionSerializer,
     EmployeeSelfProfileSerializer, EmployeePrefillRequestSerializer,
-    EmployeePrefillSerializer, AttendanceCredentialsSerializer
+    EmployeePrefillSerializer, AttendanceCredentialsSerializer,
+    CrossInstitutionConsentSerializer, RespondConsentSerializer
 )
 from .utils import (
     detect_duplicate_employees, generate_employee_invitation_token,
     get_invitation_expiry_date, send_employee_invitation_email,
     create_employee_audit_log, check_required_documents,
-    check_expiring_documents, get_cross_institution_summary
+    check_expiring_documents, get_cross_institution_summary,
+    notify_employer_users, notify_employee_user
 )
 from accounts.permissions import (
     IsEmployee,
@@ -320,9 +322,100 @@ class EmployeeViewSet(viewsets.ModelViewSet):
                 'total_matches': duplicate_info['total_matches'],
                 'same_institution': len(duplicate_info['same_institution_matches']),
                 'cross_institution': len(duplicate_info['cross_institution_matches']),
+                'existing_employers': [
+                    {
+                        'employer_id': match.get('employer_id'),
+                        'employer_name': match.get('employer_name'),
+                        'employee_id': (
+                            match.get('data', {}).get('employee_id')
+                            if isinstance(match.get('data'), dict)
+                            else getattr(match.get('data'), 'employee_id', None)
+                        ),
+                    }
+                    for match in (duplicate_info.get('cross_institution_matches') or [])
+                ],
             }
+
+            # Create in-app notification for warnings
+            try:
+                employer = get_active_employer(request, require_context=True)
+                notify_employer_users(
+                    employer,
+                    title='Duplicate employee detected',
+                    body=response_data['duplicate_warning']['message'],
+                    type='ALERT',
+                    data=response_data['duplicate_warning'],
+                )
+            except Exception:
+                # Do not block employee creation if notification fails
+                pass
+
+        # Notify employer on successful creation
+        try:
+            employer = get_active_employer(request, require_context=True)
+            notify_employer_users(
+                employer,
+                title='Employee created',
+                body=f"{employee.full_name} was added to {employer.company_name}.",
+                type='INFO',
+                data={
+                    'event': 'employees.created',
+                    'employee_id': str(employee.id),
+                    'employee_number': employee.employee_id,
+                    'name': employee.full_name,
+                    'path': f"/employer/employees/{employee.id}",
+                },
+            )
+        except Exception:
+            pass
         
         return Response(response_data, status=status.HTTP_201_CREATED)
+
+    def update(self, request, *args, **kwargs):
+        """Update an employee and refresh profile completion state"""
+        partial = kwargs.pop('partial', False)
+        instance = self.get_object()
+        serializer = self.get_serializer(instance, data=request.data, partial=partial)
+        serializer.is_valid(raise_exception=True)
+        employee = serializer.save()
+
+        from accounts.database_utils import get_tenant_database_alias
+        from employees.utils import get_or_create_employee_config, check_missing_fields_against_config
+
+        employer = get_active_employer(request, require_context=True)
+        tenant_db = get_tenant_database_alias(employer)
+        config = get_or_create_employee_config(employee.employer_id, tenant_db)
+        validation_result = check_missing_fields_against_config(employee, config)
+
+        employee.profile_completion_state = validation_result['completion_state']
+        employee.profile_completion_required = validation_result['requires_update']
+        employee.missing_required_fields = validation_result['missing_critical']
+        employee.missing_optional_fields = validation_result['missing_non_critical']
+
+        if validation_result['completion_state'] == 'COMPLETE':
+            employee.profile_completed = True
+            employee.profile_completed_at = timezone.now()
+            if employee.employment_status == 'PENDING':
+                employee.employment_status = 'ACTIVE'
+        else:
+            employee.profile_completed = False
+            employee.profile_completed_at = None
+
+        employee.save(using=tenant_db, update_fields=[
+            'profile_completion_state',
+            'profile_completion_required',
+            'missing_required_fields',
+            'missing_optional_fields',
+            'profile_completed',
+            'profile_completed_at',
+            'employment_status',
+        ])
+
+        return Response(EmployeeDetailSerializer(employee).data)
+
+    def partial_update(self, request, *args, **kwargs):
+        kwargs['partial'] = True
+        return self.update(request, *args, **kwargs)
 
     @action(detail=True, methods=["post", "patch"], url_path="attendance-credentials")
     def attendance_credentials(self, request, pk=None):
@@ -459,9 +552,6 @@ class EmployeeViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST
             )
         
-        serializer = TerminateEmployeeSerializer(data=request.data)
-        serializer.is_valid(raise_exception=True)
-        
         # Get tenant database and config
         from accounts.database_utils import get_tenant_database_alias
         from employees.utils import get_or_create_employee_config, create_termination_approval_request, revoke_employee_access
@@ -469,6 +559,9 @@ class EmployeeViewSet(viewsets.ModelViewSet):
         employer = get_active_employer(request, require_context=True)
         tenant_db = get_tenant_database_alias(employer)
         config = get_or_create_employee_config(employer.id, tenant_db)
+
+        serializer = TerminateEmployeeSerializer(data=request.data, context={'config': config})
+        serializer.is_valid(raise_exception=True)
         
         # Check if approval is required
         if config.termination_approval_required:
@@ -497,6 +590,41 @@ class EmployeeViewSet(viewsets.ModelViewSet):
             )
             
             from .serializers import TerminationApprovalSerializer
+            # Notify employer and employee about the termination request
+            try:
+                notify_employer_users(
+                    employer,
+                    title="Termination requested",
+                    body=f"Termination requested for {employee.full_name}.",
+                    type="ACTION",
+                    data={
+                        "event": "employees.termination_requested",
+                        "employee_id": str(employee.id),
+                        "employee_number": employee.employee_id,
+                        "termination_date": str(serializer.validated_data['termination_date']),
+                        "approval_id": str(approval.id) if approval else None,
+                        "path": f"/employer/employees/{employee.id}",
+                    },
+                )
+            except Exception:
+                pass
+
+            try:
+                notify_employee_user(
+                    employee,
+                    title="Termination requested",
+                    body="A termination request has been initiated for your employment.",
+                    type="ALERT",
+                    data={
+                        "event": "employees.termination_requested",
+                        "termination_date": str(serializer.validated_data['termination_date']),
+                        "path": "/employee/profile",
+                    },
+                    employer_profile=employer,
+                )
+            except Exception:
+                pass
+
             return Response({
                 'message': 'Termination request submitted for approval',
                 'approval_required': True,
@@ -542,6 +670,51 @@ class EmployeeViewSet(viewsets.ModelViewSet):
         
         # Revoke system access based on configuration
         revoke_employee_access(employee, config, tenant_db)
+        try:
+            from employees.utils import terminate_employee_contracts
+            terminate_employee_contracts(
+                employee,
+                tenant_db=tenant_db,
+                termination_date=employee.termination_date,
+                termination_reason=employee.termination_reason,
+                performed_by=request.user,
+            )
+        except Exception:
+            pass
+
+        # Notify employer and employee about immediate termination
+        try:
+            notify_employer_users(
+                employer,
+                title="Employee terminated",
+                body=f"{employee.full_name} was terminated.",
+                type="ALERT",
+                data={
+                    "event": "employees.termination_completed",
+                    "employee_id": str(employee.id),
+                    "employee_number": employee.employee_id,
+                    "termination_date": str(employee.termination_date),
+                    "path": f"/employer/employees/{employee.id}",
+                },
+            )
+        except Exception:
+            pass
+
+        try:
+            notify_employee_user(
+                employee,
+                title="Employment terminated",
+                body="Your employment has been terminated.",
+                type="ALERT",
+                data={
+                    "event": "employees.termination_completed",
+                    "termination_date": str(employee.termination_date),
+                    "path": "/employee/profile",
+                },
+                employer_profile=employer,
+            )
+        except Exception:
+            pass
         
         return Response(
             EmployeeDetailSerializer(employee).data,
@@ -593,6 +766,39 @@ class EmployeeViewSet(viewsets.ModelViewSet):
             request=request,
             tenant_db=tenant_db
         )
+
+        # Notify employer and employee
+        try:
+            notify_employer_users(
+                employer,
+                title="Employee reactivated",
+                body=f"{employee.full_name} has been reactivated.",
+                type="INFO",
+                data={
+                    "event": "employees.reactivated",
+                    "employee_id": str(employee.id),
+                    "employee_number": employee.employee_id,
+                    "path": f"/employer/employees/{employee.id}",
+                },
+            )
+        except Exception:
+            pass
+
+        try:
+            notify_employee_user(
+                employee,
+                title="Employment reactivated",
+                body="Your employment has been reactivated.",
+                type="INFO",
+                data={
+                    "event": "employees.reactivated",
+                    "employee_id": str(employee.id),
+                    "path": "/employee/profile",
+                },
+                employer_profile=employer,
+            )
+        except Exception:
+            pass
         
         return Response(
             EmployeeDetailSerializer(employee).data,
@@ -632,6 +838,7 @@ class EmployeeViewSet(viewsets.ModelViewSet):
     def documents(self, request, pk=None):
         """Get all documents for an employee"""
         from accounts.database_utils import get_tenant_database_alias
+        from employees.utils import get_or_create_employee_config
         
         employee = self.get_object()
         
@@ -647,7 +854,8 @@ class EmployeeViewSet(viewsets.ModelViewSet):
         required_check = check_required_documents(employee)
         
         # Check for expiring documents
-        expiring_check = check_expiring_documents(employee)
+        config = get_or_create_employee_config(employee.employer_id, tenant_db)
+        expiring_check = check_expiring_documents(employee, config=config)
         
         return Response({
             'documents': serializer.data,
@@ -796,9 +1004,19 @@ class EmployeeViewSet(viewsets.ModelViewSet):
                 employee.save(using=tenant_db)
                 
                 # Revoke access
-                from employees.utils import get_or_create_employee_config, revoke_employee_access
+                from employees.utils import get_or_create_employee_config, revoke_employee_access, terminate_employee_contracts
                 config = get_or_create_employee_config(employer.id, tenant_db)
                 revoke_employee_access(employee, config, tenant_db)
+                try:
+                    terminate_employee_contracts(
+                        employee,
+                        tenant_db=tenant_db,
+                        termination_date=employee.termination_date,
+                        termination_reason=employee.termination_reason,
+                        performed_by=request.user,
+                    )
+                except Exception:
+                    pass
                 
                 # Create audit log
                 create_employee_audit_log(
@@ -813,6 +1031,41 @@ class EmployeeViewSet(viewsets.ModelViewSet):
                     request=request,
                     tenant_db=tenant_db
                 )
+
+                # Notify employer and employee about approval
+                try:
+                    notify_employer_users(
+                        employer,
+                        title="Termination approved",
+                        body=f"Termination approved for {employee.full_name}.",
+                        type="ALERT",
+                        data={
+                            "event": "employees.termination_approved",
+                            "employee_id": str(employee.id),
+                            "employee_number": employee.employee_id,
+                            "termination_date": str(employee.termination_date),
+                            "approval_id": str(approval.id),
+                            "path": f"/employer/employees/{employee.id}",
+                        },
+                    )
+                except Exception:
+                    pass
+
+                try:
+                    notify_employee_user(
+                        employee,
+                        title="Termination approved",
+                        body="Your termination has been approved.",
+                        type="ALERT",
+                        data={
+                            "event": "employees.termination_approved",
+                            "termination_date": str(employee.termination_date),
+                            "path": "/employee/profile",
+                        },
+                        employer_profile=employer,
+                    )
+                except Exception:
+                    pass
             
             approval.save(using=tenant_db)
             
@@ -841,6 +1094,30 @@ class EmployeeViewSet(viewsets.ModelViewSet):
                 request=request,
                 tenant_db=tenant_db
             )
+
+            # Notify requester about rejection
+            try:
+                from django.contrib.auth import get_user_model
+                User = get_user_model()
+                requester = User.objects.filter(id=approval.requested_by_id).first()
+                if requester:
+                    from accounts.notifications import create_notification
+                    create_notification(
+                        user=requester,
+                        title="Termination rejected",
+                        body=f"Termination request for {approval.employee.full_name} was rejected.",
+                        type="ALERT",
+                        data={
+                            "event": "employees.termination_rejected",
+                            "employee_id": str(approval.employee.id),
+                            "employee_number": approval.employee.employee_id,
+                            "approval_id": str(approval.id),
+                            "path": f"/employer/employees/{approval.employee.id}",
+                        },
+                        employer_profile=employer,
+                    )
+            except Exception:
+                pass
             
             return Response({
                 'message': 'Termination request rejected',
@@ -1095,6 +1372,7 @@ class EmployeeDocumentViewSet(viewsets.ModelViewSet):
             serializer.save(using=tenant_db, uploaded_by_id=user.id)
         elif user.is_employee:
             # Employee uploading their own document
+            from accounts.database_utils import get_tenant_database_alias
             from accounts.models import EmployerProfile
             employers = EmployerProfile.objects.filter(user__is_active=True)
             
@@ -1129,7 +1407,17 @@ class EmployeeDocumentViewSet(viewsets.ModelViewSet):
     @action(detail=False, methods=['get'])
     def expiring_soon(self, request):
         """Get documents expiring soon"""
-        days_ahead = int(request.query_params.get('days', 30))
+        from accounts.database_utils import get_tenant_database_alias
+        from employees.utils import get_or_create_employee_config
+        employer = get_active_employer(request, require_context=True)
+        tenant_db = get_tenant_database_alias(employer)
+        config = get_or_create_employee_config(employer.id, tenant_db)
+
+        if not config.document_expiry_tracking_enabled:
+            return Response([])
+
+        default_days = config.document_expiry_reminder_days or 30
+        days_ahead = int(request.query_params.get('days', default_days))
         expiry_threshold = timezone.now().date() + timedelta(days=days_ahead)
         
         documents = self.get_queryset().filter(
@@ -1157,6 +1445,30 @@ class EmployeeConfigurationViewSet(viewsets.ModelViewSet):
     }
     serializer_class = EmployeeConfigurationSerializer
     http_method_names = ['get', 'post', 'patch', 'put']
+
+    def _normalize_payload(self, data):
+        """Normalize frontend payload keys/values to backend field names."""
+        try:
+            payload = data.copy()
+        except Exception:
+            payload = dict(data)
+
+        alias_map = {
+            'termination_require_reason': 'require_termination_reason',
+            'termination_allow_reactivation': 'allow_employee_reactivation',
+            'probation_default_months': 'default_probation_period_months',
+        }
+
+        for alias, actual in alias_map.items():
+            if alias in payload and actual not in payload:
+                payload[actual] = payload.pop(alias)
+
+        # Normalize revoke timing values
+        timing = payload.get('termination_revoke_access_timing')
+        if timing == 'ON_TERMINATION_DATE':
+            payload['termination_revoke_access_timing'] = 'ON_DATE'
+
+        return payload
     
     def get_queryset(self):
         """Return configuration for the employer from tenant database"""
@@ -1196,7 +1508,8 @@ class EmployeeConfigurationViewSet(viewsets.ModelViewSet):
         tenant_db = get_tenant_database_alias(employer)
         
         instance = self.get_object()
-        serializer = self.get_serializer(instance, data=request.data, partial=True)
+        payload = self._normalize_payload(request.data)
+        serializer = self.get_serializer(instance, data=payload, partial=True)
         serializer.is_valid(raise_exception=True)
         
         # Save to tenant database
@@ -1214,7 +1527,8 @@ class EmployeeConfigurationViewSet(viewsets.ModelViewSet):
         
         partial = kwargs.pop('partial', False)
         instance = self.get_object()
-        serializer = self.get_serializer(instance, data=request.data, partial=partial)
+        payload = self._normalize_payload(request.data)
+        serializer = self.get_serializer(instance, data=payload, partial=partial)
         serializer.is_valid(raise_exception=True)
         
         # Save to tenant database
@@ -1421,12 +1735,32 @@ class EmployeeInvitationViewSet(viewsets.ReadOnlyModelViewSet):
         
         # Send profile completion notification if needed
         if validation_result['requires_update']:
-            send_profile_completion_notification(
-                employee,
-                validation_result,
-                employer_profile,
-                tenant_db
-            )
+            if config.send_profile_completion_reminder:
+                send_profile_completion_notification(
+                    employee,
+                    validation_result,
+                    employer_profile,
+                    tenant_db
+                )
+            else:
+                try:
+                    notify_employee_user(
+                        employee,
+                        title="Profile completion required",
+                        body=f"{employer_profile.company_name} requires additional profile details.",
+                        type="ACTION",
+                        data={
+                            "event": "employees.profile_completion_required",
+                            "missing_critical": validation_result.get("missing_critical", []),
+                            "missing_non_critical": validation_result.get("missing_non_critical", []),
+                            "missing_documents": validation_result.get("missing_documents", []),
+                            "is_blocking": validation_result.get("is_blocking", False),
+                            "path": "/employee/profile/complete",
+                        },
+                        employer_profile=employer_profile,
+                    )
+                except Exception:
+                    pass
         
         # Send welcome email if configured
         if config.send_welcome_email:
@@ -1462,6 +1796,209 @@ class EmployeeInvitationViewSet(viewsets.ReadOnlyModelViewSet):
                 'missing_documents': validation_result.get('missing_documents', []),
             }
         }, status=status.HTTP_200_OK)
+
+
+class CrossInstitutionConsentViewSet(viewsets.ModelViewSet):
+    """ViewSet for managing cross-institution consent requests"""
+
+    permission_classes = [IsAuthenticated]
+    serializer_class = CrossInstitutionConsentSerializer
+    http_method_names = ['get', 'post', 'patch']
+
+    def _resolve_employer(self):
+        """Resolve employer context for employer owners or delegates."""
+        user = self.request.user
+        employer = None
+
+        if getattr(user, "employer_profile", None):
+            employer = user.employer_profile
+        else:
+            resolved = get_active_employer(self.request, require_context=False)
+            if resolved and (user.is_admin or user.is_superuser or is_delegate_user(user, resolved.id)):
+                employer = resolved
+
+        return employer
+
+    def get_queryset(self):
+        """Return consent requests scoped to employee or employer."""
+        from accounts.models import EmployeeRegistry
+
+        user = self.request.user
+        qs = CrossInstitutionConsent.objects.using('default').all()
+
+        if user.is_employee:
+            registry = EmployeeRegistry.objects.filter(user_id=user.id).first()
+            if not registry:
+                return qs.none()
+            qs = qs.filter(employee_registry_id=registry.id)
+        else:
+            employer = self._resolve_employer()
+            if not employer:
+                return qs.none()
+            qs = qs.filter(target_employer_id=employer.id)
+
+        status_filter = self.request.query_params.get('status')
+        if status_filter:
+            qs = qs.filter(status=str(status_filter).upper())
+
+        return qs.order_by('-requested_at')
+
+    def create(self, request, *args, **kwargs):
+        """Create a consent request (employer-only)."""
+        from accounts.models import EmployerProfile, EmployeeRegistry
+        from accounts.database_utils import get_tenant_database_alias
+        from employees.utils import generate_consent_token
+
+        user = request.user
+        if user.is_employee:
+            return Response({'error': 'Employees cannot request consent.'}, status=status.HTTP_403_FORBIDDEN)
+
+        employer = self._resolve_employer()
+        if not employer:
+            return Response({'error': 'Employer context is required.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        employee_registry_id = request.data.get('employee_registry_id')
+        source_employer_id = request.data.get('source_employer_id') or request.data.get('detected_employer_id')
+        employee_id = request.data.get('employee_id')
+        user_id = request.data.get('user_id')
+        notes = request.data.get('notes') or ''
+
+        if not employee_registry_id:
+            if user_id:
+                registry = EmployeeRegistry.objects.filter(user_id=user_id).first()
+                if registry:
+                    employee_registry_id = registry.id
+            elif employee_id:
+                tenant_db = get_tenant_database_alias(employer)
+                employee_obj = Employee.objects.using(tenant_db).filter(id=employee_id).only('user_id').first()
+                if employee_obj and employee_obj.user_id:
+                    registry = EmployeeRegistry.objects.filter(user_id=employee_obj.user_id).first()
+                    if registry:
+                        employee_registry_id = registry.id
+
+        if not employee_registry_id:
+            return Response({'error': 'employee_registry_id or user_id is required.'}, status=status.HTTP_400_BAD_REQUEST)
+        if not source_employer_id:
+            return Response({'error': 'source_employer_id is required.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        # Ensure registry exists
+        if not EmployeeRegistry.objects.filter(id=employee_registry_id).exists():
+            return Response({'error': 'Employee registry record not found.'}, status=status.HTTP_404_NOT_FOUND)
+
+        # Avoid duplicate pending requests
+        existing = (
+            CrossInstitutionConsent.objects.using('default')
+            .filter(
+                employee_registry_id=employee_registry_id,
+                source_employer_id=source_employer_id,
+                target_employer_id=employer.id,
+                status='PENDING',
+                expires_at__gte=timezone.now(),
+            )
+            .first()
+        )
+        if existing:
+            serializer = self.get_serializer(existing)
+            return Response(serializer.data, status=status.HTTP_200_OK)
+
+        expires_at = request.data.get('expires_at')
+        if expires_at:
+            from django.utils.dateparse import parse_datetime
+            if isinstance(expires_at, str):
+                parsed = parse_datetime(expires_at)
+                if not parsed:
+                    return Response({'error': 'Invalid expires_at datetime format.'}, status=status.HTTP_400_BAD_REQUEST)
+                expires_at = parsed
+        else:
+            expires_at = timezone.now() + timedelta(days=7)
+
+        consent = CrossInstitutionConsent.objects.using('default').create(
+            employee_registry_id=employee_registry_id,
+            source_employer_id=source_employer_id,
+            target_employer_id=employer.id,
+            target_employer_name=employer.company_name,
+            status='PENDING',
+            consent_token=generate_consent_token(),
+            expires_at=expires_at,
+            notes=notes or None,
+        )
+
+        # Update cross-institution record in target tenant when possible
+        if employee_id:
+            tenant_db = get_tenant_database_alias(employer)
+            EmployeeCrossInstitutionRecord.objects.using(tenant_db).filter(
+                employee_id=employee_id,
+                detected_employer_id=source_employer_id
+            ).update(
+                consent_status='PENDING',
+                consent_requested_at=timezone.now(),
+                consent_notes=notes or None
+            )
+
+        serializer = self.get_serializer(consent)
+        return Response(serializer.data, status=status.HTTP_201_CREATED)
+
+    @action(detail=True, methods=['post'])
+    def respond(self, request, pk=None):
+        """Employee responds to a consent request."""
+        from accounts.models import EmployeeRegistry, EmployerProfile, EmployeeMembership
+        from accounts.database_utils import get_tenant_database_alias
+
+        consent = self.get_object()
+
+        user = request.user
+        if not user.is_employee:
+            return Response({'error': 'Only employees can respond to consent.'}, status=status.HTTP_403_FORBIDDEN)
+
+        registry = EmployeeRegistry.objects.filter(user_id=user.id).first()
+        if not registry or consent.employee_registry_id != registry.id:
+            return Response({'error': 'Consent request not found for this employee.'}, status=status.HTTP_404_NOT_FOUND)
+
+        if consent.status != 'PENDING':
+            return Response({'error': 'Consent request has already been processed.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        if consent.expires_at and consent.expires_at < timezone.now():
+            return Response({'error': 'Consent request has expired.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        serializer = RespondConsentSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+
+        response_value = serializer.validated_data['response']
+        notes = serializer.validated_data.get('notes') or None
+        decision = 'APPROVED' if response_value == 'approve' else 'REJECTED'
+
+        consent.status = decision
+        consent.responded_at = timezone.now()
+        consent.notes = notes
+        consent.save(using='default', update_fields=['status', 'responded_at', 'notes'])
+
+        # Update cross-institution record in target tenant if membership is known
+        try:
+            target_employer = EmployerProfile.objects.get(id=consent.target_employer_id)
+            tenant_db = get_tenant_database_alias(target_employer)
+            membership = EmployeeMembership.objects.filter(
+                user_id=registry.user_id,
+                employer_profile_id=consent.target_employer_id
+            ).first()
+
+            if membership and membership.tenant_employee_id:
+                EmployeeCrossInstitutionRecord.objects.using(tenant_db).filter(
+                    employee_id=membership.tenant_employee_id,
+                    detected_employer_id=consent.source_employer_id
+                ).update(
+                    consent_status=decision,
+                    consent_responded_at=timezone.now(),
+                    consent_notes=notes
+                )
+
+                if decision == 'APPROVED':
+                    Employee.objects.using(tenant_db).filter(id=membership.tenant_employee_id).update(
+                        is_concurrent_employment=True
+                    )
+        except EmployerProfile.DoesNotExist:
+            pass
+
+        return Response(self.get_serializer(consent).data, status=status.HTTP_200_OK)
         
 
 class EmployeeProfileViewSet(viewsets.GenericViewSet):
@@ -1665,6 +2202,47 @@ class EmployeeProfileViewSet(viewsets.GenericViewSet):
                     'missing_required_fields', 'missing_optional_fields',
                     'profile_completed', 'profile_completed_at', 'employment_status'
                 ])
+
+                # Notify employee and employer when profile is completed
+                if validation_result['completion_state'] == 'COMPLETE':
+                    from accounts.models import EmployerProfile
+                    employer_profile = EmployerProfile.objects.filter(
+                        id=updated_employee.employer_id
+                    ).first()
+
+                    try:
+                        notify_employee_user(
+                            updated_employee,
+                            title="Profile completed",
+                            body="Your profile is now complete.",
+                            type="INFO",
+                            data={
+                                "event": "employees.profile_completed",
+                                "employee_id": str(updated_employee.id),
+                                "path": "/employee/profile",
+                            },
+                            employer_profile=employer_profile,
+                        )
+                    except Exception:
+                        pass
+
+                    try:
+                        if employer_profile:
+                            notify_employer_users(
+                                employer_profile,
+                                title="Employee profile completed",
+                                body=f"{updated_employee.full_name} completed their profile.",
+                                type="INFO",
+                                data={
+                                    "event": "employees.profile_completed",
+                                    "employee_id": str(updated_employee.id),
+                                    "employee_number": updated_employee.employee_id,
+                                    "name": updated_employee.full_name,
+                                    "path": f"/employer/employees/{updated_employee.id}",
+                                },
+                            )
+                    except Exception:
+                        pass
                 
                 # Create audit log
                 create_employee_audit_log(

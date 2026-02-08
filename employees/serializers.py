@@ -1,4 +1,6 @@
 from rest_framework import serializers
+from datetime import timedelta
+from django.utils import timezone
 from django.contrib.auth import get_user_model
 from .models import (
     Department, Branch, Employee, EmployeeDocument,
@@ -316,14 +318,16 @@ class CreateEmployeeSerializer(serializers.ModelSerializer):
     
     def validate_department(self, value):
         """Validate that department UUID exists in tenant database"""
-        if value is None:
+        if not value:
             return value
         
         request = self.context['request']
-        employer_id = request.user.employer_profile.id
+        from accounts.rbac import get_active_employer
+        employer = get_active_employer(request, require_context=True)
+        employer_id = employer.id
         
         from accounts.database_utils import get_tenant_database_alias
-        tenant_db = get_tenant_database_alias(request.user.employer_profile)
+        tenant_db = get_tenant_database_alias(employer)
         
         # Check if department exists in tenant database
         try:
@@ -342,10 +346,12 @@ class CreateEmployeeSerializer(serializers.ModelSerializer):
             return value
         
         request = self.context['request']
-        employer_id = request.user.employer_profile.id
+        from accounts.rbac import get_active_employer
+        employer = get_active_employer(request, require_context=True)
+        employer_id = employer.id
         
         from accounts.database_utils import get_tenant_database_alias
-        tenant_db = get_tenant_database_alias(request.user.employer_profile)
+        tenant_db = get_tenant_database_alias(employer)
         
         # Check if branch exists in tenant database
         try:
@@ -364,10 +370,12 @@ class CreateEmployeeSerializer(serializers.ModelSerializer):
             return value
         
         request = self.context['request']
-        employer_id = request.user.employer_profile.id
+        from accounts.rbac import get_active_employer
+        employer = get_active_employer(request, require_context=True)
+        employer_id = employer.id
         
         from accounts.database_utils import get_tenant_database_alias
-        tenant_db = get_tenant_database_alias(request.user.employer_profile)
+        tenant_db = get_tenant_database_alias(employer)
         
         # Check if manager exists in tenant database
         try:
@@ -427,18 +435,12 @@ class CreateEmployeeSerializer(serializers.ModelSerializer):
         # Validate data against employer configuration
         try:
             validation_result = validate_employee_data_strict(data, config)
-            
-            # If validation fails, raise error with missing fields
-            if not validation_result['is_valid']:
-                error_msg = validation_result['error_message']
+
+            if not validation_result.get('valid', True):
                 employer_name = request.user.employer_profile.company_name
-                
                 raise serializers.ValidationError({
-                    'non_field_errors': [error_msg],
-                    '_info': {
-                        'employer': employer_name,
-                        'missing_fields': validation_result.get('missing_fields', [])
-                    }
+                    **validation_result.get('errors', {}),
+                    '_info': f'These fields are required by {employer_name}'
                 })
         except DjangoValidationError as e:
             raise serializers.ValidationError({'non_field_errors': [str(e)]})
@@ -551,6 +553,33 @@ class CreateEmployeeSerializer(serializers.ModelSerializer):
         
         # Create employee in tenant database
         employee = Employee.objects.using(tenant_db).create(**validated_data)
+
+        # Evaluate profile completion state based on configuration
+        from employees.utils import check_missing_fields_against_config
+        completion_result = check_missing_fields_against_config(employee, config)
+        employee.profile_completion_state = completion_result['completion_state']
+        employee.profile_completion_required = completion_result['requires_update']
+        employee.missing_required_fields = completion_result['missing_critical']
+        employee.missing_optional_fields = completion_result['missing_non_critical']
+
+        if completion_result['completion_state'] == 'COMPLETE':
+            employee.profile_completed = True
+            employee.profile_completed_at = timezone.now()
+        else:
+            employee.profile_completed = False
+            employee.profile_completed_at = None
+
+        employee.save(using=tenant_db, update_fields=[
+            'profile_completion_state',
+            'profile_completion_required',
+            'missing_required_fields',
+            'missing_optional_fields',
+            'profile_completed',
+            'profile_completed_at',
+        ])
+
+        if completion_result['requires_update'] and config.send_profile_completion_reminder:
+            employee._send_completion_notification = True
         if pin_code:
             employee.set_pin_code(pin_code)
             employee.save(using=tenant_db, update_fields=["pin_code_hash"])
@@ -620,8 +649,10 @@ class UpdateEmployeeSerializer(serializers.ModelSerializer):
         
         # Get tenant database from context
         request = self.context.get('request')
-        if request and hasattr(request.user, 'employer_profile'):
-            tenant_db = get_tenant_database_alias(request.user.employer_profile)
+        if request:
+            from accounts.rbac import get_active_employer
+            employer = get_active_employer(request, require_context=True)
+            tenant_db = get_tenant_database_alias(employer)
             pin_code = validated_data.pop("pin_code", None)
             
             # Before updating, validate and clean up any invalid foreign key references
@@ -692,7 +723,7 @@ class TerminateEmployeeSerializer(serializers.Serializer):
     """Serializer for employee termination"""
     
     termination_date = serializers.DateField()
-    termination_reason = serializers.CharField(required=True)
+    termination_reason = serializers.CharField(required=False, allow_blank=True, allow_null=True)
     
     def validate_termination_date(self, value):
         from django.utils import timezone
@@ -701,6 +732,16 @@ class TerminateEmployeeSerializer(serializers.Serializer):
                 "Termination date cannot be in the future."
             )
         return value
+
+    def validate(self, attrs):
+        config = self.context.get('config')
+        if config and config.require_termination_reason:
+            reason = attrs.get('termination_reason')
+            if not reason or (isinstance(reason, str) and reason.strip() == ''):
+                raise serializers.ValidationError({
+                    'termination_reason': 'Termination reason is required by configuration.'
+                })
+        return attrs
 
 
 class EmployeeDocumentSerializer(serializers.ModelSerializer):
@@ -734,14 +775,23 @@ class EmployeeDocumentSerializer(serializers.ModelSerializer):
     def validate_file(self, value):
         """Validate file size and format based on employer configuration"""
         request = self.context.get('request')
-        if not request or not hasattr(request.user, 'employer_profile'):
+        if not request:
             return value
         
         # Get employer configuration
+        from accounts.rbac import get_active_employer
         from accounts.database_utils import get_tenant_database_alias
         from employees.utils import get_or_create_employee_config
-        
-        employer = request.user.employer_profile
+
+        employer = None
+        try:
+            employer = get_active_employer(request, require_context=False)
+        except Exception:
+            employer = None
+
+        if not employer:
+            return value
+
         tenant_db = get_tenant_database_alias(employer)
         config = get_or_create_employee_config(employer.id, tenant_db)
         
@@ -754,19 +804,15 @@ class EmployeeDocumentSerializer(serializers.ModelSerializer):
             )
         
         # Validate file format
-        if config.document_allowed_formats:
-            allowed_formats = config.document_allowed_formats
-            if isinstance(allowed_formats, str):
-                import json
-                allowed_formats = json.loads(allowed_formats)
-            
-            if allowed_formats:
-                file_extension = value.name.split('.')[-1].lower()
-                if file_extension not in [fmt.lower() for fmt in allowed_formats]:
-                    raise serializers.ValidationError(
-                        f"File format '.{file_extension}' is not allowed. "
-                        f"Allowed formats: {', '.join(allowed_formats)}"
-                    )
+        allowed_formats = config.get_allowed_document_formats()
+        if allowed_formats:
+            file_extension = value.name.split('.')[-1].lower()
+            normalized_formats = [fmt.lower() for fmt in allowed_formats]
+            if file_extension not in normalized_formats:
+                raise serializers.ValidationError(
+                    f"File format '.{file_extension}' is not allowed. "
+                    f"Allowed formats: {', '.join(allowed_formats)}"
+                )
         
         return value
 
@@ -775,16 +821,28 @@ class CrossInstitutionRecordSerializer(serializers.ModelSerializer):
     """Serializer for Cross-Institution Records"""
     
     employee_name = serializers.CharField(source='employee.full_name', read_only=True)
-    detected_employer_name = serializers.CharField(source='detected_employer.company_name', read_only=True)
+    detected_employer_name = serializers.SerializerMethodField()
     
     class Meta:
         model = EmployeeCrossInstitutionRecord
         fields = [
-            'id', 'employee', 'employee_name', 'detected_employer',
+            'id', 'employee', 'employee_name', 'detected_employer_id',
             'detected_employer_name', 'detected_employee_id', 'status',
-            'detected_at', 'verified', 'verified_at', 'notes'
+            'consent_status', 'consent_requested_at', 'consent_responded_at',
+            'consent_notes', 'detected_at', 'verified', 'verified_at', 'notes'
         ]
-        read_only_fields = ['id', 'detected_at']
+        read_only_fields = [
+            'id', 'detected_at', 'consent_requested_at',
+            'consent_responded_at', 'verified_at'
+        ]
+
+    def get_detected_employer_name(self, obj):
+        from accounts.models import EmployerProfile
+        try:
+            employer = EmployerProfile.objects.get(id=obj.detected_employer_id)
+            return employer.company_name
+        except EmployerProfile.DoesNotExist:
+            return None
 
 
 class EmployeeAuditLogSerializer(serializers.ModelSerializer):
@@ -884,12 +942,20 @@ class EmployeePrefillSerializer(serializers.Serializer):
 class EmployeeConfigurationSerializer(serializers.ModelSerializer):
     """Serializer for Employee Configuration"""
     
-    employer_name = serializers.CharField(source='employer.company_name', read_only=True)
+    employer_name = serializers.SerializerMethodField()
     
     class Meta:
         model = EmployeeConfiguration
         fields = '__all__'
-        read_only_fields = ['id', 'employer', 'created_at', 'updated_at']
+        read_only_fields = ['id', 'employer_id', 'created_at', 'updated_at']
+
+    def get_employer_name(self, obj):
+        from accounts.models import EmployerProfile
+        try:
+            employer = EmployerProfile.objects.get(id=obj.employer_id)
+            return employer.company_name
+        except EmployerProfile.DoesNotExist:
+            return None
 
 
 class DuplicateDetectionResultSerializer(serializers.Serializer):
@@ -912,9 +978,6 @@ class CreateEmployeeWithDetectionSerializer(serializers.ModelSerializer):
         help_text='ID of existing user account to link (from main database)')
     user_id = serializers.IntegerField(required=False, allow_null=True, write_only=True,
         help_text='Explicit user account ID to link (from main database)')
-    acknowledge_cross_institution = serializers.BooleanField(default=False, write_only=True,
-        help_text='Acknowledge concurrent employment in other institutions')
-    
     # Define as explicit UUID fields to prevent auto ForeignKey handling
     department = serializers.UUIDField(
         required=True, 
@@ -963,7 +1026,6 @@ class CreateEmployeeWithDetectionSerializer(serializers.ModelSerializer):
             
             # Additional
             'send_invitation', 'force_create', 'link_existing_user', 'user_id',
-            'acknowledge_cross_institution'
         ]
         extra_kwargs = {
             # Make most fields optional - employers provide minimal data, employees complete their profiles
@@ -1007,17 +1069,61 @@ class CreateEmployeeWithDetectionSerializer(serializers.ModelSerializer):
             'user_id': {'required': False},
         }
 
-    
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        request = self.context.get('request')
+        if not request:
+            return
+
+        try:
+            from accounts.rbac import get_active_employer
+            from accounts.database_utils import get_tenant_database_alias
+            from employees.utils import get_or_create_employee_config
+            employer = get_active_employer(request, require_context=True)
+            tenant_db = get_tenant_database_alias(employer)
+            config = get_or_create_employee_config(employer.id, tenant_db)
+        except Exception:
+            return
+
+        def apply_requirement(field_name, requirement):
+            field = self.fields.get(field_name)
+            if not field:
+                return
+            if requirement == config.FIELD_REQUIRED:
+                field.required = True
+                field.allow_null = False
+                if hasattr(field, 'allow_blank'):
+                    field.allow_blank = False
+            else:
+                field.required = False
+                field.allow_null = True
+                if hasattr(field, 'allow_blank'):
+                    field.allow_blank = True
+
+        apply_requirement('department', config.require_department)
+        apply_requirement('branch', config.require_branch)
+        apply_requirement('manager', config.require_manager)
+        apply_requirement('probation_end_date', config.require_probation_period)
+        apply_requirement('national_id_number', config.require_national_id)
+
+        # Allow email to be optional when auto-generation is enabled
+        if config.auto_generate_work_email and 'email' in self.fields:
+            self.fields['email'].required = False
+            if hasattr(self.fields['email'], 'allow_blank'):
+                self.fields['email'].allow_blank = True
+
     def validate_department(self, value):
         """Validate that department UUID exists in tenant database"""
         if value is None:
             return value
         
         request = self.context['request']
-        employer_id = request.user.employer_profile.id
+        from accounts.rbac import get_active_employer
+        employer = get_active_employer(request, require_context=True)
+        employer_id = employer.id
         
         from accounts.database_utils import get_tenant_database_alias
-        tenant_db = get_tenant_database_alias(request.user.employer_profile)
+        tenant_db = get_tenant_database_alias(employer)
         
         try:
             Department.objects.using(tenant_db).get(
@@ -1031,14 +1137,16 @@ class CreateEmployeeWithDetectionSerializer(serializers.ModelSerializer):
     
     def validate_branch(self, value):
         """Validate that branch UUID exists in tenant database"""
-        if value is None:
+        if not value:
             return value
         
         request = self.context['request']
-        employer_id = request.user.employer_profile.id
+        from accounts.rbac import get_active_employer
+        employer = get_active_employer(request, require_context=True)
+        employer_id = employer.id
         
         from accounts.database_utils import get_tenant_database_alias
-        tenant_db = get_tenant_database_alias(request.user.employer_profile)
+        tenant_db = get_tenant_database_alias(employer)
         
         try:
             Branch.objects.using(tenant_db).get(
@@ -1052,14 +1160,16 @@ class CreateEmployeeWithDetectionSerializer(serializers.ModelSerializer):
     
     def validate_manager(self, value):
         """Validate that manager UUID exists in tenant database"""
-        if value is None:
+        if not value:
             return value
         
         request = self.context['request']
-        employer_id = request.user.employer_profile.id
+        from accounts.rbac import get_active_employer
+        employer = get_active_employer(request, require_context=True)
+        employer_id = employer.id
         
         from accounts.database_utils import get_tenant_database_alias
-        tenant_db = get_tenant_database_alias(request.user.employer_profile)
+        tenant_db = get_tenant_database_alias(employer)
         
         try:
             Employee.objects.using(tenant_db).get(
@@ -1073,12 +1183,26 @@ class CreateEmployeeWithDetectionSerializer(serializers.ModelSerializer):
     
     def validate_national_id_number(self, value):
         """Validate national ID number format and uniqueness within institution"""
-        if not value or value.strip() == '':
+        if not value or (isinstance(value, str) and value.strip() == ''):
+            # Respect configuration if national ID is optional/hidden
+            request = self.context.get('request')
+            try:
+                from accounts.rbac import get_active_employer
+                from accounts.database_utils import get_tenant_database_alias
+                from employees.utils import get_or_create_employee_config
+                employer = get_active_employer(request, require_context=True)
+                tenant_db = get_tenant_database_alias(employer)
+                config = get_or_create_employee_config(employer.id, tenant_db)
+                if config and config.require_national_id != config.FIELD_REQUIRED:
+                    return value
+            except Exception:
+                pass
             raise serializers.ValidationError("National ID number is required for cross-institutional tracking.")
         
         # Check uniqueness within the employer's institution
         request = self.context['request']
-        employer = request.user.employer_profile
+        from accounts.rbac import get_active_employer
+        employer = get_active_employer(request, require_context=True)
         
         from accounts.database_utils import get_tenant_database_alias
         tenant_db = get_tenant_database_alias(employer)
@@ -1094,9 +1218,29 @@ class CreateEmployeeWithDetectionSerializer(serializers.ModelSerializer):
             existing_query = existing_query.exclude(id=self.instance.id)
         
         if existing_query.exists():
-            raise serializers.ValidationError(
-                "An employee with this National ID already exists in your institution."
-            )
+            existing = existing_query.only(
+                'id',
+                'employee_id',
+                'first_name',
+                'last_name',
+                'employment_status',
+                'branch_id',
+                'department_id',
+            ).first()
+            details = None
+            if existing:
+                details = {
+                    'id': str(existing.id),
+                    'employee_id': existing.employee_id,
+                    'name': f"{existing.first_name} {existing.last_name}",
+                    'status': existing.employment_status,
+                    'branch_id': existing.branch_id,
+                    'department_id': existing.department_id,
+                }
+            raise serializers.ValidationError({
+                'national_id_number': "An employee with this National ID already exists in your institution.",
+                'existing_employee': details
+            })
         
         return value
     
@@ -1106,11 +1250,18 @@ class CreateEmployeeWithDetectionSerializer(serializers.ModelSerializer):
         from accounts.database_utils import get_tenant_database_alias
         
         request = self.context['request']
-        employer = request.user.employer_profile
+        from accounts.rbac import get_active_employer
+        employer = get_active_employer(request, require_context=True)
         tenant_db = get_tenant_database_alias(employer)
         
         # Get or create configuration using helper function
         config = get_or_create_employee_config(employer.id, tenant_db)
+
+        # Enforce manual employee ID override setting
+        if data.get('employee_id') and config and not config.employee_id_manual_override:
+            raise serializers.ValidationError({
+                'employee_id': 'Manual employee ID entry is disabled by configuration.'
+            })
         
         # Skip strict validation during employer-initiated creation
         # The configuration requirements apply when employees complete their own profiles,
@@ -1119,8 +1270,6 @@ class CreateEmployeeWithDetectionSerializer(serializers.ModelSerializer):
         
         # Check for concurrent employment if linking existing user
         link_existing_user = data.get('link_existing_user')
-        acknowledge_cross_institution = data.get('acknowledge_cross_institution', False)
-        
         if link_existing_user:
             from accounts.models import EmployeeRegistry
             try:
@@ -1133,41 +1282,119 @@ class CreateEmployeeWithDetectionSerializer(serializers.ModelSerializer):
                         'existing_employers': concurrent_check['existing_employers']
                     })
                 
-                # If consent required and not acknowledged
-                if concurrent_check.get('requires_consent') and not acknowledge_cross_institution:
-                    raise serializers.ValidationError({
-                        'consent_required': 'Employee consent is required for cross-institution employment. Please set acknowledge_cross_institution=true after obtaining consent.',
-                        'existing_employers': concurrent_check['existing_employers']
-                    })
-                
             except EmployeeRegistry.DoesNotExist:
                 pass  # No registry, no concurrent employment check needed
         
-        # Detect duplicates
-        force_create = data.get('force_create', False)
-        if not force_create:
-            duplicate_result = detect_duplicate_employees(
-                employer=employer,
-                national_id=data.get('national_id_number'),
-                email=data.get('email'),
-                phone=data.get('phone_number'),
-                first_name=data.get('first_name'),
-                last_name=data.get('last_name'),
-                date_of_birth=data.get('date_of_birth'),
-                config=config
-            )
-            
-            if duplicate_result['duplicates_found']:
-                # Check duplicate action from config
+        # Detect duplicates (always), then apply policy gates before respecting force_create
+        duplicate_result = detect_duplicate_employees(
+            employer=employer,
+            national_id=data.get('national_id_number'),
+            email=data.get('email'),
+            phone=data.get('phone_number'),
+            first_name=data.get('first_name'),
+            last_name=data.get('last_name'),
+            date_of_birth=data.get('date_of_birth'),
+            config=config
+        )
+
+        if duplicate_result.get('duplicates_found'):
+            same_matches = duplicate_result.get('same_institution_matches') or []
+            cross_matches = duplicate_result.get('cross_institution_matches') or []
+            if cross_matches:
+                existing_employers = []
+                for match in cross_matches:
+                    entry = {
+                        'employer_id': match.get('employer_id'),
+                        'employer_name': match.get('employer_name'),
+                    }
+                    data_obj = match.get('data')
+                    if isinstance(data_obj, dict):
+                        entry['employee_id'] = data_obj.get('employee_id') or data_obj.get('id')
+                    else:
+                        entry['employee_id'] = getattr(data_obj, 'employee_id', None) or getattr(data_obj, 'id', None)
+                    existing_employers.append(entry)
+
+                # Contract-level gating for multi-institution employment
+                contract_blocks_multi = False
+                try:
+                    from contracts.models import ContractConfiguration
+                    contract_config = ContractConfiguration.objects.using(tenant_db).filter(
+                        employer_id=employer.id,
+                        contract_type__isnull=True
+                    ).first()
+                    contract_blocks_multi = bool(
+                        contract_config and not contract_config.allow_multi_institution_employment
+                    )
+                except Exception:
+                    contract_blocks_multi = False
+
+                # Employee configuration can override contract-level default
+                if contract_blocks_multi and not (config and config.allow_concurrent_employment):
+                    try:
+                        from accounts.notifications import create_notification
+                        create_notification(
+                            user=request.user,
+                            title="Concurrent employment blocked",
+                            body="Employee creation blocked due to contract configuration.",
+                            type="ALERT",
+                            data={
+                                "event": "employees.concurrent_employment_blocked",
+                                "reason": "contract_policy",
+                                "existing_employers": existing_employers,
+                            },
+                            employer_profile=employer,
+                        )
+                    except Exception:
+                        pass
+                    raise serializers.ValidationError({
+                        'concurrent_employment': 'Concurrent employment is not allowed by contract configuration',
+                        'existing_employers': existing_employers,
+                        'concurrent_employment_detected': True,
+                    })
+
+                if config and not config.allow_concurrent_employment:
+                    try:
+                        from accounts.notifications import create_notification
+                        create_notification(
+                            user=request.user,
+                            title="Concurrent employment blocked",
+                            body="Employee creation blocked by employer policy.",
+                            type="ALERT",
+                            data={
+                                "event": "employees.concurrent_employment_blocked",
+                                "reason": "employer_policy",
+                                "existing_employers": existing_employers,
+                            },
+                            employer_profile=employer,
+                        )
+                    except Exception:
+                        pass
+                    raise serializers.ValidationError({
+                        'concurrent_employment': 'Concurrent employment is not allowed by this employer',
+                        'existing_employers': existing_employers,
+                        'concurrent_employment_detected': True,
+                    })
+
+                # Consent flow disabled: do not require employee consent to proceed.
+
+            # Check duplicate action from config (skip if force_create)
+            force_create = data.get('force_create', False)
+            if not force_create:
                 if config and config.duplicate_action == 'BLOCK':
-                    error_msg = f"Duplicate employee detected. Found {duplicate_result['total_matches']} matching records."
-                    if duplicate_result['same_institution_matches']:
-                        error_msg += f" {len(duplicate_result['same_institution_matches'])} in your institution."
-                    if duplicate_result['cross_institution_matches']:
-                        error_msg += f" {len(duplicate_result['cross_institution_matches'])} in other institutions."
-                    raise serializers.ValidationError({'duplicate_detected': error_msg})
-                
-                elif not config or config.duplicate_action == 'WARN':
+                    # Always block if duplicates exist within the same institution
+                    if same_matches:
+                        error_msg = f"Duplicate employee detected. Found {duplicate_result['total_matches']} matching records."
+                        if same_matches:
+                            error_msg += f" {len(same_matches)} in your institution."
+                        if cross_matches:
+                            error_msg += f" {len(cross_matches)} in other institutions."
+                        raise serializers.ValidationError({'duplicate_detected': error_msg})
+
+                    # If duplicates are only cross-institution and concurrent employment is allowed,
+                    # treat as a warning so creation can proceed.
+                    if cross_matches:
+                        data['_duplicate_info'] = duplicate_result
+                elif not config or config.duplicate_action in ['WARN', 'ALLOW']:
                     # Store duplicate info for response but allow creation
                     data['_duplicate_info'] = duplicate_result
         
@@ -1180,7 +1407,6 @@ class CreateEmployeeWithDetectionSerializer(serializers.ModelSerializer):
         force_create = validated_data.pop('force_create', False)
         link_existing_user = validated_data.pop('link_existing_user', None)
         explicit_user_id = validated_data.pop('user_id', None)
-        acknowledge_cross_institution = validated_data.pop('acknowledge_cross_institution', False)
         duplicate_info = validated_data.pop('_duplicate_info', None)
         
         # Pop UUID fields and convert to _id fields
@@ -1196,7 +1422,8 @@ class CreateEmployeeWithDetectionSerializer(serializers.ModelSerializer):
             validated_data['manager_id'] = manager_uuid
         
         request = self.context['request']
-        employer = request.user.employer_profile
+        from accounts.rbac import get_active_employer
+        employer = get_active_employer(request, require_context=True)
         
         # Ensure baseline employment fields for employer onboarding
         validated_data.setdefault('employment_status', 'ACTIVE')
@@ -1208,14 +1435,47 @@ class CreateEmployeeWithDetectionSerializer(serializers.ModelSerializer):
         
         # Get configuration
         config = get_or_create_employee_config(employer.id, tenant_db)
+
+        # Respect configuration for invitation sending
+        if not config.send_invitation_email:
+            send_invitation = False
         
         # Auto-generate employee ID if not provided and configured
         if not validated_data.get('employee_id'):
+            department_obj = None
+            branch_obj = None
+            if department_uuid:
+                try:
+                    department_obj = Department.objects.using(tenant_db).get(id=department_uuid)
+                except Department.DoesNotExist:
+                    department_obj = None
+            if branch_uuid:
+                try:
+                    branch_obj = Branch.objects.using(tenant_db).get(id=branch_uuid)
+                except Branch.DoesNotExist:
+                    branch_obj = None
+
             validated_data['employee_id'] = config.get_next_employee_id(
-                branch=validated_data.get('branch'),
-                department=validated_data.get('department'),
+                branch=branch_obj,
+                department=department_obj,
                 using=tenant_db
             )
+
+        # Set probation end date using default configuration if not provided
+        if not validated_data.get('probation_end_date') and config.default_probation_period_months:
+            if config.require_probation_period != config.FIELD_HIDDEN:
+                hire_date = validated_data.get('hire_date')
+                if hire_date:
+                    import calendar
+                    months = int(config.default_probation_period_months)
+                    year = hire_date.year + (hire_date.month - 1 + months) // 12
+                    month = (hire_date.month - 1 + months) % 12 + 1
+                    day = min(hire_date.day, calendar.monthrange(year, month)[1])
+                    validated_data['probation_end_date'] = hire_date.replace(
+                        year=year,
+                        month=month,
+                        day=day
+                    )
         
         # Auto-generate work email if configured
         if config.auto_generate_work_email and not validated_data.get('email'):
@@ -1314,6 +1574,8 @@ class CreateEmployeeWithDetectionSerializer(serializers.ModelSerializer):
             User.objects.filter(id=employee.user_id, last_active_employer_id__isnull=True).update(
                 last_active_employer_id=employer.id
             )
+
+            # Consent flow disabled: do not create consent requests.
         
         # Create audit log in tenant database
         create_employee_audit_log(
@@ -1369,7 +1631,8 @@ class CreateEmployeeWithDetectionSerializer(serializers.ModelSerializer):
                     detected_employer_id=employer_id,
                     detected_employee_id=str(detected_employee_id) if detected_employee_id is not None else '',
                     status=status_val or 'PENDING',
-                    consent_status='PENDING' if config and config.require_employee_consent_cross_institution else 'NOT_REQUIRED',
+                    consent_status='NOT_REQUIRED',
+                    consent_requested_at=None,
                     notes=f"Detected during employee creation. Match reasons: {', '.join(reasons or [])}"
                 )
         
@@ -1437,6 +1700,7 @@ class EmployeeDocumentUploadSerializer(serializers.ModelSerializer):
     def validate_employee(self, value):
         """Validate that employee exists in the tenant database and belongs to employer"""
         from accounts.database_utils import get_tenant_database_alias
+        from accounts.rbac import get_active_employer
         
         request = self.context.get('request')
         if not request:
@@ -1465,11 +1729,16 @@ class EmployeeDocumentUploadSerializer(serializers.ModelSerializer):
                 except Employee.DoesNotExist:
                     raise serializers.ValidationError("You can only upload documents for yourself")
         
-        # Employer uploading for an employee
-        if not hasattr(user, 'employer_profile') or not user.employer_profile:
+        # Employer or delegate uploading for an employee
+        employer = None
+        try:
+            employer = get_active_employer(request, require_context=False)
+        except Exception:
+            employer = None
+
+        if not employer:
             raise serializers.ValidationError("User must be an employer")
-        
-        employer = user.employer_profile
+
         tenant_db = self.context.get('tenant_db')
         
         if not tenant_db:
@@ -1494,6 +1763,7 @@ class EmployeeDocumentUploadSerializer(serializers.ModelSerializer):
     def validate_file(self, value):
         """Validate file size and format based on configuration"""
         from accounts.database_utils import get_tenant_database_alias
+        from accounts.rbac import get_active_employer
         from employees.utils import get_or_create_employee_config
         
         request = self.context['request']
@@ -1501,22 +1771,41 @@ class EmployeeDocumentUploadSerializer(serializers.ModelSerializer):
         tenant_db = self.context.get('tenant_db')
         
         # Get employer_id based on user type
+        employer_id = None
         if hasattr(user, 'employer_profile') and user.employer_profile:
             employer_id = user.employer_profile.id
             if not tenant_db:
                 tenant_db = get_tenant_database_alias(user.employer_profile)
-        elif user.is_employee:
+        else:
+            try:
+                active_employer = get_active_employer(request, require_context=False)
+            except Exception:
+                active_employer = None
+            if active_employer:
+                employer_id = active_employer.id
+                if not tenant_db:
+                    tenant_db = get_tenant_database_alias(active_employer)
+
+        if not employer_id and user.is_employee:
             # Get employee to find employer_id
             employee = self.context.get('employee')
             if employee:
                 employer_id = employee.employer_id
+                if not tenant_db:
+                    try:
+                        from accounts.models import EmployerProfile
+                        employer_profile = EmployerProfile.objects.get(id=employee.employer_id)
+                        tenant_db = get_tenant_database_alias(employer_profile)
+                    except Exception:
+                        tenant_db = tenant_db or None
             else:
                 # Skip validation if we can't determine employer
                 return value
-        else:
+        elif not employer_id:
             return value
         
         # Get or create configuration using helper function
+        tenant_db = tenant_db or 'default'
         config = get_or_create_employee_config(employer_id, tenant_db)
             
         # Check file size
@@ -1529,7 +1818,8 @@ class EmployeeDocumentUploadSerializer(serializers.ModelSerializer):
         # Check file format
         allowed_formats = config.get_allowed_document_formats()
         file_ext = value.name.split('.')[-1].lower()
-        if allowed_formats and file_ext not in allowed_formats:
+        normalized_formats = [fmt.lower() for fmt in allowed_formats] if allowed_formats else []
+        if normalized_formats and file_ext not in normalized_formats:
             raise serializers.ValidationError(
                 f"File format '.{file_ext}' is not allowed. Allowed formats: {', '.join(allowed_formats)}"
             )
@@ -2090,7 +2380,7 @@ class RequestTerminationSerializer(serializers.Serializer):
     """Serializer for requesting employee termination with approval workflow"""
     
     termination_date = serializers.DateField()
-    termination_reason = serializers.CharField(required=True)
+    termination_reason = serializers.CharField(required=False, allow_blank=True, allow_null=True)
     
     def validate_termination_date(self, value):
         from django.utils import timezone
@@ -2100,18 +2390,37 @@ class RequestTerminationSerializer(serializers.Serializer):
             )
         return value
 
+    def validate(self, attrs):
+        config = self.context.get('config')
+        if config and config.require_termination_reason:
+            reason = attrs.get('termination_reason')
+            if not reason or (isinstance(reason, str) and reason.strip() == ''):
+                raise serializers.ValidationError({
+                    'termination_reason': 'Termination reason is required by configuration.'
+                })
+        return attrs
+
 
 class CrossInstitutionConsentSerializer(serializers.ModelSerializer):
     """Serializer for Cross-Institution Consent"""
-    
+    source_employer_name = serializers.SerializerMethodField()
+
     class Meta:
         model = CrossInstitutionConsent
         fields = [
             'id', 'employee_registry_id', 'source_employer_id', 'target_employer_id',
-            'target_employer_name', 'status', 'consent_token', 'requested_at',
-            'expires_at', 'responded_at', 'notes'
+            'source_employer_name', 'target_employer_name', 'status', 'consent_token',
+            'requested_at', 'expires_at', 'responded_at', 'notes'
         ]
-        read_only_fields = ['id', 'consent_token', 'requested_at', 'updated_at']
+        read_only_fields = ['id', 'consent_token', 'requested_at', 'responded_at']
+
+    def get_source_employer_name(self, obj):
+        from accounts.models import EmployerProfile
+        try:
+            employer = EmployerProfile.objects.get(id=obj.source_employer_id)
+            return employer.company_name
+        except EmployerProfile.DoesNotExist:
+            return None
 
 
 class RespondConsentSerializer(serializers.Serializer):

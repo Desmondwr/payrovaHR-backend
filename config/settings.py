@@ -59,6 +59,7 @@ INSTALLED_APPS = [
     'treasury.apps.TreasuryConfig',
     'income_expense.apps.IncomeExpenseConfig',
     'recruitment.apps.RecruitmentConfig',
+    'payroll.apps.PayrollConfig',
 ]
 
 MIDDLEWARE = [

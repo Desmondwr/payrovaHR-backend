@@ -45,8 +45,7 @@ class EmployeeConfigurationAdmin(admin.ModelAdmin):
                       'require_emergency_contact')
         }),
         ('Cross-Institution Rules', {
-            'fields': ('allow_concurrent_employment', 'require_employee_consent_cross_institution',
-                      'cross_institution_visibility_level')
+            'fields': ('allow_concurrent_employment', 'cross_institution_visibility_level')
         }),
         ('Duplicate Detection', {
             'fields': ('duplicate_detection_level', 'duplicate_action',

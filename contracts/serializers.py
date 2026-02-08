@@ -1,12 +1,13 @@
 from rest_framework import serializers
 from decimal import Decimal
 from .models import (
-    Contract, Allowance, Deduction, ContractAmendment, 
-    ContractConfiguration, SalaryScale
+    Contract, Allowance, Deduction, ContractAmendment,
+    ContractConfiguration, SalaryScale, ContractTemplate, ContractTemplateVersion
 )
 from timeoff.defaults import merge_time_off_defaults, validate_time_off_config
 from accounts.rbac import get_active_employer, is_delegate_user
 from .configuration_defaults import CONFIGURATION_MERGE_FUNCTIONS
+from .payroll_sync import sync_contract_payroll_elements
 
 class AllowanceSerializer(serializers.ModelSerializer):
     class Meta:
@@ -31,6 +32,84 @@ class SalaryScaleSerializer(serializers.ModelSerializer):
         if tenant_db:
             return SalaryScale.objects.using(tenant_db).create(**validated_data)
         return super().create(validated_data)
+
+
+class ContractTemplateSerializer(serializers.ModelSerializer):
+    file_url = serializers.SerializerMethodField()
+
+    class Meta:
+        model = ContractTemplate
+        fields = [
+            'id',
+            'employer_id',
+            'name',
+            'category',
+            'version',
+            'contract_type',
+            'file',
+            'file_url',
+            'body_override',
+            'is_default',
+            'created_at',
+            'updated_at',
+        ]
+        read_only_fields = ('id', 'employer_id', 'created_at', 'updated_at', 'file_url')
+
+    def get_file_url(self, obj):
+        if not obj.file:
+            return None
+        try:
+            url = obj.file.url
+        except Exception:
+            return None
+        request = self.context.get('request')
+        if request:
+            try:
+                return request.build_absolute_uri(url)
+            except Exception:
+                return url
+        return url
+
+    def create(self, validated_data):
+        tenant_db = self.context.get('tenant_db')
+        if tenant_db:
+            return ContractTemplate.objects.using(tenant_db).create(**validated_data)
+        return super().create(validated_data)
+
+
+class ContractTemplateVersionSerializer(serializers.ModelSerializer):
+    file_url = serializers.SerializerMethodField()
+
+    class Meta:
+        model = ContractTemplateVersion
+        fields = [
+            'id',
+            'template',
+            'name',
+            'category',
+            'version',
+            'contract_type',
+            'body_override',
+            'file',
+            'file_url',
+            'created_at',
+        ]
+        read_only_fields = ('id', 'created_at', 'file_url')
+
+    def get_file_url(self, obj):
+        if not obj.file:
+            return None
+        try:
+            url = obj.file.url
+        except Exception:
+            return None
+        request = self.context.get('request')
+        if request:
+            try:
+                return request.build_absolute_uri(url)
+            except Exception:
+                return url
+        return url
 
 class ContractSerializer(serializers.ModelSerializer):
     allowances = AllowanceSerializer(many=True, required=False, allow_null=True)
@@ -147,6 +226,8 @@ class ContractSerializer(serializers.ModelSerializer):
         status = data.get('status', getattr(self.instance, 'status', 'DRAFT'))
         start_date = data.get('start_date') if 'start_date' in data else getattr(self.instance, 'start_date', None)
         end_date = data.get('end_date') if 'end_date' in data else getattr(self.instance, 'end_date', None)
+        base_salary = data.get('base_salary', getattr(self.instance, 'base_salary', None))
+        salary_scale = data.get('salary_scale') or getattr(self.instance, 'salary_scale', None)
 
         # Only check if status is active/signed/pending and we have start date
         allow_concurrent = config_get('allow_concurrent_contracts_same_inst', False)
@@ -236,8 +317,30 @@ class ContractSerializer(serializers.ModelSerializer):
                         f"Total percentage allowances exceed the maximum allowed ({max_pct}%)."
                     )
 
-        salary_scale = data.get('salary_scale') or getattr(self.instance, 'salary_scale', None)
-        base_salary = data.get('base_salary', getattr(self.instance, 'base_salary', None))
+        require_gross_gt_zero = config_get('require_gross_salary_gt_zero')
+        if require_gross_gt_zero:
+            gross_total = Decimal(str(base_salary or 0))
+            if allowances_data is not None:
+                for allowance in allowances_data:
+                    try:
+                        amount = Decimal(str(allowance.get('amount') or 0))
+                    except Exception:
+                        amount = Decimal('0')
+                    if (allowance.get('type') or '').upper() == 'PERCENTAGE':
+                        try:
+                            gross_total += (Decimal(str(base_salary or 0)) * amount / Decimal('100'))
+                        except Exception:
+                            pass
+                    else:
+                        gross_total += amount
+            elif self.instance:
+                try:
+                    gross_total = self.instance.gross_salary
+                except Exception:
+                    pass
+            if gross_total <= 0:
+                add_error('base_salary', 'Gross salary must be greater than zero.')
+
         allow_salary_override = config_get('allow_salary_override', True)
         salary_scale_enforcement = config_get('salary_scale_enforcement', 'WARNING')
 
@@ -262,6 +365,26 @@ class ContractSerializer(serializers.ModelSerializer):
             allowances_data = []
         if deductions_data is None:
             deductions_data = []
+
+        # Apply default duration if end_date is missing and config provides a default.
+        try:
+            config_get, _tenant_db = self._get_config_context(validated_data)
+            start_date = validated_data.get('start_date')
+            end_date = validated_data.get('end_date')
+            contract_type = (validated_data.get('contract_type') or '').upper()
+            default_months = config_get('default_duration_months')
+            if start_date and not end_date and default_months and contract_type != 'PERMANENT':
+                import calendar
+
+                months = int(default_months)
+                if months > 0:
+                    year = start_date.year + (start_date.month - 1 + months) // 12
+                    month = (start_date.month - 1 + months) % 12 + 1
+                    day = min(start_date.day, calendar.monthrange(year, month)[1])
+                    validated_data['end_date'] = start_date.replace(year=year, month=month, day=day)
+        except Exception:
+            # Default duration is best-effort; validation will catch missing/invalid end dates.
+            pass
         
         # Set tenant and user context automatically
         request = self.context.get('request')
@@ -288,6 +411,8 @@ class ContractSerializer(serializers.ModelSerializer):
                     
                 for deduction_data in deductions_data:
                     Deduction.objects.using(tenant_db).create(contract=contract, **deduction_data)
+
+                sync_contract_payroll_elements(contract, tenant_db=tenant_db)
                     
                 return contract
             
@@ -296,6 +421,10 @@ class ContractSerializer(serializers.ModelSerializer):
     def update(self, instance, validated_data):
         allowances_data = validated_data.pop('allowances', None)
         deductions_data = validated_data.pop('deductions', None)
+        base_salary_changed = (
+            'base_salary' in validated_data
+            and validated_data.get('base_salary') != instance.base_salary
+        )
         
         # Get tenant DB
         request = self.context.get('request')
@@ -332,6 +461,13 @@ class ContractSerializer(serializers.ModelSerializer):
             # Create new
             for deduction_data in deductions_data:
                 Deduction.objects.using(tenant_db).create(contract=instance, **deduction_data)
+
+        sync_contract_payroll_elements(
+            instance,
+            tenant_db=tenant_db,
+            sync_allowances=allowances_data is not None or base_salary_changed,
+            sync_deductions=deductions_data is not None,
+        )
 
         return instance
 

@@ -1,4 +1,4 @@
-from datetime import date
+from datetime import date, timedelta
 from decimal import Decimal
 
 from rest_framework import serializers
@@ -380,6 +380,8 @@ class TimeOffRequestInputSerializer(serializers.ModelSerializer):
         working_hours = int(global_settings.get("working_hours_per_day", 8) or 8)
         weekend_days = global_settings.get("weekend_days") or []
         reservation_policy = global_settings.get("reservation_policy") or "RESERVE_ON_SUBMIT"
+        if not global_settings.get("module_enabled", True):
+            raise serializers.ValidationError({"detail": "Time-off module is disabled for this institution."})
 
         leave_type_code = attrs.get("leave_type_code") or self.initial_data.get("leave_type_code")
         leave_types = (config.get("leave_types") or [])
@@ -428,10 +430,13 @@ class TimeOffRequestInputSerializer(serializers.ModelSerializer):
         blackout_dates = request_policy.get("blackout_dates") or []
         if blackout_dates:
             blackout_set = {str(bd) for bd in blackout_dates}
-            for day in (start_at.date(), end_at.date()):
-                if str(day) in blackout_set:
+            curr = start_at.date()
+            end_day = end_at.date()
+            while curr <= end_day:
+                if str(curr) in blackout_set:
                     errors["start_date"] = "Requested dates intersect with blackout dates."
                     break
+                curr += timedelta(days=1)
 
         description = attrs.get("description") or attrs.get("reason") or self.initial_data.get("description")
         attachments = attrs.get("attachments") or self.initial_data.get("attachments") or []
@@ -470,6 +475,50 @@ class TimeOffRequestInputSerializer(serializers.ModelSerializer):
                 exclude_request_id=self.instance.id if self.instance else None,
             ):
                 errors["detail"] = "Request overlaps with an existing request."
+
+        min_unit = global_settings.get("minimum_request_unit")
+        if min_unit is not None:
+            try:
+                min_unit = float(min_unit)
+            except (TypeError, ValueError):
+                min_unit = None
+        if min_unit and min_unit > 0:
+            multiple = duration_days / min_unit
+            if abs(multiple - round(multiple)) > 1e-6:
+                errors["duration"] = f"Duration must be in increments of {min_unit} day(s)."
+
+        max_length = global_settings.get("max_request_length_days")
+        if max_length is not None:
+            try:
+                max_length = float(max_length)
+            except (TypeError, ValueError):
+                max_length = None
+        if max_length and duration_days > max_length:
+            errors["duration"] = f"Request length cannot exceed {max_length} day(s)."
+
+        max_requests_per_month = global_settings.get("max_requests_per_month")
+        submit_flag = self.context.get("submit_flag", False)
+        if max_requests_per_month and (submit_flag or (self.instance and self.instance.status in ["SUBMITTED", "PENDING", "APPROVED"])):
+            try:
+                max_requests_per_month = int(max_requests_per_month)
+            except (TypeError, ValueError):
+                max_requests_per_month = None
+        if max_requests_per_month:
+            month_start = start_at.date().replace(day=1)
+            if month_start.month == 12:
+                next_month = date(month_start.year + 1, 1, 1)
+            else:
+                next_month = date(month_start.year, month_start.month + 1, 1)
+            monthly_qs = TimeOffRequest.objects.using(tenant_db).filter(
+                employee=employee_obj,
+                status__in=["SUBMITTED", "PENDING", "APPROVED"],
+                start_at__date__gte=month_start,
+                start_at__date__lt=next_month,
+            )
+            if self.instance:
+                monthly_qs = monthly_qs.exclude(id=self.instance.id)
+            if monthly_qs.count() >= max_requests_per_month:
+                errors["detail"] = f"Monthly request limit ({max_requests_per_month}) reached."
 
         # Balance validation
         reservation_policy = (leave_type.get("reservation_policy") or reservation_policy).upper()
@@ -687,6 +736,9 @@ class TimeOffAllocationCreateSerializer(serializers.ModelSerializer):
         attrs["employer_id"] = employer.id
 
         config = _load_config(employer.id, tenant_db)
+        global_settings = config.get("global_settings") or {}
+        if not global_settings.get("module_enabled", True):
+            raise serializers.ValidationError({"detail": "Time-off module is disabled for this institution."})
         leave_types = config.get("leave_types") or []
         leave_type = next((lt for lt in leave_types if lt.get("code") == attrs.get("leave_type_code")), None)
         if not leave_type:
@@ -722,8 +774,8 @@ class TimeOffAllocationCreateSerializer(serializers.ModelSerializer):
                 if not scoped.exists():
                     raise serializers.ValidationError({"employee_id": ["Employee not found in tenant."]})
         attrs["employee"] = employee_obj
-        attrs["working_hours"] = int((config.get("global_settings") or {}).get("working_hours_per_day", 8) or 8)
-        attrs["rounding"] = (config.get("global_settings") or {}).get("rounding") or {}
+        attrs["working_hours"] = int(global_settings.get("working_hours_per_day", 8) or 8)
+        attrs["rounding"] = global_settings.get("rounding") or {}
         return attrs
 
     def create(self, validated_data):
@@ -781,6 +833,9 @@ class TimeOffBulkAllocationSerializer(serializers.Serializer):
         attrs["employer_id"] = employer.id
 
         config = _load_config(employer.id, tenant_db)
+        global_settings = config.get("global_settings") or {}
+        if not global_settings.get("module_enabled", True):
+            raise serializers.ValidationError({"detail": "Time-off module is disabled for this institution."})
         leave_types = config.get("leave_types") or []
         leave_type = next((lt for lt in leave_types if lt.get("code") == attrs.get("leave_type_code")), None)
         if not leave_type:
@@ -803,8 +858,8 @@ class TimeOffBulkAllocationSerializer(serializers.Serializer):
             if scoped.count() != len(employees):
                 raise serializers.ValidationError({"employee_ids": ["One or more employees not found for this tenant."]})
         attrs["employees"] = employees
-        attrs["working_hours"] = int((config.get("global_settings") or {}).get("working_hours_per_day", 8) or 8)
-        attrs["rounding"] = (config.get("global_settings") or {}).get("rounding") or {}
+        attrs["working_hours"] = int(global_settings.get("working_hours_per_day", 8) or 8)
+        attrs["rounding"] = global_settings.get("rounding") or {}
         return attrs
 
     def create(self, validated_data):
@@ -854,6 +909,9 @@ class TimeOffAllocationRequestSerializer(serializers.ModelSerializer):
         attrs["tenant_id"] = employee.employer_id
 
         config = _load_config(employee.employer_id, tenant_db)
+        global_settings = config.get("global_settings") or {}
+        if not global_settings.get("module_enabled", True):
+            raise serializers.ValidationError({"detail": "Time-off module is disabled for this institution."})
         leave_types = config.get("leave_types") or []
         leave_type = next((lt for lt in leave_types if lt.get("code") == attrs.get("leave_type_code")), None)
         if not leave_type:

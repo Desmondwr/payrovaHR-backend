@@ -7,8 +7,6 @@ import logging
 import uuid
 from decimal import Decimal
 
-from django.db import transaction
-from django.db.models import F
 from django.utils import timezone
 
 
@@ -32,36 +30,19 @@ def _split_full_name(full_name: str):
     return first, last
 
 
-def _generate_contract_id(employer_id: int, tenant_db: str) -> str:
+def _generate_contract_id(employer_id: int, tenant_db: str, contract_type: str | None = None) -> str:
     """Generate a contract ID using the employer's ContractConfiguration sequence,
     or fall back to a random ID."""
-    from contracts.models import ContractConfiguration
+    from contracts.models import Contract
 
-    config = ContractConfiguration.objects.using(tenant_db).filter(
-        employer_id=employer_id,
-        contract_type__isnull=True,
-    ).first()
-
-    if config:
-        with transaction.atomic(using=tenant_db):
-            ContractConfiguration.objects.using(tenant_db).filter(id=config.id).update(
-                last_sequence_number=F("last_sequence_number") + 1
-            )
-            config.refresh_from_db(using=tenant_db)
-
-        seq = config.last_sequence_number
-        formatted_seq = str(seq).zfill(config.id_sequence_padding)
-        prefix = config.id_prefix
-        year = (
-            str(timezone.now().year)
-            if config.id_year_format == "YYYY"
-            else str(timezone.now().year)[2:]
-        )
-        parts = [prefix]
-        if year:
-            parts.append(year)
-        parts.append(formatted_seq)
-        return "-".join(parts)
+    try:
+        temp_contract = Contract(employer_id=employer_id, contract_type=contract_type or "PERMANENT")
+        temp_contract._state.db = tenant_db
+        generated = temp_contract.generate_contract_id()
+        if generated:
+            return generated
+    except Exception:
+        pass
 
     return f"CNT-{uuid.uuid4().hex[:8].upper()}"
 
@@ -108,7 +89,7 @@ def create_draft_contract(applicant, employee, tenant_db: str, employer_id: int,
     contract_type = EMPLOYMENT_TO_CONTRACT_TYPE.get(job.employment_type or "", "PERMANENT")
 
     try:
-        contract_id = _generate_contract_id(employer_id, tenant_db)
+        contract_id = _generate_contract_id(employer_id, tenant_db, contract_type)
         contract = Contract(
             employer_id=employer_id,
             contract_id=contract_id,

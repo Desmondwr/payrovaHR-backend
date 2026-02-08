@@ -3,6 +3,7 @@ from django.utils import timezone
 from accounts.models import EmployerProfile
 from accounts.database_utils import get_tenant_database_alias
 from contracts.models import Contract
+from contracts.notifications import notify_expired
 
 class Command(BaseCommand):
     help = 'Automatically activates signed contracts that have reached their start date.'
@@ -34,6 +35,8 @@ class Command(BaseCommand):
                 count = 0
                 for contract in contracts_to_activate:
                     try:
+                        if not contract.get_effective_config('auto_activate_on_start', False):
+                            continue
                         # Activate with user=None (System action)
                         contract.activate(user=None)
                         count += 1
@@ -42,6 +45,34 @@ class Command(BaseCommand):
                         self.stdout.write(self.style.ERROR(f"Failed to activate contract {contract.contract_id}: {str(e)}"))
                 
                 total_activated += count
+
+                # Auto-expire fixed-term contracts when configured
+                expirable = Contract.objects.using(tenant_db).filter(
+                    employer_id=employer.id,
+                    status__in=['ACTIVE', 'SIGNED', 'PENDING_SIGNATURE', 'APPROVED', 'PENDING_APPROVAL'],
+                    end_date__isnull=False,
+                )
+                for contract in expirable:
+                    try:
+                        if contract._should_auto_expire():
+                            contract.status = 'EXPIRED'
+                            contract.save(using=tenant_db)
+                            contract.log_action(user=None, action='EXPIRED')
+                            try:
+                                contract._sync_employee_after_status_change('expired', user=None)
+                            except Exception:
+                                pass
+                            try:
+                                notify_expired(contract)
+                            except Exception:
+                                pass
+                            self.stdout.write(self.style.SUCCESS(
+                                f"Auto-expired contract {contract.contract_id} for {employer.company_name}"
+                            ))
+                    except Exception as e:
+                        self.stdout.write(self.style.ERROR(
+                            f"Failed to auto-expire contract {contract.contract_id}: {str(e)}"
+                        ))
                 
             except Exception as e:
                  self.stdout.write(self.style.ERROR(f"Error processing tenant {employer.company_name}: {str(e)}"))

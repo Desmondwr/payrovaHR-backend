@@ -127,8 +127,6 @@ class EmployeeConfiguration(models.Model):
     # ===== Cross-Institution Employment Rules =====
     allow_concurrent_employment = models.BooleanField(default=False, 
         help_text='Allow employees to work in multiple institutions simultaneously')
-    require_employee_consent_cross_institution = models.BooleanField(default=True, 
-        help_text='Require employee consent before linking to another institution')
     cross_institution_visibility_level = models.CharField(max_length=20, 
         choices=[
             ('NONE', 'No visibility'),
@@ -245,22 +243,7 @@ class EmployeeConfiguration(models.Model):
         formatted_number = str(next_number).zfill(self.employee_id_padding)
         
         # Build ID based on format
-        if self.employee_id_format == self.ID_FORMAT_SEQUENTIAL:
-            employee_id = f"{self.employee_id_prefix}-{formatted_number}"
-        
-        elif self.employee_id_format == self.ID_FORMAT_YEAR_BASED:
-            current_year = timezone.now().year
-            employee_id = f"{self.employee_id_prefix}-{current_year}-{formatted_number}"
-        
-        elif self.employee_id_format == self.ID_FORMAT_BRANCH_BASED:
-            branch_code = branch.code if branch else "HQ"
-            employee_id = f"{branch_code}-{formatted_number}"
-        
-        elif self.employee_id_format == self.ID_FORMAT_DEPT_BASED:
-            dept_code = department.code if department and hasattr(department, 'code') else "GEN"
-            employee_id = f"{dept_code}-{formatted_number}"
-        
-        elif self.employee_id_format == self.ID_FORMAT_CUSTOM and self.employee_id_custom_template:
+        if self.employee_id_format == self.ID_FORMAT_CUSTOM and self.employee_id_custom_template:
             # Parse custom template
             template = self.employee_id_custom_template
             template = template.replace('{prefix}', self.employee_id_prefix)
@@ -270,7 +253,29 @@ class EmployeeConfiguration(models.Model):
             template = template.replace('{number}', formatted_number)
             employee_id = template
         else:
-            employee_id = f"{self.employee_id_prefix}-{formatted_number}"
+            # Default composition uses include flags
+            year_part = str(timezone.now().year) if (
+                self.employee_id_format == self.ID_FORMAT_YEAR_BASED or self.employee_id_include_year
+            ) else None
+
+            if self.employee_id_format == self.ID_FORMAT_BRANCH_BASED:
+                prefix = branch.code if branch else "HQ"
+            elif self.employee_id_format == self.ID_FORMAT_DEPT_BASED:
+                prefix = department.code if department and hasattr(department, 'code') else "GEN"
+            else:
+                prefix = self.employee_id_prefix
+
+            branch_part = None
+            if self.employee_id_include_branch and self.employee_id_format != self.ID_FORMAT_BRANCH_BASED:
+                branch_part = branch.code if branch else "HQ"
+
+            dept_part = None
+            if self.employee_id_include_department and self.employee_id_format != self.ID_FORMAT_DEPT_BASED:
+                dept_part = department.code if department and hasattr(department, 'code') else "GEN"
+
+            parts = [prefix, year_part, branch_part, dept_part, formatted_number]
+            parts = [p for p in parts if p]
+            employee_id = "-".join(parts)
         
         # Add suffix if configured
         if self.employee_id_suffix:

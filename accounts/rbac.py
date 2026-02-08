@@ -35,6 +35,9 @@ def get_active_employer(request, require_context=False):
 
     # Employer owners use their own profile
     if getattr(user, "employer_profile", None):
+        employer_id = _get_employer_id_from_request(request)
+        if employer_id and employer_id != user.employer_profile.id:
+            raise PermissionDenied("Employer context mismatch for this account.")
         return user.employer_profile
 
     # Admins may access any employer by header

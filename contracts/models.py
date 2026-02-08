@@ -223,9 +223,11 @@ class Contract(models.Model):
         if not self.end_date:
             return None  # Permanent contract
         today = timezone.now().date()
-        if today > self.end_date:
+        grace_days = self.get_effective_config('expiry_grace_period_days', 0) or 0
+        cutoff_date = self.end_date + timedelta(days=grace_days)
+        if today > cutoff_date:
             return 0  # Expired
-        return (self.end_date - today).days
+        return (cutoff_date - today).days
     
     @classmethod
     def get_config_for(cls, employer_id, contract_type=None, db_alias='default'):
@@ -350,36 +352,80 @@ class Contract(models.Model):
 
         if self._should_auto_expire() and self.status in ['ACTIVE', 'SIGNED', 'PENDING_SIGNATURE', 'APPROVED']:
             self.status = 'EXPIRED'
+            self._auto_expired = True
 
     def generate_contract_id(self, config=None):
         """Auto-generate contract ID based on configuration"""
         if not config:
-            config = self.get_config()
+            db_alias = self._state.db or 'default'
+            global_config, type_config = Contract.get_config_for(
+                employer_id=self.employer_id,
+                contract_type=self.contract_type,
+                db_alias=db_alias
+            )
+            config = type_config or global_config
         if not config:
             return None
-            
+
         from django.db.models import F
         from django.db import transaction
+
         db_alias = self._state.db or 'default'
-        
+        now = timezone.now()
+
+        def _resolve_institution_code():
+            """Best-effort institution code for ID generation."""
+            code = None
+            try:
+                from accounts.models import EmployerProfile
+                employer = EmployerProfile.objects.using('default').filter(id=self.employer_id).only('slug').first()
+                code = getattr(employer, 'slug', None)
+            except Exception:
+                code = None
+
+            if not code:
+                code = str(self.employer_id)
+
+            cleaned = ''.join(ch for ch in str(code).upper() if ch.isalnum())
+            return cleaned[:8] if len(cleaned) > 8 else cleaned
+
         with transaction.atomic(using=db_alias):
-            ContractConfiguration.objects.using(db_alias).filter(id=config.id).update(
-                last_sequence_number=F('last_sequence_number') + 1
-            )
+            config_qs = ContractConfiguration.objects.using(db_alias).select_for_update().filter(id=config.id)
+            config = config_qs.first()
+            if not config:
+                return None
+
+            if config.id_reset_sequence_yearly:
+                contract_qs = Contract.objects.using(db_alias).filter(employer_id=self.employer_id)
+                if config.contract_type:
+                    contract_qs = contract_qs.filter(contract_type=config.contract_type)
+                if not contract_qs.filter(created_at__year=now.year).exists():
+                    config_qs.update(last_sequence_number=0, updated_at=now)
+                    config.refresh_from_db(using=db_alias)
+
+            config_qs.update(last_sequence_number=F('last_sequence_number') + 1, updated_at=now)
             config.refresh_from_db(using=db_alias)
             seq = config.last_sequence_number
-            
-        padding = config.id_sequence_padding
+
+        padding = max(1, int(config.id_sequence_padding or 1))
         formatted_seq = str(seq).zfill(padding)
-        
-        prefix = config.id_prefix
-        year = str(timezone.now().year) if config.id_year_format == 'YYYY' else str(timezone.now().year)[2:]
-        
-        parts = [prefix]
+
+        prefix = (config.id_prefix or '').strip()
+        year = ''
+        if config.id_year_format == 'YYYY':
+            year = str(now.year)
+        elif config.id_year_format == 'YY':
+            year = str(now.year)[2:]
+
+        parts = []
+        if prefix:
+            parts.append(prefix)
+        if config.id_include_institution_code:
+            parts.append(_resolve_institution_code())
         if year:
             parts.append(year)
         parts.append(formatted_seq)
-        return "-".join(parts)
+        return "-".join([part for part in parts if part])
 
     def clean(self):
         """Validate contract data against configurations"""
@@ -418,6 +464,16 @@ class Contract(models.Model):
             if self.end_date <= self.start_date:
                  errors['end_date'] = 'End date must be after start date.'
 
+        # 2c. Probation end date should fit within contract duration
+        probation_must_end = self.get_effective_config('probation_must_end_before_contract', False)
+        if probation_must_end and self.end_date and self.employee_id:
+            try:
+                probation_end = getattr(self.employee, 'probation_end_date', None)
+            except Exception:
+                probation_end = None
+            if probation_end and probation_end > self.end_date:
+                errors['end_date'] = 'Probation end date must be on or before the contract end date.'
+
         # 2b. Concurrent contract rules
         allow_concurrent = self.get_effective_config('allow_concurrent_contracts_same_inst', False)
         if not allow_concurrent and self.employee_id and self.start_date:
@@ -454,8 +510,16 @@ class Contract(models.Model):
         min_wage = self.get_effective_config('min_wage')
 
         if require_gross_gt_zero is not None and require_gross_gt_zero:
-            if not self.base_salary or self.base_salary <= 0:
-                errors['base_salary'] = 'Base salary must be greater than zero.'
+            gross_value = None
+            if self.pk:
+                try:
+                    gross_value = self.gross_salary
+                except Exception:
+                    gross_value = None
+            if gross_value is None:
+                gross_value = self.base_salary or Decimal('0')
+            if gross_value <= 0:
+                errors['base_salary'] = 'Gross salary must be greater than zero.'
             
         if min_wage is not None and self.base_salary and self.base_salary < min_wage:
             errors['base_salary'] = f'Base salary must be at least the minimum wage ({min_wage}).'
@@ -517,10 +581,12 @@ class Contract(models.Model):
 
         if not self.contract_id:
             db_alias = self._state.db or 'default'
-            config = ContractConfiguration.objects.using(db_alias).filter(
-                employer_id=self.employer_id, 
-                contract_type__isnull=True
-            ).first()
+            global_config, type_config = Contract.get_config_for(
+                employer_id=self.employer_id,
+                contract_type=self.contract_type,
+                db_alias=db_alias
+            )
+            config = type_config or global_config
             if config:
                 self.contract_id = self.generate_contract_id(config)
             else:
@@ -534,6 +600,12 @@ class Contract(models.Model):
         self._apply_auto_expiry_if_needed()
         self.full_clean(exclude=['employee', 'branch', 'department', 'previous_contract', 'salary_scale'])
         super().save(*args, **kwargs)
+        if getattr(self, '_auto_expired', False):
+            try:
+                self._sync_employee_after_status_change('expired', user=None)
+            except Exception:
+                pass
+            self._auto_expired = False
 
     @property
     def gross_salary(self):
@@ -682,15 +754,27 @@ class Contract(models.Model):
         else:
             self.log_action(user, 'ACTIVATED')
             notify_activated(self)
+        try:
+            self._sync_employee_after_status_change('activated', user=user)
+        except Exception:
+            pass
 
     def expire(self, user):
         if self.status != 'ACTIVE':
              from django.core.exceptions import ValidationError
              raise ValidationError("Only active contracts can be expired.")
-             
+        if self.end_date:
+            grace_days = self.get_effective_config('expiry_grace_period_days', 0) or 0
+            cutoff_date = self.end_date + timedelta(days=grace_days)
+            if timezone.now().date() <= cutoff_date:
+                raise ValidationError("Contract is still within its expiry grace period.")
         self.status = 'EXPIRED'
         self.save()
         self.log_action(user, 'EXPIRED')
+        try:
+            self._sync_employee_after_status_change('expired', user=user)
+        except Exception:
+            pass
 
     def terminate(self, user, reason=None):
         if self.status != 'ACTIVE':
@@ -700,6 +784,97 @@ class Contract(models.Model):
         self.status = 'TERMINATED'
         self.save()
         self.log_action(user, 'TERMINATED', metadata={'reason': reason})
+        try:
+            self._sync_employee_after_status_change('terminated', user=user)
+        except Exception:
+            pass
+
+    def _sync_employee_after_status_change(self, action, *, user=None):
+        """Sync employee status when contracts change state."""
+        employee = self.employee
+        if not employee:
+            return
+
+        db_alias = self._state.db or 'default'
+        try:
+            from employees.utils import get_or_create_employee_config, revoke_employee_access
+        except Exception:
+            return
+
+        config = get_or_create_employee_config(self.employer_id, db_alias)
+        today = timezone.now().date()
+        active_statuses = ['ACTIVE', 'SIGNED', 'PENDING_SIGNATURE', 'APPROVED', 'PENDING_APPROVAL']
+        other_active = Contract.objects.using(db_alias).filter(
+            employee=employee,
+            status__in=active_statuses
+        ).exclude(id=self.id).exists()
+
+        if action == 'activated':
+            # Reactivate only if allowed by configuration
+            if employee.employment_status in ['TERMINATED', 'RESIGNED', 'RETIRED'] and not config.allow_employee_reactivation:
+                return
+
+            if not employee.probation_end_date and self.start_date:
+                probation_days = None
+                try:
+                    payroll_cfg = self.get_effective_config('payroll_configuration', {}) or {}
+                    probation_days = payroll_cfg.get('probation_period_days')
+                except Exception:
+                    probation_days = None
+
+                try:
+                    probation_days = int(probation_days) if probation_days is not None else None
+                except Exception:
+                    probation_days = None
+
+                if probation_days and probation_days > 0:
+                    employee.probation_end_date = self.start_date + timedelta(days=probation_days)
+                else:
+                    months = self.get_effective_config('default_probation_period_months')
+                    try:
+                        months = int(months) if months is not None else None
+                    except Exception:
+                        months = None
+                    if months and months > 0:
+                        import calendar
+                        year = self.start_date.year + (self.start_date.month - 1 + months) // 12
+                        month = (self.start_date.month - 1 + months) % 12 + 1
+                        day = min(self.start_date.day, calendar.monthrange(year, month)[1])
+                        employee.probation_end_date = self.start_date.replace(
+                            year=year,
+                            month=month,
+                            day=day
+                        )
+
+            if employee.probation_end_date and employee.probation_end_date >= today:
+                employee.employment_status = 'PROBATION'
+            else:
+                employee.employment_status = 'ACTIVE'
+
+            employee.termination_date = None
+            employee.termination_reason = None
+            employee.save(using=db_alias)
+            return
+
+        if action in ['terminated', 'expired']:
+            if other_active:
+                return
+            employee.employment_status = 'TERMINATED'
+            if action == 'expired':
+                employee.termination_date = self.end_date or today
+                if not employee.termination_reason:
+                    employee.termination_reason = 'Contract expired'
+            else:
+                employee.termination_date = self.termination_date or today
+                if not employee.termination_reason:
+                    employee.termination_reason = self.termination_reason or 'Contract terminated'
+            employee.save(using=db_alias)
+
+            if config.termination_revoke_access_timing == 'IMMEDIATE':
+                try:
+                    revoke_employee_access(employee, config, db_alias)
+                except Exception:
+                    pass
 
 
 class SalaryScale(models.Model):
@@ -977,6 +1152,20 @@ class ContractTemplate(models.Model):
     employer_id = models.IntegerField(db_index=True, help_text='ID of the employer (from main database)')
     
     name = models.CharField(max_length=255, help_text='Name of the template')
+
+    category = models.CharField(
+        max_length=100,
+        blank=True,
+        null=True,
+        help_text='Optional category label for organizing templates'
+    )
+
+    version = models.CharField(
+        max_length=50,
+        blank=True,
+        null=True,
+        help_text='Optional version label (e.g., v1, 2026-02)'
+    )
     
     contract_type = models.CharField(
         max_length=20,
@@ -986,7 +1175,9 @@ class ContractTemplate(models.Model):
     
     file = models.FileField(
         upload_to='contract_templates/',
-        help_text='Template file (DOCX, PDF, etc.)'
+        help_text='Template file (DOCX, PDF, etc.)',
+        blank=True,
+        null=True
     )
 
     # Optional editable body override (used when regenerating default PDF templates)
@@ -1007,7 +1198,10 @@ class ContractTemplate(models.Model):
         ordering = ['-created_at']
         
     def __str__(self):
-        return f"{self.name} ({self.get_contract_type_display()})"
+        label = f"{self.name} ({self.get_contract_type_display()})"
+        if self.version:
+            label = f"{label} v{self.version}" if not str(self.version).lower().startswith('v') else f"{label} {self.version}"
+        return label
     
     def save(self, *args, **kwargs):
         # Ensure only one default per contract type per employer
@@ -1061,6 +1255,36 @@ class ContractDocument(models.Model):
         
     def __str__(self):
         return f"{self.name} - {self.contract.contract_id}"
+
+
+class ContractTemplateVersion(models.Model):
+    """Snapshot of a contract template version."""
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    template = models.ForeignKey(
+        ContractTemplate,
+        on_delete=models.CASCADE,
+        related_name='versions',
+    )
+    name = models.CharField(max_length=255)
+    category = models.CharField(max_length=100, blank=True, null=True)
+    version = models.CharField(max_length=50, blank=True, null=True)
+    contract_type = models.CharField(max_length=20, choices=Contract.CONTRACT_TYPE_CHOICES)
+    body_override = models.TextField(blank=True, null=True)
+    file = models.FileField(upload_to='contract_templates/', blank=True, null=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        db_table = 'contract_template_versions'
+        verbose_name = 'Contract Template Version'
+        verbose_name_plural = 'Contract Template Versions'
+        ordering = ['-created_at']
+
+    def __str__(self):
+        label = f"{self.name} ({self.contract_type})"
+        if self.version:
+            label = f"{label} v{self.version}" if not str(self.version).lower().startswith('v') else f"{label} {self.version}"
+        return label
 
 
 class ContractSignature(models.Model):

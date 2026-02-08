@@ -100,7 +100,6 @@ config.save()
 - Checks for existing active employments before linking user
 - Respects `allow_concurrent_employment` configuration
 - Blocks creation if concurrent employment not allowed
-- Requires employee consent when `require_employee_consent_cross_institution` is True
 
 **Implementation**:
 - Added `check_concurrent_employment()` function
@@ -111,7 +110,6 @@ config.save()
 ```python
 # Configure concurrent employment
 config.allow_concurrent_employment = False  # Block concurrent employment
-config.require_employee_consent_cross_institution = True
 config.save()
 
 # Attempt to link employee with existing employment will fail
@@ -297,7 +295,6 @@ config.save()
 | `document_expiry_reminder_days` | ✅ Working | Automated document expiry reminders |
 | `probation_reminder_before_end_days` | ✅ Working | Automated probation ending reminders |
 | `allow_concurrent_employment` | ✅ Working | Blocks/allows concurrent employment |
-| `require_employee_consent_cross_institution` | ⚠️ Partial | Validation exists, consent endpoints pending |
 
 ---
 

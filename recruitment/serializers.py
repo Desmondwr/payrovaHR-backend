@@ -289,7 +289,18 @@ class JobPositionSerializer(serializers.ModelSerializer):
             "employer_id",
             "title",
             "slug",
+            "reference_code",
+            "level",
+            "contract_duration",
+            "number_of_positions",
             "description",
+            "requirements",
+            "responsibilities",
+            "qualifications",
+            "experience_years_min",
+            "experience_years_max",
+            "skills",
+            "languages",
             "department",
             "department_name",
             "branch",
@@ -297,6 +308,11 @@ class JobPositionSerializer(serializers.ModelSerializer):
             "location",
             "employment_type",
             "is_remote",
+            "salary_min",
+            "salary_max",
+            "salary_currency",
+            "salary_visibility",
+            "application_deadline",
             "publish_scope",
             "is_published",
             "published_at",
@@ -320,6 +336,68 @@ class JobPositionSerializer(serializers.ModelSerializer):
 
     def validate_description(self, value):
         return sanitize_rich_text(value)
+
+    def validate_requirements(self, value):
+        return sanitize_rich_text(value)
+
+    def validate_responsibilities(self, value):
+        return sanitize_rich_text(value)
+
+    def validate_qualifications(self, value):
+        return sanitize_rich_text(value)
+
+    def validate_reference_code(self, value):
+        return sanitize_text(value)
+
+    def validate_contract_duration(self, value):
+        return sanitize_text(value)
+
+    def validate_salary_currency(self, value):
+        return sanitize_text(value.upper()) if value else value
+
+    def _normalize_list(self, value, field_name):
+        if value is None:
+            return []
+        if not isinstance(value, list):
+            raise serializers.ValidationError(f"{field_name} must be a list.")
+        cleaned = []
+        for entry in value:
+            text = sanitize_text(entry)
+            if text:
+                cleaned.append(text)
+        return cleaned
+
+    def validate_skills(self, value):
+        return self._normalize_list(value, "skills")
+
+    def validate_languages(self, value):
+        return self._normalize_list(value, "languages")
+
+    def validate(self, attrs):
+        instance = getattr(self, "instance", None)
+        salary_min = attrs.get("salary_min", getattr(instance, "salary_min", None))
+        salary_max = attrs.get("salary_max", getattr(instance, "salary_max", None))
+        salary_visibility = attrs.get(
+            "salary_visibility", getattr(instance, "salary_visibility", None)
+        )
+        salary_currency = attrs.get("salary_currency", getattr(instance, "salary_currency", None))
+        exp_min = attrs.get("experience_years_min", getattr(instance, "experience_years_min", None))
+        exp_max = attrs.get("experience_years_max", getattr(instance, "experience_years_max", None))
+        positions = attrs.get("number_of_positions", getattr(instance, "number_of_positions", None))
+
+        if salary_min is not None and salary_max is not None and salary_min > salary_max:
+            raise serializers.ValidationError({"salary_max": "Must be greater than or equal to salary_min."})
+        if exp_min is not None and exp_max is not None and exp_min > exp_max:
+            raise serializers.ValidationError({"experience_years_max": "Must be greater than or equal to experience_years_min."})
+        if positions is not None and int(positions) < 1:
+            raise serializers.ValidationError({"number_of_positions": "Must be at least 1."})
+        if salary_visibility == JobPosition.SALARY_PUBLIC:
+            if salary_min is None or salary_max is None or not salary_currency:
+                raise serializers.ValidationError(
+                    {"salary_visibility": "Public salary visibility requires salary_min, salary_max, and salary_currency."}
+                )
+
+        return attrs
 
     def to_representation(self, instance):
         """Override to properly serialize FK UUIDs"""
@@ -351,7 +429,18 @@ class JobPositionPublicSerializer(serializers.ModelSerializer):
             "id",
             "title",
             "slug",
+            "reference_code",
+            "level",
+            "contract_duration",
+            "number_of_positions",
             "description",
+            "requirements",
+            "responsibilities",
+            "qualifications",
+            "experience_years_min",
+            "experience_years_max",
+            "skills",
+            "languages",
             "department",
             "department_name",
             "employer_name",
@@ -367,6 +456,11 @@ class JobPositionPublicSerializer(serializers.ModelSerializer):
             "location",
             "employment_type",
             "is_remote",
+            "salary_min",
+            "salary_max",
+            "salary_currency",
+            "salary_visibility",
+            "application_deadline",
             "published_at",
         ]
 
@@ -430,6 +524,16 @@ class JobPositionPublicSerializer(serializers.ModelSerializer):
     def get_linkedin_url(self, obj):
         profile = self._get_employer_profile(obj)
         return profile.linkedin_url if profile else None
+
+    def to_representation(self, instance):
+        data = super().to_representation(instance)
+        visibility = instance.salary_visibility or JobPosition.SALARY_PRIVATE
+        data["salary_visibility"] = visibility
+        if visibility != JobPosition.SALARY_PUBLIC:
+            data["salary_min"] = None
+            data["salary_max"] = None
+            data["salary_currency"] = None
+        return data
 
 
 class RecruitmentAttachmentSerializer(serializers.ModelSerializer):

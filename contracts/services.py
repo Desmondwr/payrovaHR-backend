@@ -585,9 +585,18 @@ def generate_contract_pdf(contract, template=None):
     # 3) Load and Process DOCX
     # -------------------------------------------------------------------------
     db_alias = contract._state.db or "default"
-    ext = (template.file.name or "").lower()
+    has_file = bool(getattr(template, "file", None)) and bool(getattr(template.file, "name", None))
+    ext = (template.file.name or "").lower() if has_file else ""
 
-    if ext.endswith(".pdf"):
+    if not has_file:
+        try:
+            from contracts.management.commands.seed_contract_template import TYPE_BODIES, BASE_BODY
+            body_text = _clean_body(template.body_override or TYPE_BODIES.get(contract.contract_type, BASE_BODY))
+        except Exception:
+            body_text = _clean_body(template.body_override or "")
+        content_file = render_pdf_from_body(f"{contract.contract_type} CONTRACT", body_text or "Contract")
+        file_name = f"Contract_{contract.contract_id}_{timezone.now().strftime('%Y%m%d_%H%M%S')}.pdf"
+    elif ext.endswith(".pdf"):
         # Always render a fresh PDF with merged context (do not reuse raw template bytes).
         try:
             from contracts.management.commands.seed_contract_template import TYPE_BODIES, BASE_BODY

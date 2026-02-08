@@ -295,13 +295,48 @@ class JobPosition(models.Model):
         (STATUS_ARCHIVED, "Archived"),
     ]
 
+    LEVEL_JUNIOR = "JUNIOR"
+    LEVEL_MID = "MID"
+    LEVEL_SENIOR = "SENIOR"
+    LEVEL_LEAD = "LEAD"
+    LEVEL_EXECUTIVE = "EXECUTIVE"
+
+    LEVEL_CHOICES = [
+        (LEVEL_JUNIOR, "Junior"),
+        (LEVEL_MID, "Mid"),
+        (LEVEL_SENIOR, "Senior"),
+        (LEVEL_LEAD, "Lead"),
+        (LEVEL_EXECUTIVE, "Executive"),
+    ]
+
+    SALARY_PUBLIC = "PUBLIC"
+    SALARY_PRIVATE = "PRIVATE"
+    SALARY_NEGOTIABLE = "NEGOTIABLE"
+
+    SALARY_VISIBILITY_CHOICES = [
+        (SALARY_PUBLIC, "Public"),
+        (SALARY_PRIVATE, "Private"),
+        (SALARY_NEGOTIABLE, "Negotiable"),
+    ]
+
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     employer_id = models.IntegerField(db_index=True)
     tenant_id = models.IntegerField(null=True, blank=True, db_index=True)
 
     title = models.CharField(max_length=255)
     slug = models.CharField(max_length=255, db_index=True)
+    reference_code = models.CharField(max_length=60, blank=True, null=True, db_index=True)
+    level = models.CharField(max_length=20, choices=LEVEL_CHOICES, blank=True, null=True)
+    contract_duration = models.CharField(max_length=100, blank=True, null=True)
+    number_of_positions = models.PositiveIntegerField(default=1, blank=True)
     description = models.TextField(blank=True, null=True)
+    requirements = models.TextField(blank=True, null=True)
+    responsibilities = models.TextField(blank=True, null=True)
+    qualifications = models.TextField(blank=True, null=True)
+    experience_years_min = models.PositiveIntegerField(blank=True, null=True)
+    experience_years_max = models.PositiveIntegerField(blank=True, null=True)
+    skills = models.JSONField(default=list, blank=True)
+    languages = models.JSONField(default=list, blank=True)
     department = models.ForeignKey(
         "employees.Department",
         on_delete=models.SET_NULL,
@@ -319,6 +354,15 @@ class JobPosition(models.Model):
     location = models.CharField(max_length=255, blank=True, null=True)
     employment_type = models.CharField(max_length=50, blank=True, null=True)
     is_remote = models.BooleanField(default=False)
+    salary_min = models.DecimalField(max_digits=12, decimal_places=2, blank=True, null=True)
+    salary_max = models.DecimalField(max_digits=12, decimal_places=2, blank=True, null=True)
+    salary_currency = models.CharField(max_length=10, blank=True, null=True)
+    salary_visibility = models.CharField(
+        max_length=20,
+        choices=SALARY_VISIBILITY_CHOICES,
+        default=SALARY_PRIVATE,
+    )
+    application_deadline = models.DateField(blank=True, null=True)
 
     publish_scope = models.CharField(
         max_length=20,

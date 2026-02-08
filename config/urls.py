@@ -35,6 +35,7 @@ urlpatterns = [
     path('api/v1/recruitment/', include('recruitment.urls')),
     path('api/v1/public/', include('recruitment.public_urls')),
     path('api/v1/internal/', include('recruitment.internal_urls')),
+    path('api/payroll/', include('payroll.urls')),
 ]
 
 # Serve media files in development

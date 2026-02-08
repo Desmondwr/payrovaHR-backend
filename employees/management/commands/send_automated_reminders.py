@@ -136,6 +136,29 @@ class Command(BaseCommand):
                         employer,
                         days_until_expiry
                     )
+                    try:
+                        from accounts.notifications import create_notification
+                        from django.contrib.auth import get_user_model
+                        User = get_user_model()
+                        if document.employee.user_id:
+                            user = User.objects.filter(id=document.employee.user_id, is_active=True).first()
+                            if user:
+                                create_notification(
+                                    user=user,
+                                    title="Document expiring soon",
+                                    body=f"{document.title} expires in {days_until_expiry} day(s).",
+                                    type="ACTION",
+                                    data={
+                                        "event": "employees.document_expiry",
+                                        "employee_id": str(document.employee.id),
+                                        "document_id": str(document.id),
+                                        "expiry_date": str(document.expiry_date),
+                                        "path": "/employee/documents",
+                                    },
+                                    employer_profile=employer,
+                                )
+                    except Exception:
+                        pass
                     count += 1
                     
             except Exception as e:
@@ -235,6 +258,22 @@ class Command(BaseCommand):
                                 user.save(update_fields=['is_active'])
                                 count += 1
                                 self.stdout.write(f'Revoked access for user {user.email} (Employee: {employee.employee_id})')
+                                try:
+                                    from accounts.notifications import create_notification
+                                    create_notification(
+                                        user=user,
+                                        title="Access revoked",
+                                        body="Your access has been revoked due to termination.",
+                                        type="ALERT",
+                                        data={
+                                            "event": "employees.access_revoked",
+                                            "employee_id": str(employee.id),
+                                            "path": "/login",
+                                        },
+                                        employer_profile=employer,
+                                    )
+                                except Exception:
+                                    pass
                         except User.DoesNotExist:
                             pass
                     
