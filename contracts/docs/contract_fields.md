@@ -167,6 +167,7 @@ Note: job-specific metadata (e.g., `job_position`) is now captured via `recruitm
 Both `Allowance` and `Deduction` entries now capture optional identifiers and effective dates:
 - `allowance_id` / `deduction_id` (`IntegerField`): Optional reference to shared allowance/deduction templates or master records.
 - `effective_from` (`DateField`): Date when the component starts applying.
+- `advantage` (`UUIDField`): Optional link to the payroll advantages catalog (Allowance only).
 
 ## ContractSignature metadata
 

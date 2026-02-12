@@ -1095,6 +1095,15 @@ class Allowance(ContractComponentBase):
         help_text='Date when this allowance takes effect'
     )
 
+    advantage = models.ForeignKey(
+        'payroll.Advantage',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='contract_allowances',
+        help_text='Linked payroll advantage catalog item'
+    )
+
     class Meta(ContractComponentBase.Meta):
         db_table = 'contract_allowances'
         verbose_name = 'Allowance'

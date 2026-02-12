@@ -2,6 +2,7 @@ from decimal import Decimal
 from typing import Dict, Iterable, Optional, Tuple
 
 from django.db import transaction
+from django.db.models import Q
 
 from payroll.models import (
     Advantage,
@@ -69,30 +70,61 @@ def _replace_basis_links(
         CalculationBasisAdvantage.objects.using(tenant_db).bulk_create(links)
 
 
-def sync_contract_allowances(contract, *, tenant_db: Optional[str] = None) -> None:
+def sync_contract_allowances(
+    contract,
+    *,
+    tenant_db: Optional[str] = None,
+    previous_allowance_advantage_ids: Optional[Iterable[str]] = None,
+) -> None:
     db_alias = tenant_db or contract._state.db or "default"
     employer_id = contract.employer_id
 
-    allowances = list(contract.allowances.all())
+    allowances = list(contract.allowances.select_related("advantage").all())
+    previous_ids = {adv_id for adv_id in (previous_allowance_advantage_ids or []) if adv_id}
     with transaction.atomic(using=db_alias):
+        delete_filter = Q(advantage__sys_code=CONTRACT_ALLOWANCE_SYS_CODE)
+        if previous_ids:
+            delete_filter |= Q(advantage_id__in=previous_ids)
+
         existing_elements = (
             PayrollElement.objects.using(db_alias)
             .filter(
                 employer_id=employer_id,
                 contract=contract,
-                advantage__sys_code=CONTRACT_ALLOWANCE_SYS_CODE,
+                advantage__isnull=False,
             )
+            .filter(delete_filter)
             .select_related("advantage")
         )
         old_advantage_ids = [element.advantage_id for element in existing_elements if element.advantage_id]
         existing_elements.delete()
+
         if old_advantage_ids:
-            CalculationBasisAdvantage.objects.using(db_alias).filter(
-                employer_id=employer_id, advantage_id__in=old_advantage_ids
-            ).delete()
-            Advantage.objects.using(db_alias).filter(
-                employer_id=employer_id, id__in=old_advantage_ids
-            ).delete()
+            contract_advantage_ids = set(
+                Advantage.objects.using(db_alias)
+                .filter(
+                    employer_id=employer_id,
+                    id__in=old_advantage_ids,
+                    sys_code=CONTRACT_ALLOWANCE_SYS_CODE,
+                )
+                .values_list("id", flat=True)
+            )
+            if contract_advantage_ids:
+                from .models import Allowance
+
+                used_ids = set(
+                    Allowance.objects.using(db_alias)
+                    .filter(advantage_id__in=contract_advantage_ids)
+                    .values_list("advantage_id", flat=True)
+                )
+                stale_ids = contract_advantage_ids - used_ids
+                if stale_ids:
+                    CalculationBasisAdvantage.objects.using(db_alias).filter(
+                        employer_id=employer_id, advantage_id__in=stale_ids
+                    ).delete()
+                    Advantage.objects.using(db_alias).filter(
+                        employer_id=employer_id, id__in=stale_ids
+                    ).delete()
 
         if not allowances:
             return
@@ -102,42 +134,62 @@ def sync_contract_allowances(contract, *, tenant_db: Optional[str] = None) -> No
         elements = []
         for allowance in allowances:
             code = f"{ALLOWANCE_CODE_PREFIX}{allowance.id}"[:50]
-            advantage, _created = Advantage.objects.using(db_alias).get_or_create(
-                employer_id=employer_id,
-                code=code,
-                defaults={
-                    "name": allowance.name,
-                    "sys_code": CONTRACT_ALLOWANCE_SYS_CODE,
-                    "is_manual": True,
-                    "is_taxable": bool(getattr(allowance, "taxable", True)),
-                    "is_contributory": bool(getattr(allowance, "cnps_base", True)),
-                    "is_active": True,
-                },
-            )
+            advantage = getattr(allowance, "advantage", None)
+            created_advantage = False
+            if not advantage:
+                advantage, _created = Advantage.objects.using(db_alias).get_or_create(
+                    employer_id=employer_id,
+                    code=code,
+                    defaults={
+                        "name": allowance.name,
+                        "sys_code": CONTRACT_ALLOWANCE_SYS_CODE,
+                        "is_manual": True,
+                        "is_taxable": bool(getattr(allowance, "taxable", True)),
+                        "is_contributory": bool(getattr(allowance, "cnps_base", True)),
+                        "is_active": True,
+                    },
+                )
+                created_advantage = _created
+                if not allowance.advantage_id or allowance.advantage_id != advantage.id:
+                    allowance.advantage = advantage
+                    allowance.save(using=db_alias, update_fields=["advantage"])
 
-            advantage.name = allowance.name
-            advantage.sys_code = CONTRACT_ALLOWANCE_SYS_CODE
-            advantage.is_manual = True
-            advantage.is_taxable = bool(getattr(allowance, "taxable", True))
-            advantage.is_contributory = bool(getattr(allowance, "cnps_base", True))
-            advantage.is_active = True
-            advantage.save(using=db_alias)
+            use_allowance_flags = (advantage.sys_code == CONTRACT_ALLOWANCE_SYS_CODE) or created_advantage
+            if use_allowance_flags:
+                advantage.name = allowance.name or advantage.name
+                advantage.sys_code = CONTRACT_ALLOWANCE_SYS_CODE
+                advantage.is_manual = True
+                advantage.is_taxable = bool(getattr(allowance, "taxable", True))
+                advantage.is_contributory = bool(getattr(allowance, "cnps_base", True))
+                advantage.is_active = True
+                advantage.save(using=db_alias)
+
+            is_taxable = advantage.is_taxable if advantage else bool(getattr(allowance, "taxable", True))
+            is_contributory = advantage.is_contributory if advantage else bool(getattr(allowance, "cnps_base", True))
 
             basis_codes = ["SAL-BRUT"]
-            if getattr(allowance, "taxable", True):
+            if is_taxable:
                 basis_codes.extend(["SAL-BRUT-TAX", "SAL-BRUT-TAX-IRPP"])
             elif non_tax_basis:
                 basis_codes.append(non_tax_basis.code)
-            if getattr(allowance, "cnps_base", True):
+            if is_contributory:
                 basis_codes.extend(["SAL-BRUT-COT-AF-PV", "SAL-BRUT-COT-AT"])
+            update_basis_links = use_allowance_flags
+            if not update_basis_links:
+                has_links = CalculationBasisAdvantage.objects.using(db_alias).filter(
+                    employer_id=employer_id,
+                    advantage=advantage,
+                ).exists()
+                update_basis_links = not has_links
 
-            _replace_basis_links(
-                employer_id=employer_id,
-                tenant_db=db_alias,
-                advantage=advantage,
-                basis_codes=basis_codes,
-                basis_map=basis_map,
-            )
+            if update_basis_links:
+                _replace_basis_links(
+                    employer_id=employer_id,
+                    tenant_db=db_alias,
+                    advantage=advantage,
+                    basis_codes=basis_codes,
+                    basis_map=basis_map,
+                )
 
             amount = _to_decimal(getattr(allowance, "amount", None))
             allowance_type = (getattr(allowance, "type", "") or "").upper()
@@ -267,8 +319,13 @@ def sync_contract_payroll_elements(
     tenant_db: Optional[str] = None,
     sync_allowances: bool = True,
     sync_deductions: bool = True,
+    previous_allowance_advantage_ids: Optional[Iterable[str]] = None,
 ) -> None:
     if sync_allowances:
-        sync_contract_allowances(contract, tenant_db=tenant_db)
+        sync_contract_allowances(
+            contract,
+            tenant_db=tenant_db,
+            previous_allowance_advantage_ids=previous_allowance_advantage_ids,
+        )
     if sync_deductions:
         sync_contract_deductions(contract, tenant_db=tenant_db)

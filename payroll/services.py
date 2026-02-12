@@ -15,6 +15,12 @@ from contracts.models import Contract
 from employees.models import Employee
 from timeoff.models import TimeOffConfiguration, TimeOffRequest, TimeOffType
 from attendance.models import AttendanceRecord
+from attendance.services import (
+    ensure_attendance_configuration,
+    _resolve_payload_timezone,
+    is_missing_checkout_after_cutoff,
+    resolve_expected_minutes,
+)
 from treasury.models import BankAccount, CashDesk, PaymentBatch, PaymentLine
 from treasury.services import (
     apply_batch_approval_rules,
@@ -200,6 +206,9 @@ class PayrollCalculationService:
         config = TimeOffConfiguration.objects.using(self.tenant_db).filter(employer_id=self.employer_id).first()
         working_hours = (config.working_hours_per_day if config else 8) or 8
         minutes_per_day = Decimal(str(working_hours * 60))
+        attendance_config = ensure_attendance_configuration(self.employer_id, self.tenant_db)
+        penalty_mode = getattr(attendance_config, "missing_checkout_penalty_mode", "none")
+        penalty_minutes_setting = int(getattr(attendance_config, "missing_checkout_penalty_minutes", 0) or 0)
 
         records = AttendanceRecord.objects.using(self.tenant_db).filter(
             employer_id=self.employer_id,
@@ -218,6 +227,40 @@ class PayrollCalculationService:
                 absence_minutes += Decimal(str(expected - worked))
             overtime = record.overtime_approved_minutes or record.overtime_worked_minutes or 0
             overtime_minutes += Decimal(str(overtime))
+
+        if (
+            attendance_config
+            and attendance_config.auto_flag_anomalies
+            and getattr(attendance_config, "flag_missing_checkout", False)
+            and penalty_mode
+            and penalty_mode != "none"
+        ):
+            open_records = AttendanceRecord.objects.using(self.tenant_db).filter(
+                employer_id=self.employer_id,
+                employee=employee,
+                check_out_at__isnull=True,
+                check_in_at__date__gte=month_start,
+                check_in_at__date__lte=month_end,
+            )
+            for record in open_records:
+                tz_override = _resolve_payload_timezone(getattr(record, "check_in_timezone", None))
+                if not is_missing_checkout_after_cutoff(
+                    record, attendance_config, self.tenant_db, tz_override=tz_override
+                ):
+                    continue
+                expected = record.expected_minutes or resolve_expected_minutes(
+                    employee, record.check_in_at, self.tenant_db, tz_override=tz_override
+                )
+                if not expected:
+                    expected = int(minutes_per_day)
+                if penalty_mode in ("full_absence", "auto_refuse"):
+                    absence_minutes += Decimal(str(expected))
+                elif penalty_mode == "fixed_minutes":
+                    penalty_minutes = max(penalty_minutes_setting, 0)
+                    if expected:
+                        penalty_minutes = min(penalty_minutes, int(expected))
+                    if penalty_minutes:
+                        absence_minutes += Decimal(str(penalty_minutes))
 
         absence_days = absence_minutes / minutes_per_day if minutes_per_day else Decimal("0")
         overtime_hours = overtime_minutes / Decimal("60")

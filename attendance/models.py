@@ -53,7 +53,24 @@ class AttendanceConfiguration(models.Model):
     allow_gps_logging = models.BooleanField(default=True)
     timezone = models.CharField(max_length=64, default="UTC")
     auto_flag_anomalies = models.BooleanField(default=True)
+    enforce_schedule_check_in = models.BooleanField(default=True)
+    flag_overlaps = models.BooleanField(default=False)
+    flag_missing_checkout = models.BooleanField(default=False)
+    missing_checkout_cutoff_minutes = models.IntegerField(default=0, validators=[MinValueValidator(0)])
+    missing_checkout_penalty_mode = models.CharField(
+        max_length=24,
+        choices=[
+            ("none", "No penalty"),
+            ("full_absence", "Full absence"),
+            ("auto_refuse", "Auto-refuse record"),
+            ("fixed_minutes", "Fixed penalty minutes"),
+        ],
+        default="none",
+    )
+    missing_checkout_penalty_minutes = models.IntegerField(default=0, validators=[MinValueValidator(0)])
     max_daily_work_minutes_before_flag = models.IntegerField(blank=True, null=True)
+    early_check_in_grace_minutes = models.IntegerField(default=0, validators=[MinValueValidator(0)])
+    late_check_in_grace_minutes = models.IntegerField(default=0, validators=[MinValueValidator(0)])
     kiosk_bypass_geofence = models.BooleanField(default=True)
     kiosk_bypass_wifi = models.BooleanField(default=True)
     kiosk_access_token = models.CharField(
@@ -263,6 +280,8 @@ class WorkingScheduleDay(models.Model):
     weekday = models.IntegerField(choices=WEEKDAY_CHOICES)
     start_time = models.TimeField()
     end_time = models.TimeField()
+    break_start_time = models.TimeField(blank=True, null=True)
+    break_end_time = models.TimeField(blank=True, null=True)
     break_minutes = models.IntegerField(default=0, validators=[MinValueValidator(0)])
     expected_minutes = models.IntegerField(default=0)
     created_at = models.DateTimeField(auto_now_add=True)
@@ -285,7 +304,14 @@ class WorkingScheduleDay(models.Model):
         end_dt = datetime.combine(datetime.today(), self.end_time)
         delta = end_dt - start_dt
         total_minutes = int(delta.total_seconds() // 60)
-        total_minutes = max(total_minutes - int(self.break_minutes or 0), 0)
+        break_minutes = int(self.break_minutes or 0)
+        if self.break_start_time and self.break_end_time:
+            break_start_dt = datetime.combine(datetime.today(), self.break_start_time)
+            break_end_dt = datetime.combine(datetime.today(), self.break_end_time)
+            break_delta = break_end_dt - break_start_dt
+            break_minutes = max(int(break_delta.total_seconds() // 60), 0)
+            self.break_minutes = break_minutes
+        total_minutes = max(total_minutes - break_minutes, 0)
         self.expected_minutes = total_minutes
         super().save(*args, **kwargs)
 
@@ -320,7 +346,9 @@ class AttendanceRecord(models.Model):
     employer_id = models.IntegerField(db_index=True)
     employee = models.ForeignKey(Employee, on_delete=models.PROTECT, related_name="attendance_records")
     check_in_at = models.DateTimeField()
+    check_in_timezone = models.CharField(max_length=64, blank=True, null=True)
     check_out_at = models.DateTimeField(blank=True, null=True)
+    check_out_timezone = models.CharField(max_length=64, blank=True, null=True)
     worked_minutes = models.IntegerField(default=0)
     expected_minutes = models.IntegerField(blank=True, null=True)
     overtime_worked_minutes = models.IntegerField(default=0)
@@ -352,6 +380,9 @@ class AttendanceRecord(models.Model):
     check_out_wifi_ssid = models.CharField(max_length=255, blank=True, null=True)
     check_out_wifi_bssid = models.CharField(max_length=64, blank=True, null=True)
     anomaly_reason = models.CharField(max_length=255, blank=True, null=True)
+    break_reminder_sent_at = models.DateTimeField(blank=True, null=True)
+    break_ending_soon_sent_at = models.DateTimeField(blank=True, null=True)
+    break_end_sent_at = models.DateTimeField(blank=True, null=True)
     created_by_id = models.IntegerField(blank=True, null=True, db_index=True)
     kiosk_session_reference = models.CharField(max_length=100, blank=True, null=True)
     kiosk_station = models.ForeignKey(

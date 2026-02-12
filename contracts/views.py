@@ -30,6 +30,7 @@ from accounts.rbac import get_active_employer, is_delegate_user, get_delegate_sc
 from contracts.management.commands.seed_contract_template import TYPE_BODIES, BASE_BODY
 from rest_framework.parsers import MultiPartParser, FormParser, JSONParser
 
+
 class ContractViewSet(viewsets.ModelViewSet):
     """
     API endpoint that allows contracts to be viewed or edited.

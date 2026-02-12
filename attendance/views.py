@@ -1,7 +1,9 @@
 from collections import defaultdict
+from datetime import timedelta
 import uuid
 
 from django.db import models
+from django.utils import timezone
 from rest_framework import permissions, status, viewsets
 from rest_framework.exceptions import PermissionDenied
 from rest_framework.decorators import action
@@ -46,13 +48,19 @@ from .serializers import (
     WorkingScheduleSerializer,
 )
 from .services import (
+    append_anomaly_reason,
     ensure_attendance_configuration,
+    compute_worked_minutes_for_employee,
+    flag_missing_checkout_if_needed,
+    _resolve_payload_timezone,
     perform_check_in,
     perform_check_out,
+    resolve_check_in_timing,
     resolve_station_by_token,
     resolve_configuration_by_kiosk_token,
     resolve_expected_minutes,
     is_employee_on_leave,
+    resolve_break_window,
 )
 
 
@@ -91,6 +99,14 @@ def _employee_from_request(request, tenant_db=None) -> Employee:
                     return None
             return employee
     return None
+
+
+def _resolve_attendance_users(employee: Employee):
+    employer_profile = EmployerProfile.objects.filter(id=employee.employer_id).first()
+    employer_user = getattr(employer_profile, "user", None)
+    employee_user_id = employee.user_account_id or employee.user_id
+    employee_user = User.objects.filter(id=employee_user_id).first() if employee_user_id else None
+    return employer_profile, employee_user, employer_user
 
 
 def _send_attendance_notifications(
@@ -138,6 +154,185 @@ def _send_attendance_notifications(
             employer_profile=employer_profile,
             data=payload,
         )
+
+
+def _send_check_in_timing_notifications(
+    employee: Employee,
+    record,
+    config: AttendanceConfiguration,
+    tenant_db: str,
+    employer_profile: EmployerProfile = None,
+    employee_user=None,
+    employer_user=None,
+):
+    if not record or not employee or not config:
+        return
+
+    tz_override = _resolve_payload_timezone(getattr(record, "check_in_timezone", None))
+    timing = resolve_check_in_timing(
+        employee,
+        record.check_in_at,
+        config,
+        tenant_db,
+        tz_override=tz_override,
+    )
+    if not timing:
+        return
+
+    delta_seconds = timing.get("delta_seconds", 0)
+    if not delta_seconds:
+        return
+
+    is_early = delta_seconds < 0
+    direction = "early" if is_early else "late"
+    minutes = timing.get("early_minutes", 0) if is_early else timing.get("late_minutes", 0)
+    grace = timing.get("early_grace_minutes", 0) if is_early else timing.get("late_grace_minutes", 0)
+    within_grace = grace > 0 and minutes <= grace
+
+    scheduled_start = timing.get("scheduled_start")
+    tz = timing.get("tz")
+    start_label = scheduled_start.strftime("%H:%M") if scheduled_start else "--:--"
+    tz_label = getattr(tz, "key", None) or str(tz) if tz else ""
+    tz_suffix = f" ({tz_label})" if tz_label else ""
+
+    minutes_label = f"{minutes} min " if minutes > 0 else ""
+    grace_note = f" Within {grace}-minute grace." if within_grace else ""
+
+    employer_profile = employer_profile or EmployerProfile.objects.filter(id=employee.employer_id).first()
+    if employee_user is None or employer_user is None:
+        employer_profile, employee_user, employer_user = _resolve_attendance_users(employee)
+
+    if not employee_user and not employer_user:
+        return
+
+    employee_name = getattr(employee, "full_name", "").strip() or f"{employee.first_name} {employee.last_name}".strip()
+    action_title = f"{direction.capitalize()} check-in"
+    employee_body = (
+        f"You checked in {minutes_label}{direction}.{grace_note} "
+        f"Shift starts at {start_label}{tz_suffix}."
+    )
+    employer_body = (
+        f"{employee_name} checked in {minutes_label}{direction}.{grace_note} "
+        f"Shift starts at {start_label}{tz_suffix}."
+    )
+    payload = {
+        "type": "attendance_check_in_timing",
+        "attendance_id": str(record.id),
+        "direction": direction,
+        "minutes": minutes,
+        "within_grace": within_grace,
+        "scheduled_start": scheduled_start.isoformat() if scheduled_start else None,
+        "check_in_at": record.check_in_at.isoformat() if record.check_in_at else None,
+    }
+
+    if employee_user:
+        create_notification(
+            user=employee_user,
+            title=action_title,
+            body=employee_body,
+            type="INFO",
+            employer_profile=employer_profile,
+            data=payload,
+        )
+
+    if employer_user:
+        create_notification(
+            user=employer_user,
+            title=f"{employee_name} {direction} check-in",
+            body=employer_body,
+            type="ACTION",
+            employer_profile=employer_profile,
+            data=payload,
+        )
+
+
+def _maybe_send_break_reminder(request, employee, record, tenant_db):
+    if not record or record.check_out_at is not None:
+        return
+    tz_override = _resolve_payload_timezone(getattr(record, "check_in_timezone", None))
+    break_start, break_end, tz, local_now, day_rule = resolve_break_window(
+        employee,
+        timezone.now(),
+        tenant_db,
+        tz_override=tz_override,
+    )
+    if not break_start or not break_end or not day_rule:
+        return
+    local_check_in = timezone.localtime(record.check_in_at, tz) if tz else record.check_in_at
+    if local_check_in.date() != local_now.date():
+        return
+
+    employer_profile = EmployerProfile.objects.filter(id=employee.employer_id).first()
+    employer_user = getattr(employer_profile, "user", None)
+    employee_user_id = employee.user_account_id or employee.user_id
+    employee_user = User.objects.filter(id=employee_user_id).first() if employee_user_id else None
+    if not employee_user and not employer_user:
+        return
+    if local_now < break_start:
+        return
+    start_label = break_start.strftime("%H:%M")
+    end_label = break_end.strftime("%H:%M")
+    payload = {
+        "type": "attendance_break_reminder",
+        "attendance_id": str(record.id),
+        "break_start": break_start.isoformat(),
+        "break_end": break_end.isoformat(),
+    }
+    now = timezone.now()
+    if not record.break_end_sent_at and local_now >= break_end:
+        if employee_user:
+            create_notification(
+                user=employee_user,
+                title="Break over",
+                body="Break time is over. Please return to work.",
+                type="INFO",
+                employer_profile=employer_profile,
+                data={**payload, "type": "attendance_break_over"},
+            )
+        record.break_end_sent_at = now
+        record.save(using=tenant_db, update_fields=["break_end_sent_at", "updated_at"])
+        return
+
+    warning_start = break_end - timedelta(minutes=5)
+    warning_window_valid = warning_start > break_start
+    if warning_window_valid and not record.break_ending_soon_sent_at and warning_start <= local_now < break_end:
+        if employee_user:
+            create_notification(
+                user=employee_user,
+                title="Break ending soon",
+                body=f"Your break ends in 5 minutes (ends at {end_label}).",
+                type="INFO",
+                employer_profile=employer_profile,
+                data={**payload, "type": "attendance_break_ending_soon", "minutes_remaining": 5},
+            )
+        record.break_ending_soon_sent_at = now
+        record.save(using=tenant_db, update_fields=["break_ending_soon_sent_at", "updated_at"])
+        return
+
+    if record.break_reminder_sent_at or not (break_start <= local_now < break_end):
+        return
+
+    if employee_user:
+        create_notification(
+            user=employee_user,
+            title="Break time",
+            body=f"It's time for your break ({start_label} - {end_label}).",
+            type="INFO",
+            employer_profile=employer_profile,
+            data=payload,
+        )
+    if employer_user and employer_user != employee_user:
+        employee_name = getattr(employee, "full_name", "").strip() or f"{employee.first_name} {employee.last_name}".strip()
+        create_notification(
+            user=employer_user,
+            title="Break time",
+            body=f"{employee_name} is on break ({start_label} - {end_label}).",
+            type="INFO",
+            employer_profile=employer_profile,
+            data={**payload, "employee_id": str(employee.id)},
+        )
+    record.break_reminder_sent_at = now
+    record.save(using=tenant_db, update_fields=["break_reminder_sent_at", "updated_at"])
 
 
 class AttendanceConfigurationViewSet(viewsets.ModelViewSet):
@@ -455,6 +650,60 @@ class AttendanceRecordViewSet(viewsets.ReadOnlyModelViewSet):
     }
     serializer_class = AttendanceRecordSerializer
 
+    def _resolve_access_context(self):
+        user = self.request.user
+        employer = None
+        if getattr(user, "employer_profile", None):
+            employer = user.employer_profile
+        else:
+            resolved = get_active_employer(self.request, require_context=False)
+            if resolved and (user.is_admin or user.is_superuser or is_delegate_user(user, resolved.id)):
+                employer = resolved
+        if employer:
+            tenant_db = get_tenant_database_alias(employer)
+            return employer, None, tenant_db
+        if hasattr(user, "employee_profile") and user.employee_profile:
+            employee = user.employee_profile
+            tenant_db = employee._state.db or "default"
+            return None, employee, tenant_db
+        return None, None, None
+
+    def _auto_flag_missing_checkout(self, employer=None, employee=None, tenant_db=None):
+        if not tenant_db:
+            return
+        employer_id = employer.id if employer else getattr(employee, "employer_id", None)
+        if not employer_id:
+            return
+        config = ensure_attendance_configuration(employer_id, tenant_db)
+        if not config.auto_flag_anomalies or not getattr(config, "flag_missing_checkout", False):
+            return
+        qs = AttendanceRecord.objects.using(tenant_db).filter(check_out_at__isnull=True)
+        if employer:
+            qs = qs.filter(employer_id=employer.id)
+            if is_delegate_user(self.request.user, employer.id):
+                scope = get_delegate_scope(self.request.user, employer.id)
+                qs = apply_scope_filter(
+                    qs,
+                    scope,
+                    branch_field="employee__branch_id",
+                    department_field="employee__department_id",
+                    self_field="employee_id",
+                )
+        elif employee:
+            qs = qs.filter(employee=employee)
+        for record in qs.select_related("employee"):
+            flag_missing_checkout_if_needed(record, config, tenant_db)
+
+    def list(self, request, *args, **kwargs):
+        employer, employee, tenant_db = self._resolve_access_context()
+        self._auto_flag_missing_checkout(employer=employer, employee=employee, tenant_db=tenant_db)
+        return super().list(request, *args, **kwargs)
+
+    def retrieve(self, request, *args, **kwargs):
+        employer, employee, tenant_db = self._resolve_access_context()
+        self._auto_flag_missing_checkout(employer=employer, employee=employee, tenant_db=tenant_db)
+        return super().retrieve(request, *args, **kwargs)
+
     def get_queryset(self):
         user = self.request.user
         params = self.request.query_params
@@ -492,7 +741,15 @@ class AttendanceRecordViewSet(viewsets.ReadOnlyModelViewSet):
             return AttendanceRecord.objects.none()
 
         if status_param:
-            qs = qs.filter(status=status_param)
+            normalized = str(status_param).lower()
+            status_map = {
+                "pending": AttendanceRecord.STATUS_TO_APPROVE,
+                "to_approve": AttendanceRecord.STATUS_TO_APPROVE,
+                "approved": AttendanceRecord.STATUS_APPROVED,
+                "rejected": AttendanceRecord.STATUS_REFUSED,
+                "refused": AttendanceRecord.STATUS_REFUSED,
+            }
+            qs = qs.filter(status=status_map.get(normalized, status_param))
         if employee_id and employer:
             qs = qs.filter(employee_id=employee_id)
         if mode:
@@ -507,6 +764,7 @@ class AttendanceRecordViewSet(viewsets.ReadOnlyModelViewSet):
     def to_approve(self, request):
         employer = get_active_employer(request, require_context=True)
         tenant_db = get_tenant_database_alias(employer)
+        self._auto_flag_missing_checkout(employer=employer, tenant_db=tenant_db)
         qs = AttendanceRecord.objects.using(tenant_db).filter(
             employer_id=employer.id, status=AttendanceRecord.STATUS_TO_APPROVE
         )
@@ -582,9 +840,7 @@ class PortalCheckInView(APIView):
             mode=AttendanceRecord.MODE_PORTAL,
             created_by=request.user.id,
         )
-        employer_profile = EmployerProfile.objects.filter(id=employee.employer_id).first()
-        employee_user = User.objects.filter(id=employee.user_id).first() if employee.user_id else None
-        employer_user = getattr(employer_profile, "user", None)
+        employer_profile, employee_user, employer_user = _resolve_attendance_users(employee)
         _send_attendance_notifications(
             employee_user=employee_user,
             employer_user=employer_user,
@@ -593,6 +849,15 @@ class PortalCheckInView(APIView):
             record=record,
             action="check_in",
             mode=AttendanceRecord.MODE_PORTAL,
+        )
+        _send_check_in_timing_notifications(
+            employee=employee,
+            record=record,
+            config=config,
+            tenant_db=tenant_db,
+            employer_profile=employer_profile,
+            employee_user=employee_user,
+            employer_user=employer_user,
         )
         output = AttendanceRecordSerializer(record)
         return Response(output.data, status=status.HTTP_201_CREATED)
@@ -620,9 +885,7 @@ class PortalCheckOutView(APIView):
             db_alias=tenant_db,
             mode=AttendanceRecord.MODE_PORTAL,
         )
-        employer_profile = EmployerProfile.objects.filter(id=employee.employer_id).first()
-        employee_user = User.objects.filter(id=employee.user_id).first() if employee.user_id else None
-        employer_user = getattr(employer_profile, "user", None)
+        employer_profile, employee_user, employer_user = _resolve_attendance_users(employee)
         _send_attendance_notifications(
             employee_user=employee_user,
             employer_user=employer_user,
@@ -706,9 +969,7 @@ class KioskCheckView(APIView):
         record.kiosk_session_reference = kiosk_token
         record.kiosk_station = station
         record.save(using=tenant_db, update_fields=["kiosk_session_reference", "kiosk_station", "updated_at"])
-        employer_profile = EmployerProfile.objects.filter(id=employee.employer_id).first()
-        employee_user = User.objects.filter(id=employee.user_id).first() if employee.user_id else None
-        employer_user = getattr(employer_profile, "user", None)
+        employer_profile, employee_user, employer_user = _resolve_attendance_users(employee)
         _send_attendance_notifications(
             employee_user=employee_user,
             employer_user=employer_user,
@@ -718,6 +979,16 @@ class KioskCheckView(APIView):
             action=action,
             mode="KIOSK",
         )
+        if action == "check_in":
+            _send_check_in_timing_notifications(
+                employee=employee,
+                record=record,
+                config=config,
+                tenant_db=tenant_db,
+                employer_profile=employer_profile,
+                employee_user=employee_user,
+                employer_user=employer_user,
+            )
         output = AttendanceRecordSerializer(record)
         return Response(output.data, status=status.HTTP_200_OK)
 
@@ -738,6 +1009,8 @@ class AttendanceStatusView(APIView):
             .order_by("-check_in_at")
             .first()
         )
+        if open_record:
+            _maybe_send_break_reminder(request, employee, open_record, tenant_db)
         last_record = (
             AttendanceRecord.objects.using(tenant_db)
             .filter(employee=employee)
@@ -786,25 +1059,37 @@ class ManualAttendanceCreateView(APIView):
         ):
             return Response({"detail": "Employee is on approved leave for this period."}, status=status.HTTP_400_BAD_REQUEST)
 
+        config = ensure_attendance_configuration(employer.id, tenant_db)
+        if not config.is_enabled:
+            return Response({"detail": "Attendance module is disabled for this employer."}, status=status.HTTP_400_BAD_REQUEST)
+
         overlap = (
             AttendanceRecord.objects.using(tenant_db)
             .filter(employee=employee)
             .filter(check_out_at__gt=data["check_in_at"], check_in_at__lt=data["check_out_at"])
             .exists()
         )
+        overlap_flag = False
         if overlap:
-            return Response({"detail": "Overlapping attendance record exists."}, status=status.HTTP_400_BAD_REQUEST)
-
-        config = ensure_attendance_configuration(employer.id, tenant_db)
-        if not config.is_enabled:
-            return Response({"detail": "Attendance module is disabled for this employer."}, status=status.HTTP_400_BAD_REQUEST)
-        worked_minutes = int((data["check_out_at"] - data["check_in_at"]).total_seconds() // 60)
+            if config.auto_flag_anomalies and getattr(config, "flag_overlaps", False):
+                overlap_flag = True
+            else:
+                return Response({"detail": "Overlapping attendance record exists."}, status=status.HTTP_400_BAD_REQUEST)
+        worked_minutes = compute_worked_minutes_for_employee(
+            employee,
+            data["check_in_at"],
+            data["check_out_at"],
+            config,
+            tenant_db,
+        )
         expected_minutes = resolve_expected_minutes(employee, data["check_in_at"], tenant_db)
         overtime_worked = max(worked_minutes - (expected_minutes or 0), 0)
         approved_overtime = min(data.get("overtime_approved_minutes") or 0, overtime_worked)
         manual_status = AttendanceRecord.STATUS_TO_APPROVE
         anomaly_reason = "Manual record created"
-        if approved_overtime:
+        if overlap_flag:
+            anomaly_reason = append_anomaly_reason(anomaly_reason, "Overlapping record")
+        if approved_overtime and not overlap_flag:
             manual_status = AttendanceRecord.STATUS_APPROVED
 
         record = AttendanceRecord.objects.using(tenant_db).create(
@@ -824,7 +1109,7 @@ class ManualAttendanceCreateView(APIView):
         if config.auto_flag_anomalies and config.max_daily_work_minutes_before_flag:
             if record.worked_minutes > config.max_daily_work_minutes_before_flag:
                 record.status = AttendanceRecord.STATUS_TO_APPROVE
-                record.anomaly_reason = "Excessive hours"
+                record.anomaly_reason = append_anomaly_reason(record.anomaly_reason, "Excessive hours")
                 record.save(using=tenant_db, update_fields=["status", "anomaly_reason", "updated_at"])
         output = AttendanceRecordSerializer(record)
         return Response(output.data, status=status.HTTP_201_CREATED)

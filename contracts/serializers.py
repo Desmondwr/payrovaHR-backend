@@ -4,16 +4,37 @@ from .models import (
     Contract, Allowance, Deduction, ContractAmendment,
     ContractConfiguration, SalaryScale, ContractTemplate, ContractTemplateVersion
 )
+from payroll.models import Advantage as PayrollAdvantage
 from timeoff.defaults import merge_time_off_defaults, validate_time_off_config
 from accounts.rbac import get_active_employer, is_delegate_user
 from .configuration_defaults import CONFIGURATION_MERGE_FUNCTIONS
 from .payroll_sync import sync_contract_payroll_elements
 
 class AllowanceSerializer(serializers.ModelSerializer):
+    advantage = serializers.PrimaryKeyRelatedField(
+        queryset=PayrollAdvantage.objects.none(),
+        required=False,
+        allow_null=True,
+    )
+    advantage_name = serializers.CharField(source='advantage.name', read_only=True)
+    advantage_code = serializers.CharField(source='advantage.code', read_only=True)
+
     class Meta:
         model = Allowance
         exclude = ('contract', 'created_at', 'updated_at')
         read_only_fields = ('id',)
+        extra_kwargs = {
+            'name': {'required': False},
+        }
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        tenant_db = self.context.get('tenant_db') or 'default'
+        employer_id = self.context.get('employer_id')
+        qs = PayrollAdvantage.objects.using(tenant_db)
+        if employer_id:
+            qs = qs.filter(employer_id=employer_id)
+        self.fields['advantage'].queryset = qs
 
 class DeductionSerializer(serializers.ModelSerializer):
     class Meta:
@@ -131,6 +152,7 @@ class ContractSerializer(serializers.ModelSerializer):
         tenant_db = 'default'
         instance = self.instance
         is_list_instance = isinstance(instance, (list, tuple))
+        employer_id = None
 
         if request and hasattr(request, 'user'):
             from accounts.database_utils import get_tenant_database_alias
@@ -145,6 +167,7 @@ class ContractSerializer(serializers.ModelSerializer):
 
             if employer:
                 tenant_db = get_tenant_database_alias(employer)
+                employer_id = employer.id
             
             # Set dynamic querysets for tenant-aware relational fields
             if 'employee' in self.fields:
@@ -155,11 +178,17 @@ class ContractSerializer(serializers.ModelSerializer):
                 self.fields['department'].queryset = Department.objects.using(tenant_db).all()
         elif instance and not is_list_instance:
             tenant_db = instance._state.db or tenant_db
+            employer_id = getattr(instance, 'employer_id', None)
 
         if 'previous_contract' in self.fields:
             self.fields['previous_contract'].queryset = Contract.objects.using(tenant_db).all()
         if 'salary_scale' in self.fields:
             self.fields['salary_scale'].queryset = SalaryScale.objects.using(tenant_db).all()
+
+        # Provide tenant context to nested serializers.
+        self.context.setdefault('tenant_db', tenant_db)
+        if employer_id is not None:
+            self.context.setdefault('employer_id', employer_id)
 
     def _get_config_context(self, data):
         """
@@ -291,14 +320,26 @@ class ContractSerializer(serializers.ModelSerializer):
             seen = set()
             duplicates = set()
             for allowance in allowances_data:
-                key = (allowance.get('name') or '').strip().lower()
+                advantage_key = allowance.get('advantage')
+                if advantage_key:
+                    key = f"advantage:{advantage_key}"
+                    label = allowance.get('name') or str(advantage_key)
+                else:
+                    key = (allowance.get('name') or '').strip().lower()
+                    label = allowance.get('name') or key
                 if not key:
                     continue
                 if key in seen:
-                    duplicates.add(allowance.get('name') or key)
+                    duplicates.add(label)
                 seen.add(key)
             if duplicates:
                 add_error('allowances', f"Duplicate allowances are not allowed: {', '.join(sorted(duplicates))}.")
+
+        if allowances_data:
+            for allowance in allowances_data:
+                if not allowance.get('name') and not allowance.get('advantage'):
+                    add_error('allowances', 'Each allowance must include a name or advantage.')
+                    break
 
         allow_pct = config_get('allow_percentage_allowances', True)
         max_pct = config_get('max_allowance_percentage')
@@ -407,6 +448,13 @@ class ContractSerializer(serializers.ModelSerializer):
             
                 # Create nested objects
                 for allowance_data in allowances_data:
+                    advantage = allowance_data.get('advantage')
+                    if advantage and not allowance_data.get('name'):
+                        allowance_data['name'] = advantage.name
+                    if advantage and 'taxable' not in allowance_data:
+                        allowance_data['taxable'] = advantage.is_taxable
+                    if advantage and 'cnps_base' not in allowance_data:
+                        allowance_data['cnps_base'] = advantage.is_contributory
                     Allowance.objects.using(tenant_db).create(contract=contract, **allowance_data)
                     
                 for deduction_data in deductions_data:
@@ -425,6 +473,11 @@ class ContractSerializer(serializers.ModelSerializer):
             'base_salary' in validated_data
             and validated_data.get('base_salary') != instance.base_salary
         )
+        previous_allowance_advantage_ids = []
+        if allowances_data is not None or base_salary_changed:
+            previous_allowance_advantage_ids = list(
+                instance.allowances.all().values_list('advantage_id', flat=True)
+            )
         
         # Get tenant DB
         request = self.context.get('request')
@@ -452,6 +505,13 @@ class ContractSerializer(serializers.ModelSerializer):
             instance.allowances.all().using(tenant_db).delete()
             # Create new
             for allowance_data in allowances_data:
+                advantage = allowance_data.get('advantage')
+                if advantage and not allowance_data.get('name'):
+                    allowance_data['name'] = advantage.name
+                if advantage and 'taxable' not in allowance_data:
+                    allowance_data['taxable'] = advantage.is_taxable
+                if advantage and 'cnps_base' not in allowance_data:
+                    allowance_data['cnps_base'] = advantage.is_contributory
                 Allowance.objects.using(tenant_db).create(contract=instance, **allowance_data)
 
         # Update nested deductions if provided
@@ -467,6 +527,7 @@ class ContractSerializer(serializers.ModelSerializer):
             tenant_db=tenant_db,
             sync_allowances=allowances_data is not None or base_salary_changed,
             sync_deductions=deductions_data is not None,
+            previous_allowance_advantage_ids=previous_allowance_advantage_ids,
         )
 
         return instance

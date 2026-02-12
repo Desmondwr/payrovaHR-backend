@@ -2,11 +2,9 @@ from django.urls import path, include
 from rest_framework.routers import DefaultRouter
 
 from .views import (
-    AdvantageViewSet,
     CalculationBasisAdvantageViewSet,
     CalculationBasisViewSet,
     CalculationScaleViewSet,
-    DeductionViewSet,
     PayrollArchiveView,
     PayrollConfigurationViewSet,
     PayrollElementViewSet,
@@ -22,8 +20,6 @@ from .models import Salary
 
 router = DefaultRouter()
 router.register(r"config", PayrollConfigurationViewSet, basename="payroll-config")
-router.register(r"advantages", AdvantageViewSet, basename="payroll-advantages")
-router.register(r"deductions", DeductionViewSet, basename="payroll-deductions")
 router.register(r"bases", CalculationBasisViewSet, basename="payroll-bases")
 router.register(r"basis-advantages", CalculationBasisAdvantageViewSet, basename="payroll-basis-advantages")
 router.register(r"scales", CalculationScaleViewSet, basename="payroll-scales")

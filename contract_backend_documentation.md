@@ -41,10 +41,13 @@ When creating or updating a contract, you can pass lists of allowances and deduc
 
 - **Allowances (`allowances`)**:
     - `name`: String (e.g., "Transport Allowance")
+    - `advantage`: UUID (optional) - payroll advantage catalog id to link
     - `type`: `FIXED` or `PERCENTAGE`
     - `amount`: Decimal (Value or %)
     - `taxable`: Boolean
     - `cnps_base`: Boolean
+
+If `advantage` is provided, the contract allowance links to that payroll catalog item. If omitted, the backend will create a catalog item automatically and link it.
 
 - **Deductions (`deductions`)**:
     - Structure mirrors allowances but reduces net pay.
