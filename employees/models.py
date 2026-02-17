@@ -116,7 +116,7 @@ class EmployeeConfiguration(models.Model):
     require_manager = models.CharField(max_length=20, choices=FIELD_REQUIREMENT_CHOICES, default=FIELD_OPTIONAL)
     require_probation_period = models.CharField(max_length=20, choices=FIELD_REQUIREMENT_CHOICES, default=FIELD_OPTIONAL)
     
-    # Payroll Information
+    # Compensation Information
     require_bank_details = models.CharField(max_length=20, choices=FIELD_REQUIREMENT_CHOICES, default=FIELD_REQUIRED)
     require_bank_details_active_only = models.BooleanField(default=True, 
         help_text='Require bank details only for active employees')
@@ -472,7 +472,7 @@ class Employee(models.Model):
     termination_date = models.DateField(blank=True, null=True)
     termination_reason = models.TextField(blank=True, null=True)
     
-    # Payroll Information
+    # Compensation Information
     bank_name = models.CharField(max_length=255, blank=True, null=True)
     bank_account_number = models.CharField(max_length=50, blank=True, null=True)
     bank_account_name = models.CharField(max_length=255, blank=True, null=True)

@@ -163,7 +163,7 @@ class Contract(models.Model):
     
     final_pay_flag = models.BooleanField(
         default=False,
-        help_text='Flag to trigger final payroll calculation'
+        help_text='Flag to trigger final compensation calculation'
     )
 
     # Audit fields
@@ -476,11 +476,17 @@ class Contract(models.Model):
 
         # 2b. Concurrent contract rules
         allow_concurrent = self.get_effective_config('allow_concurrent_contracts_same_inst', False)
-        if not allow_concurrent and self.employee_id and self.start_date:
+        constrained_statuses = ['ACTIVE', 'SIGNED', 'PENDING_SIGNATURE']
+        if (
+            not allow_concurrent
+            and self.employee_id
+            and self.start_date
+            and self.status in constrained_statuses
+        ):
             db_alias = self._state.db or 'default'
             existing_contracts = Contract.objects.using(db_alias).filter(
                 employee=self.employee,
-                status__in=['ACTIVE', 'SIGNED', 'PENDING_SIGNATURE']
+                status__in=constrained_statuses
             )
             if self.pk:
                 existing_contracts = existing_contracts.exclude(id=self.pk)
@@ -701,6 +707,7 @@ class Contract(models.Model):
                 'signer_user_id': user.id,
                 'signer_name': signer_name,
                 'signature_text': 'Signature on file',
+                'document_hash': '',
             }
         )
 
@@ -817,8 +824,8 @@ class Contract(models.Model):
             if not employee.probation_end_date and self.start_date:
                 probation_days = None
                 try:
-                    payroll_cfg = self.get_effective_config('payroll_configuration', {}) or {}
-                    probation_days = payroll_cfg.get('probation_period_days')
+                    compensation_cfg = self.get_effective_config('payroll_configuration', {}) or {}
+                    probation_days = compensation_cfg.get('probation_period_days')
                 except Exception:
                     probation_days = None
 
@@ -906,6 +913,92 @@ class SalaryScale(models.Model):
 
     def __str__(self):
         return f"{self.salary_category} - {self.echelon} ({self.amount})"
+
+
+class CalculationScale(models.Model):
+    """Scale table header used by payroll deductions and progressive calculations."""
+
+    code = models.CharField(max_length=100, null=True, blank=True)
+    name = models.CharField(max_length=100, null=True, blank=True)
+    employer_id = models.IntegerField(
+        db_index=True,
+        help_text='ID of the employer (from main database)'
+    )
+    branch = models.ForeignKey(
+        'employees.Branch',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='calculation_scales',
+    )
+    user_id = models.IntegerField(null=True, blank=True)
+    year = models.CharField(max_length=10, null=True, blank=True)
+    is_enable = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = 'calculation_scales'
+        verbose_name = 'Calculation Scale'
+        verbose_name_plural = 'Calculation Scales'
+        ordering = ['name', 'code', 'id']
+        indexes = [
+            models.Index(fields=['employer_id', 'is_enable'], name='calc_scale_emp_enabled_idx'),
+        ]
+
+    def __str__(self):
+        label = (self.name or '').strip() or (self.code or '').strip() or f"Scale #{self.pk}"
+        if self.code and self.name and self.code.strip() != self.name.strip():
+            return f"{self.name} ({self.code})"
+        return label
+
+
+class ScaleRange(models.Model):
+    """A band/range row attached to a calculation scale."""
+
+    range1 = models.FloatField(null=True, blank=True)
+    range2 = models.FloatField(null=True, blank=True)
+    calculation_scale = models.ForeignKey(
+        'CalculationScale',
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
+        related_name='ranges',
+    )
+    coefficient = models.FloatField(null=True, blank=True)
+    indice = models.FloatField(null=True, blank=True)
+    base = models.FloatField(null=True, blank=True)
+    employer_id = models.IntegerField(
+        db_index=True,
+        help_text='ID of the employer (from main database)'
+    )
+    branch = models.ForeignKey(
+        'employees.Branch',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='scale_ranges',
+    )
+    user_id = models.IntegerField(null=True, blank=True)
+    year = models.CharField(max_length=10, null=True, blank=True)
+    is_enable = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = 'scale_ranges'
+        verbose_name = 'Scale Range'
+        verbose_name_plural = 'Scale Ranges'
+        ordering = ['calculation_scale_id', 'range1', 'range2', 'id']
+        indexes = [
+            models.Index(fields=['employer_id', 'is_enable'], name='scale_range_emp_enabled_idx'),
+            models.Index(fields=['calculation_scale'], name='scale_range_scale_idx'),
+        ]
+
+    def __str__(self):
+        start = self.range1 if self.range1 is not None else '-inf'
+        end = self.range2 if self.range2 is not None else '+inf'
+        return f"{self.calculation_scale_id or 'NoScale'}: {start} - {end}"
 
 
 class ContractConfiguration(models.Model):
@@ -1006,7 +1099,7 @@ class ContractConfiguration(models.Model):
     recruitment_configuration = models.JSONField(default=dict, blank=True, help_text='Recruitment metadata defaults (application IDs, offer refs, etc.)')
     attendance_configuration = models.JSONField(default=dict, blank=True, help_text='Work rules (schedule type, shift template, attendance requirements)')
     time_off_configuration = models.JSONField(default=dict, blank=True, help_text='Leave policy defaults & overrides per leave type')
-    payroll_configuration = models.JSONField(default=dict, blank=True, help_text='Payroll inputs (tax profile, CNPS, probation, proration)')
+    payroll_configuration = models.JSONField(default=dict, blank=True, help_text='Compensation inputs (tax profile, CNPS, probation, proration)')
     expense_configuration = models.JSONField(default=dict, blank=True, help_text='Expense routing (policy, cost center, reimbursement)')
     fleet_configuration = models.JSONField(default=dict, blank=True, help_text='Fleet entitlements (vehicle, transport allowance)')
     signature_configuration = models.JSONField(default=dict, blank=True, help_text='Document & signature defaults (template, method, document hash)')
@@ -1058,6 +1151,20 @@ class ContractComponentBase(models.Model):
         decimal_places=2,
         help_text='Amount value (currency or percentage)'
     )
+
+    code = models.CharField(
+        max_length=255,
+        null=True,
+        blank=True,
+        help_text='Optional business code for this component'
+    )
+
+    calculation_basis = models.CharField(
+        max_length=255,
+        null=True,
+        blank=True,
+        help_text='Optional calculation basis reference'
+    )
     
     taxable = models.BooleanField(
         default=True,
@@ -1067,6 +1174,49 @@ class ContractComponentBase(models.Model):
     cnps_base = models.BooleanField(
         default=True,
         help_text='Is this component part of CNPS base?'
+    )
+
+    is_enable = models.BooleanField(
+        default=True,
+        help_text='Whether this component is enabled'
+    )
+
+    institution_id = models.IntegerField(
+        null=True,
+        blank=True,
+        help_text='Optional institution reference for imported payroll metadata'
+    )
+
+    component_branch_id = models.UUIDField(
+        null=True,
+        blank=True,
+        help_text='Optional branch reference for imported payroll metadata'
+    )
+
+    component_user_id = models.IntegerField(
+        null=True,
+        blank=True,
+        help_text='Optional user reference for imported payroll metadata'
+    )
+
+    component_year = models.CharField(
+        max_length=10,
+        null=True,
+        blank=True,
+        help_text='Optional fiscal year reference (e.g., 2026)'
+    )
+
+    position = models.IntegerField(
+        null=True,
+        blank=True,
+        help_text='Display/calculation order'
+    )
+
+    sys = models.CharField(
+        max_length=255,
+        null=True,
+        blank=True,
+        help_text='Optional system/integration marker'
     )
     
     created_at = models.DateTimeField(auto_now_add=True)
@@ -1095,13 +1245,75 @@ class Allowance(ContractComponentBase):
         help_text='Date when this allowance takes effect'
     )
 
-    advantage = models.ForeignKey(
-        'payroll.Advantage',
-        on_delete=models.SET_NULL,
+    advantage = models.UUIDField(
         null=True,
         blank=True,
-        related_name='contract_allowances',
-        help_text='Linked payroll advantage catalog item'
+        help_text='Optional link to a payroll advantage catalog item'
+    )
+
+    advantage_type = models.CharField(
+        max_length=255,
+        null=True,
+        blank=True,
+        help_text='Optional advantage type label/code'
+    )
+
+    is_contribution = models.BooleanField(
+        null=True,
+        blank=True,
+        help_text='Is this allowance included in contribution calculations?'
+    )
+
+    is_permanent = models.BooleanField(
+        null=True,
+        blank=True,
+        help_text='Whether this allowance is permanent'
+    )
+
+    is_variable = models.BooleanField(
+        null=True,
+        blank=True,
+        help_text='Whether this allowance varies over time'
+    )
+
+    is_manual = models.BooleanField(
+        null=True,
+        blank=True,
+        help_text='Whether this allowance is manually managed'
+    )
+
+    is_nature = models.BooleanField(
+        null=True,
+        blank=True,
+        help_text='Whether this is a benefit in kind'
+    )
+
+    is_nature_cnps = models.BooleanField(
+        null=True,
+        blank=True,
+        help_text='Whether benefit-in-kind CNPS rules apply'
+    )
+
+    majoration = models.CharField(
+        max_length=100,
+        null=True,
+        blank=True,
+        help_text='Optional allowance uplift/majoration rule'
+    )
+
+    cnps_majoration = models.CharField(
+        max_length=100,
+        null=True,
+        blank=True,
+        help_text='Optional CNPS-specific majoration rule'
+    )
+
+    taux = models.DecimalField(
+        max_digits=7,
+        decimal_places=4,
+        null=True,
+        blank=True,
+        help_text='Optional rate used for calculations'
     )
 
     class Meta(ContractComponentBase.Meta):
@@ -1125,10 +1337,232 @@ class Deduction(ContractComponentBase):
         help_text='Date when this deduction takes effect'
     )
 
+    affectation = models.CharField(
+        max_length=255,
+        null=True,
+        blank=True,
+        help_text='Optional payroll affectation/impact area'
+    )
+
+    deduction_type = models.CharField(
+        max_length=255,
+        null=True,
+        blank=True,
+        help_text='Optional deduction type label/code'
+    )
+
+    deduction_basis = models.CharField(
+        max_length=255,
+        null=True,
+        blank=True,
+        help_text='Optional deduction basis reference'
+    )
+
+    deduction_base = models.CharField(
+        max_length=255,
+        null=True,
+        blank=True,
+        help_text='Optional upstream/base deduction reference'
+    )
+
+    is_employee = models.BooleanField(
+        null=True,
+        blank=True,
+        help_text='Whether this deduction applies to the employee share'
+    )
+
+    is_employer = models.BooleanField(
+        null=True,
+        blank=True,
+        help_text='Whether this deduction applies to the employer share'
+    )
+
+    is_scale = models.BooleanField(
+        null=True,
+        blank=True,
+        help_text='Whether scale table calculation is used'
+    )
+
+    is_rate = models.BooleanField(
+        null=True,
+        blank=True,
+        help_text='Whether rate-based calculation is used'
+    )
+
+    is_base = models.BooleanField(
+        null=True,
+        blank=True,
+        help_text='Whether this deduction acts as a base for others'
+    )
+
+    is_count = models.BooleanField(
+        null=True,
+        blank=True,
+        help_text='Whether this deduction is included in totals'
+    )
+
+    calculation_scale = models.CharField(
+        max_length=255,
+        null=True,
+        blank=True,
+        help_text='Optional calculation scale reference'
+    )
+
+    employee_rate = models.DecimalField(
+        max_digits=7,
+        decimal_places=4,
+        null=True,
+        blank=True,
+        help_text='Optional employee-side deduction rate'
+    )
+
+    employer_rate = models.DecimalField(
+        max_digits=7,
+        decimal_places=4,
+        null=True,
+        blank=True,
+        help_text='Optional employer-side deduction rate'
+    )
+
+    partner = models.CharField(
+        max_length=255,
+        null=True,
+        blank=True,
+        help_text='Optional beneficiary/partner institution'
+    )
+
     class Meta(ContractComponentBase.Meta):
         db_table = 'contract_deductions'
         verbose_name = 'Deduction'
         verbose_name_plural = 'Deductions'
+
+
+class ContractElement(models.Model):
+    """
+    Payroll element generated from contract components.
+    Exactly one of advantage or deduction must be set.
+    """
+
+    contract = models.ForeignKey(
+        Contract,
+        on_delete=models.CASCADE,
+        related_name='elements',
+        help_text='Contract this payroll element belongs to'
+    )
+
+    deduction = models.ForeignKey(
+        Deduction,
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
+        related_name='elements',
+        help_text='Deduction definition applied for this element'
+    )
+
+    advantage = models.ForeignKey(
+        Allowance,
+        on_delete=models.CASCADE,
+        null=True,
+        blank=True,
+        related_name='elements',
+        help_text='Advantage/allowance definition applied for this element'
+    )
+
+    amount = models.DecimalField(
+        max_digits=12,
+        decimal_places=2,
+        default=0,
+        help_text='Calculated or manual amount for this element and period'
+    )
+
+    year = models.CharField(
+        max_length=10,
+        help_text='Year this element applies to (e.g., 2026)'
+    )
+
+    month = models.CharField(
+        max_length=10,
+        help_text='Month this element applies to (e.g., 01)'
+    )
+
+    employee_rate = models.DecimalField(
+        max_digits=7,
+        decimal_places=4,
+        null=True,
+        blank=True,
+        help_text='Optional employee-side rate snapshot for this period'
+    )
+
+    employer_rate = models.DecimalField(
+        max_digits=7,
+        decimal_places=4,
+        null=True,
+        blank=True,
+        help_text='Optional employer-side rate snapshot for this period'
+    )
+
+    institution_id = models.IntegerField(
+        db_index=True,
+        help_text='Employer/institution identifier owning this element'
+    )
+
+    branch = models.ForeignKey(
+        'employees.Branch',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='contract_elements',
+        help_text='Optional branch scope for this element'
+    )
+
+    user_id = models.IntegerField(
+        null=True,
+        blank=True,
+        help_text='User that created/generated this element'
+    )
+
+    is_enable = models.BooleanField(
+        default=True,
+        help_text='Whether this element is active for payroll calculations'
+    )
+
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = 'contract_elements'
+        verbose_name = 'Contract Element'
+        verbose_name_plural = 'Contract Elements'
+        ordering = ['-created_at']
+        indexes = [
+            models.Index(fields=['contract', 'year', 'month']),
+            models.Index(fields=['institution_id', 'is_enable']),
+        ]
+        constraints = [
+            models.CheckConstraint(
+                check=(
+                    (models.Q(advantage__isnull=False) & models.Q(deduction__isnull=True))
+                    | (models.Q(advantage__isnull=True) & models.Q(deduction__isnull=False))
+                ),
+                name='contract_element_exactly_one_component',
+            ),
+        ]
+
+    def clean(self):
+        super().clean()
+        if bool(self.advantage_id) == bool(self.deduction_id):
+            raise ValidationError('Exactly one of advantage or deduction must be set.')
+
+        if self.advantage_id and self.contract_id and self.advantage and self.advantage.contract_id != self.contract_id:
+            raise ValidationError('Advantage must belong to the same contract as the element.')
+
+        if self.deduction_id and self.contract_id and self.deduction and self.deduction.contract_id != self.contract_id:
+            raise ValidationError('Deduction must belong to the same contract as the element.')
+
+    def __str__(self):
+        target = self.advantage or self.deduction
+        label = getattr(target, 'name', 'Unknown')
+        return f"{self.contract.contract_id} - {label} ({self.year}-{self.month})"
 
 
 class ContractAudit(models.Model):

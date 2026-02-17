@@ -243,14 +243,6 @@ DEFAULT_PERMISSIONS = [
         "scope": "COMPANY",
         "description": "View employer reports.",
     },
-    {
-        "code": "payroll.manage",
-        "module": "payroll",
-        "resource": "payroll",
-        "action": "manage",
-        "scope": "COMPANY",
-        "description": "Run payroll and manage payroll workflows.",
-    },
     # Employees (action-level)
     {
         "code": "employees.employee.view",

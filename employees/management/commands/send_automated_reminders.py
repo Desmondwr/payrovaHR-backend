@@ -3,6 +3,7 @@ Management command to send automated reminders for:
 - Profile completion
 - Document expiry
 - Probation ending
+- Birthdays
 - Scheduled access revocation for terminated employees
 """
 from django.core.management.base import BaseCommand
@@ -10,6 +11,7 @@ from django.utils import timezone
 from datetime import timedelta
 from accounts.models import EmployerProfile
 from accounts.database_utils import get_tenant_database_alias
+from notifications.models import Notification
 
 
 class Command(BaseCommand):
@@ -19,7 +21,7 @@ class Command(BaseCommand):
         parser.add_argument(
             '--reminder-type',
             type=str,
-            choices=['profile', 'documents', 'probation', 'access_revocation', 'all'],
+            choices=['profile', 'documents', 'probation', 'birthdays', 'access_revocation', 'all'],
             default='all',
             help='Type of reminder to send'
         )
@@ -35,7 +37,10 @@ class Command(BaseCommand):
         
         if reminder_type in ['probation', 'all']:
             self.send_probation_ending_reminders()
-        
+
+        if reminder_type in ['birthdays', 'all']:
+            self.send_birthday_notifications()
+
         if reminder_type in ['access_revocation', 'all']:
             self.process_scheduled_access_revocations()
         
@@ -210,6 +215,120 @@ class Command(BaseCommand):
                 continue
         
         self.stdout.write(self.style.SUCCESS(f'Sent {count} probation ending reminders'))
+
+    def _birthday_notification_exists(self, *, user_id, employer_id, employee_id, event_key, birthday_date):
+        """Prevent duplicate birthday notifications when command runs multiple times per day."""
+        existing = Notification.objects.filter(
+            user_id=user_id,
+            employer_profile_id=employer_id,
+            created_at__date=timezone.localdate(),
+        ).only('data')
+
+        for notification in existing:
+            payload = notification.data or {}
+            if (
+                payload.get('event') == event_key and
+                str(payload.get('employee_id')) == str(employee_id) and
+                payload.get('birthday_date') == birthday_date
+            ):
+                return True
+        return False
+
+    def send_birthday_notifications(self):
+        """Send in-app birthday notifications to employer admins and birthday employees."""
+        from accounts.notifications import create_notification
+        from employees.models import Employee
+        from employees.utils import get_employer_notification_recipients, notify_employee_user
+
+        self.stdout.write('Processing birthday notifications...')
+        today = timezone.localdate()
+        today_str = today.isoformat()
+        count = 0
+
+        for employer in EmployerProfile.objects.filter(user__is_active=True):
+            try:
+                tenant_db = get_tenant_database_alias(employer)
+                employees = Employee.objects.using(tenant_db).filter(
+                    employer_id=employer.id,
+                    employment_status='ACTIVE',
+                    date_of_birth__isnull=False,
+                    date_of_birth__month=today.month,
+                    date_of_birth__day=today.day,
+                )
+
+                for employee in employees:
+                    employee_name = employee.full_name
+                    if employee.date_of_birth:
+                        age = today.year - employee.date_of_birth.year
+                        if (today.month, today.day) < (employee.date_of_birth.month, employee.date_of_birth.day):
+                            age -= 1
+                    else:
+                        age = None
+
+                    admin_payload = {
+                        'event': 'employees.birthday_admin',
+                        'employee_id': str(employee.id),
+                        'employee_number': employee.employee_id,
+                        'name': employee_name,
+                        'birthday_date': today_str,
+                        'age': age,
+                        'path': f'/employer/employees/{employee.id}',
+                    }
+                    admin_body = (
+                        f"Today is {employee_name}'s birthday."
+                        if age is None
+                        else f"Today is {employee_name}'s birthday ({age} years old)."
+                    )
+
+                    for recipient in get_employer_notification_recipients(employer):
+                        if self._birthday_notification_exists(
+                            user_id=recipient.id,
+                            employer_id=employer.id,
+                            employee_id=employee.id,
+                            event_key='employees.birthday_admin',
+                            birthday_date=today_str,
+                        ):
+                            continue
+                        create_notification(
+                            user=recipient,
+                            title='Employee birthday today',
+                            body=admin_body,
+                            type='INFO',
+                            data=admin_payload,
+                            employer_profile=employer,
+                        )
+                        count += 1
+
+                    if employee.user_id and not self._birthday_notification_exists(
+                        user_id=employee.user_id,
+                        employer_id=employer.id,
+                        employee_id=employee.id,
+                        event_key='employees.birthday',
+                        birthday_date=today_str,
+                    ):
+                        created_notification = notify_employee_user(
+                            employee,
+                            title='Happy Birthday!',
+                            body=f'Happy Birthday, {employee_name}! Wishing you a great day.',
+                            type='INFO',
+                            data={
+                                'event': 'employees.birthday',
+                                'employee_id': str(employee.id),
+                                'name': employee_name,
+                                'birthday_date': today_str,
+                                'celebration': True,
+                                'path': '/employee',
+                            },
+                            employer_profile=employer,
+                        )
+                        if created_notification:
+                            count += 1
+
+            except Exception as e:
+                self.stdout.write(self.style.ERROR(f'Error processing employer {employer.id}: {str(e)}'))
+                continue
+
+        self.stdout.write(self.style.SUCCESS(f'Sent {count} birthday notifications'))
 
     def process_scheduled_access_revocations(self):
         """Process scheduled access revocations for terminated employees"""

@@ -425,7 +425,7 @@ class Role(models.Model):
     is_active = models.BooleanField(default=True)
     allow_high_risk_combination = models.BooleanField(
         default=False,
-        help_text="Allow payroll input + treasury release combinations (owner only).",
+        help_text="Allow high-risk input + treasury release combinations (owner only).",
     )
     created_by = models.ForeignKey(
         User,

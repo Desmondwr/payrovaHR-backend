@@ -462,7 +462,7 @@ class PaymentLine(models.Model):
     ]
 
     LINKED_OBJECT_CHOICES = [
-        ("PAYSLIP", "Payslip"),
+        ("PAYSLIP", "Salary Statement"),
         ("EXPENSE_CLAIM", "Expense Claim"),
         ("BILL", "Bill"),
         ("NONE", "None"),

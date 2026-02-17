@@ -1,20 +1,14 @@
 from rest_framework import serializers
 
-from contracts.models import Contract
-from employees.models import Employee
+from contracts.models import Allowance
 
 from .models import (
-    Advantage,
     CalculationBasis,
     CalculationBasisAdvantage,
-    CalculationScale,
-    Deduction,
     PayrollConfiguration,
-    PayrollElement,
     Salary,
     SalaryAdvantage,
     SalaryDeduction,
-    ScaleRange,
 )
 
 
@@ -25,43 +19,6 @@ class PayrollConfigurationSerializer(serializers.ModelSerializer):
         read_only_fields = ["id", "created_at", "updated_at", "employer_id"]
 
 
-class AdvantageSerializer(serializers.ModelSerializer):
-    class Meta:
-        model = Advantage
-        fields = "__all__"
-        read_only_fields = ["id", "created_at", "updated_at", "employer_id"]
-
-
-class CalculationScaleSerializer(serializers.ModelSerializer):
-    class Meta:
-        model = CalculationScale
-        fields = "__all__"
-        read_only_fields = ["id", "created_at", "updated_at", "employer_id"]
-
-
-class ScaleRangeSerializer(serializers.ModelSerializer):
-    class Meta:
-        model = ScaleRange
-        fields = "__all__"
-        read_only_fields = ["id", "created_at", "updated_at", "employer_id"]
-
-
-class DeductionSerializer(serializers.ModelSerializer):
-    class Meta:
-        model = Deduction
-        fields = "__all__"
-        read_only_fields = ["id", "created_at", "updated_at", "employer_id"]
-
-    def validate(self, attrs):
-        is_rate = attrs.get("is_rate", getattr(self.instance, "is_rate", False))
-        is_scale = attrs.get("is_scale", getattr(self.instance, "is_scale", False))
-        is_base_table = attrs.get("is_base_table", getattr(self.instance, "is_base_table", False))
-        methods = [is_rate, is_scale, is_base_table]
-        if sum(bool(v) for v in methods) != 1:
-            raise serializers.ValidationError("Select exactly one calculation method (rate, scale, or base table).")
-        return attrs
-
-
 class CalculationBasisSerializer(serializers.ModelSerializer):
     class Meta:
         model = CalculationBasis
@@ -70,23 +27,83 @@ class CalculationBasisSerializer(serializers.ModelSerializer):
 
 
 class CalculationBasisAdvantageSerializer(serializers.ModelSerializer):
+    basis_code = serializers.CharField(source="basis.code", read_only=True)
+    basis_name = serializers.CharField(source="basis.name", read_only=True)
+    allowance_name = serializers.CharField(source="allowance.name", read_only=True)
+    allowance_code_display = serializers.SerializerMethodField()
+
     class Meta:
         model = CalculationBasisAdvantage
         fields = "__all__"
-        read_only_fields = ["id", "created_at", "updated_at", "employer_id"]
+        read_only_fields = [
+            "id",
+            "created_at",
+            "updated_at",
+            "employer_id",
+            "basis_code",
+            "basis_name",
+            "allowance_name",
+            "allowance_code_display",
+        ]
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        tenant_db = self.context.get("tenant_db")
+        employer_id = self.context.get("employer_id")
+        if tenant_db and "allowance" in self.fields:
+            allowance_qs = Allowance.objects.using(tenant_db)
+            if employer_id is not None:
+                allowance_qs = allowance_qs.filter(contract__employer_id=employer_id)
+            self.fields["allowance"].queryset = allowance_qs
+        if tenant_db and "basis" in self.fields:
+            basis_qs = CalculationBasis.objects.using(tenant_db)
+            if employer_id is not None:
+                basis_qs = basis_qs.filter(employer_id=employer_id)
+            self.fields["basis"].queryset = basis_qs
 
-class PayrollElementSerializer(serializers.ModelSerializer):
-    class Meta:
-        model = PayrollElement
-        fields = "__all__"
-        read_only_fields = ["id", "created_at", "updated_at", "employer_id"]
+    def get_allowance_code_display(self, obj):
+        if obj.allowance_code:
+            return obj.allowance_code
+        if obj.allowance:
+            return obj.allowance.code
+        return None
 
     def validate(self, attrs):
-        advantage = attrs.get("advantage", getattr(self.instance, "advantage", None))
-        deduction = attrs.get("deduction", getattr(self.instance, "deduction", None))
-        if bool(advantage) == bool(deduction):
-            raise serializers.ValidationError("Element must link to either an advantage or a deduction.")
+        allowance = attrs.get("allowance", getattr(self.instance, "allowance", None))
+        allowance_code = attrs.get("allowance_code", getattr(self.instance, "allowance_code", None))
+        if bool(allowance) == bool(allowance_code):
+            raise serializers.ValidationError(
+                "Provide exactly one mapping target: allowance OR allowance_code."
+            )
+
+        tenant_db = self.context.get("tenant_db")
+        employer_id = self.context.get("employer_id")
+        basis = attrs.get("basis", getattr(self.instance, "basis", None))
+
+        if tenant_db and basis is not None:
+            basis_id = getattr(basis, "id", basis)
+            basis_qs = CalculationBasis.objects.using(tenant_db).filter(id=basis_id)
+            if employer_id is not None:
+                basis_qs = basis_qs.filter(employer_id=employer_id)
+            basis_row = basis_qs.first()
+            if not basis_row:
+                raise serializers.ValidationError(
+                    {"basis": "Selected basis does not exist for the active employer/tenant."}
+                )
+            attrs["basis"] = basis_row
+
+        if tenant_db and allowance is not None:
+            allowance_id = getattr(allowance, "id", allowance)
+            allowance_qs = Allowance.objects.using(tenant_db).filter(id=allowance_id)
+            if employer_id is not None:
+                allowance_qs = allowance_qs.filter(contract__employer_id=employer_id)
+            allowance_row = allowance_qs.first()
+            if not allowance_row:
+                raise serializers.ValidationError(
+                    {"allowance": "Selected allowance does not exist for the active employer/tenant."}
+                )
+            attrs["allowance"] = allowance_row
+
         return attrs
 
 
@@ -95,7 +112,7 @@ class SalaryAdvantageSerializer(serializers.ModelSerializer):
         model = SalaryAdvantage
         fields = [
             "id",
-            "advantage",
+            "allowance",
             "code",
             "name",
             "base",
@@ -205,3 +222,4 @@ class PayrollValidateSerializer(serializers.Serializer):
     salary_ids = serializers.ListField(child=serializers.UUIDField(), required=False)
     year = serializers.IntegerField(required=False)
     month = serializers.IntegerField(required=False)
+    allow_simulated = serializers.BooleanField(required=False, default=False)

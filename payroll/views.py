@@ -1,116 +1,72 @@
 from django.db import transaction
+from django.shortcuts import get_object_or_404
 from rest_framework import permissions, viewsets
 from rest_framework.exceptions import PermissionDenied, ValidationError
-from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from accounts.database_utils import ensure_tenant_database_loaded, get_tenant_database_alias
 from accounts.middleware import get_current_tenant_db
+from accounts.models import EmployerProfile
 from accounts.permissions import EmployerAccessPermission, EmployerOrEmployeeAccessPermission
 from accounts.rbac import get_active_employer, is_delegate_user
+from accounts.utils import api_response
+from contracts.payroll_defaults import ensure_payroll_default_bases
 
-from .models import (
-    Advantage,
-    CalculationBasis,
-    CalculationBasisAdvantage,
-    CalculationScale,
-    Deduction,
-    PayrollConfiguration,
-    PayrollElement,
-    Salary,
-    ScaleRange,
-)
+from .models import CalculationBasis, CalculationBasisAdvantage, PayrollConfiguration, Salary
 from .serializers import (
-    AdvantageSerializer,
     CalculationBasisAdvantageSerializer,
     CalculationBasisSerializer,
-    CalculationScaleSerializer,
-    DeductionSerializer,
     PayrollConfigurationSerializer,
-    PayrollElementSerializer,
     PayrollRunSerializer,
     PayrollValidateSerializer,
     SalaryDetailSerializer,
     SalarySummarySerializer,
-    ScaleRangeSerializer,
 )
 from .services import PayrollCalculationService, validate_payroll
 
 
 class EmployerContextMixin:
-    def _parse_header(self):
-        header_value = self.request.headers.get("x-employer-id")
-        if not header_value:
-            return None
-        try:
-            return int(header_value)
-        except ValueError:
-            raise PermissionDenied("Invalid employer id in header.")
-
-    def get_employer_id(self):
-        employer_id = self._parse_header()
-        if employer_id:
-            return employer_id
+    def _resolve_employer(self):
         user = self.request.user
-        if user.is_staff or user.is_superuser:
-            return None
-        if hasattr(user, "employer_profile") and user.employer_profile:
-            return user.employer_profile.id
+        if getattr(user, "employer_profile", None):
+            return user.employer_profile
+
         resolved = get_active_employer(self.request, require_context=False)
         if resolved and (user.is_admin or user.is_superuser or is_delegate_user(user, resolved.id)):
-            return resolved.id
+            return resolved
+
         employee = getattr(user, "employee_profile", None)
-        if employee:
-            return employee.employer_id
-        raise PermissionDenied("Employer context could not be determined.")
+        if employee and employee.employer_id:
+            return EmployerProfile.objects.filter(id=employee.employer_id).first()
+        return None
 
-    def _get_alias_for_employer(self, employer_id):
-        from accounts.models import EmployerProfile
-
-        employer_profile = EmployerProfile.objects.filter(id=employer_id).first()
-        if employer_profile and employer_profile.database_name:
-            ensure_tenant_database_loaded(employer_profile)
-            return get_tenant_database_alias(employer_profile)
-        return "default"
+    def get_employer_id(self):
+        employer = self._resolve_employer()
+        if employer:
+            return employer.id
+        raise PermissionDenied("Employer context could not be resolved.")
 
     def get_tenant_db_alias(self):
         tenant_db = get_current_tenant_db()
         if tenant_db and tenant_db != "default":
             return tenant_db
 
-        employer_id = self.get_employer_id()
-        if employer_id:
-            alias = self._get_alias_for_employer(employer_id)
-            if alias:
-                return alias
-
+        employer = self._resolve_employer()
+        if employer:
+            if employer.database_name:
+                return ensure_tenant_database_loaded(employer)
+            return get_tenant_database_alias(employer)
         return "default"
-
-    def _require_tenant_db_alias(self):
-        tenant_db = self.get_tenant_db_alias()
-        if tenant_db == "default":
-            raise PermissionDenied(
-                "Tenant database context is required. Provide X-Employer-Id header or login as employer."
-            )
-        return tenant_db
 
 
 class PayrollTenantViewSet(EmployerContextMixin, viewsets.ModelViewSet):
     permission_classes = [permissions.IsAuthenticated, EmployerAccessPermission]
     permission_map = {"*": ["payroll.manage"]}
 
-    def initial(self, request, *args, **kwargs):
-        super().initial(request, *args, **kwargs)
-        if request.method in {"POST", "PUT", "PATCH", "DELETE"}:
-            self._require_tenant_db_alias()
-
     def get_queryset(self):
         tenant_db = self.get_tenant_db_alias()
         employer_id = self.get_employer_id()
-        qs = super().get_queryset().using(tenant_db)
-        if employer_id:
-            qs = qs.filter(employer_id=employer_id)
-        return qs
+        return super().get_queryset().using(tenant_db).filter(employer_id=employer_id)
 
     def get_serializer_context(self):
         context = super().get_serializer_context()
@@ -118,16 +74,20 @@ class PayrollTenantViewSet(EmployerContextMixin, viewsets.ModelViewSet):
         context["employer_id"] = self.get_employer_id()
         return context
 
-    def perform_create(self, serializer):
-        employer_id = self.get_employer_id()
-        serializer.save(employer_id=employer_id)
+    def _create_in_tenant(self, serializer, **extra_fields):
+        tenant_db = self.get_tenant_db_alias()
+        model_cls = serializer.Meta.model
+        create_data = dict(serializer.validated_data)
+        create_data.update(extra_fields)
+        instance = model_cls.objects.using(tenant_db).create(**create_data)
+        serializer.instance = instance
+        return instance
 
-    def perform_update(self, serializer):
-        serializer.save()
+    def perform_create(self, serializer):
+        self._create_in_tenant(serializer, employer_id=self.get_employer_id())
 
     def perform_destroy(self, instance):
-        tenant_db = self.get_tenant_db_alias()
-        instance.delete(using=tenant_db)
+        instance.delete(using=self.get_tenant_db_alias())
 
 
 class PayrollConfigurationViewSet(PayrollTenantViewSet):
@@ -139,58 +99,29 @@ class PayrollConfigurationViewSet(PayrollTenantViewSet):
         tenant_db = self.get_tenant_db_alias()
         with transaction.atomic(using=tenant_db):
             PayrollConfiguration.objects.using(tenant_db).filter(
-                employer_id=employer_id, is_active=True
+                employer_id=employer_id,
+                is_active=True,
             ).update(is_active=False)
-            serializer.save(employer_id=employer_id, is_active=True)
-
-
-class AdvantageViewSet(PayrollTenantViewSet):
-    queryset = Advantage.objects.all()
-    serializer_class = AdvantageSerializer
-
-
-class DeductionViewSet(PayrollTenantViewSet):
-    queryset = Deduction.objects.all()
-    serializer_class = DeductionSerializer
+            self._create_in_tenant(serializer, employer_id=employer_id, is_active=True)
 
 
 class CalculationBasisViewSet(PayrollTenantViewSet):
     queryset = CalculationBasis.objects.all()
     serializer_class = CalculationBasisSerializer
 
+    def get_queryset(self):
+        tenant_db = self.get_tenant_db_alias()
+        employer_id = self.get_employer_id()
+        ensure_payroll_default_bases(
+            employer_id=employer_id,
+            tenant_db=tenant_db,
+        )
+        return CalculationBasis.objects.using(tenant_db).filter(employer_id=employer_id)
+
 
 class CalculationBasisAdvantageViewSet(PayrollTenantViewSet):
     queryset = CalculationBasisAdvantage.objects.all()
     serializer_class = CalculationBasisAdvantageSerializer
-
-
-class CalculationScaleViewSet(PayrollTenantViewSet):
-    queryset = CalculationScale.objects.all()
-    serializer_class = CalculationScaleSerializer
-
-
-class ScaleRangeViewSet(PayrollTenantViewSet):
-    queryset = ScaleRange.objects.all()
-    serializer_class = ScaleRangeSerializer
-
-    def get_queryset(self):
-        qs = super().get_queryset()
-        scale_id = self.request.query_params.get("scale_id")
-        if scale_id:
-            qs = qs.filter(scale_id=scale_id)
-        return qs
-
-
-class PayrollElementViewSet(PayrollTenantViewSet):
-    queryset = PayrollElement.objects.all()
-    serializer_class = PayrollElementSerializer
-
-    def get_queryset(self):
-        qs = super().get_queryset()
-        contract_id = self.request.query_params.get("contract_id")
-        if contract_id:
-            qs = qs.filter(contract_id=contract_id)
-        return qs
 
 
 class PayrollRunView(EmployerContextMixin, APIView):
@@ -201,9 +132,8 @@ class PayrollRunView(EmployerContextMixin, APIView):
         serializer = PayrollRunSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
+
         employer_id = data.get("institution_id") or self.get_employer_id()
-        if not employer_id:
-            raise ValidationError({"institution_id": "Institution id is required."})
         tenant_db = self.get_tenant_db_alias()
 
         service = PayrollCalculationService(
@@ -218,9 +148,28 @@ class PayrollRunView(EmployerContextMixin, APIView):
             branch_id=data.get("branch_id"),
             department_id=data.get("department_id"),
         )
-        salaries = [result.salary for result in results]
-        payload = SalaryDetailSerializer(salaries, many=True).data
-        return Response({"results": payload, "count": len(payload)})
+
+        payload = []
+        skipped = 0
+        for result in results:
+            row = SalaryDetailSerializer(result.salary).data
+            row["outcome"] = result.outcome
+            if result.reason:
+                row["reason"] = result.reason
+            if result.outcome != "OK":
+                skipped += 1
+            payload.append(row)
+
+        return api_response(
+            success=True,
+            message="Payroll run completed.",
+            data={
+                "results": payload,
+                "count": len(payload),
+                "skipped": skipped,
+                "processed": len(payload) - skipped,
+            },
+        )
 
 
 class PayrollPayslipListView(EmployerContextMixin, APIView):
@@ -237,6 +186,8 @@ class PayrollPayslipListView(EmployerContextMixin, APIView):
         status = request.query_params.get("status")
         employee_id = request.query_params.get("employee_id")
         contract_id = request.query_params.get("contract_id")
+        branch_id = request.query_params.get("branch_id")
+        department_id = request.query_params.get("department_id")
 
         if year:
             qs = qs.filter(year=year)
@@ -248,9 +199,17 @@ class PayrollPayslipListView(EmployerContextMixin, APIView):
             qs = qs.filter(employee_id=employee_id)
         if contract_id:
             qs = qs.filter(contract_id=contract_id)
+        if branch_id:
+            qs = qs.filter(contract__branch_id=branch_id)
+        if department_id:
+            qs = qs.filter(contract__department_id=department_id)
 
-        serializer = SalarySummarySerializer(qs.order_by("-year", "-month"), many=True)
-        return Response({"results": serializer.data, "count": len(serializer.data)})
+        serializer = SalarySummarySerializer(qs.order_by("-year", "-month", "-created_at"), many=True)
+        return api_response(
+            success=True,
+            message="Payslips retrieved.",
+            data={"results": serializer.data, "count": len(serializer.data)},
+        )
 
 
 class PayrollPayslipDetailView(EmployerContextMixin, APIView):
@@ -260,11 +219,13 @@ class PayrollPayslipDetailView(EmployerContextMixin, APIView):
     def get(self, request, salary_id):
         employer_id = self.get_employer_id()
         tenant_db = self.get_tenant_db_alias()
-        salary = Salary.objects.using(tenant_db).filter(id=salary_id, employer_id=employer_id).first()
-        if not salary:
-            raise ValidationError({"detail": "Payslip not found."})
+        salary = get_object_or_404(
+            Salary.objects.using(tenant_db),
+            id=salary_id,
+            employer_id=employer_id,
+        )
         serializer = SalaryDetailSerializer(salary)
-        return Response(serializer.data)
+        return api_response(success=True, message="Payslip retrieved.", data=serializer.data)
 
 
 class PayrollMyPayslipListView(APIView):
@@ -274,6 +235,7 @@ class PayrollMyPayslipListView(APIView):
         employee = getattr(request.user, "employee_profile", None)
         if not employee:
             raise PermissionDenied("Employee profile not available.")
+
         tenant_db = get_current_tenant_db() or "default"
         qs = Salary.objects.using(tenant_db).filter(employee=employee)
         year = request.query_params.get("year")
@@ -282,8 +244,13 @@ class PayrollMyPayslipListView(APIView):
             qs = qs.filter(year=year)
         if month:
             qs = qs.filter(month=month)
-        serializer = SalarySummarySerializer(qs.order_by("-year", "-month"), many=True)
-        return Response({"results": serializer.data, "count": len(serializer.data)})
+
+        serializer = SalarySummarySerializer(qs.order_by("-year", "-month", "-created_at"), many=True)
+        return api_response(
+            success=True,
+            message="Payslips retrieved.",
+            data={"results": serializer.data, "count": len(serializer.data)},
+        )
 
 
 class PayrollMyPayslipDetailView(APIView):
@@ -293,12 +260,11 @@ class PayrollMyPayslipDetailView(APIView):
         employee = getattr(request.user, "employee_profile", None)
         if not employee:
             raise PermissionDenied("Employee profile not available.")
+
         tenant_db = get_current_tenant_db() or "default"
-        salary = Salary.objects.using(tenant_db).filter(id=salary_id, employee=employee).first()
-        if not salary:
-            raise ValidationError({"detail": "Payslip not found."})
+        salary = get_object_or_404(Salary.objects.using(tenant_db), id=salary_id, employee=employee)
         serializer = SalaryDetailSerializer(salary)
-        return Response(serializer.data)
+        return api_response(success=True, message="Payslip retrieved.", data=serializer.data)
 
 
 class PayrollValidateView(EmployerContextMixin, APIView):
@@ -309,6 +275,7 @@ class PayrollValidateView(EmployerContextMixin, APIView):
         serializer = PayrollValidateSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
+
         employer_id = self.get_employer_id()
         tenant_db = self.get_tenant_db_alias()
 
@@ -322,8 +289,17 @@ class PayrollValidateView(EmployerContextMixin, APIView):
             if data.get("month"):
                 qs = qs.filter(month=data["month"])
 
-        batches = validate_payroll(request=request, tenant_db=tenant_db, salaries=list(qs))
-        return Response({"batches": [str(batch.id) for batch in batches]})
+        batches = validate_payroll(
+            request=request,
+            tenant_db=tenant_db,
+            salaries=list(qs),
+            allow_simulated=data.get("allow_simulated", False),
+        )
+        return api_response(
+            success=True,
+            message="Payroll validated and treasury batches created.",
+            data={"batch_ids": [str(batch.id) for batch in batches]},
+        )
 
 
 class PayrollArchiveView(EmployerContextMixin, APIView):
@@ -334,6 +310,7 @@ class PayrollArchiveView(EmployerContextMixin, APIView):
         serializer = PayrollValidateSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         data = serializer.validated_data
+
         employer_id = self.get_employer_id()
         tenant_db = self.get_tenant_db_alias()
 
@@ -347,5 +324,9 @@ class PayrollArchiveView(EmployerContextMixin, APIView):
             if data.get("month"):
                 qs = qs.filter(month=data["month"])
 
-        qs.update(status=Salary.STATUS_ARCHIVED)
-        return Response({"detail": "Archived"})
+        updated = qs.update(status=Salary.STATUS_ARCHIVED)
+        return api_response(
+            success=True,
+            message="Payroll archived.",
+            data={"archived_count": updated},
+        )

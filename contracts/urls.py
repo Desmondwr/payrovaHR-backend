@@ -2,12 +2,15 @@ from django.urls import path, include
 from rest_framework.routers import DefaultRouter
 from .views import (
     ContractViewSet, ContractAmendmentViewSet,
-    ContractConfigurationViewSet, SalaryScaleViewSet, ContractTemplateViewSet
+    ContractConfigurationViewSet, SalaryScaleViewSet,
+    CalculationScaleViewSet, ScaleRangeViewSet, ContractTemplateViewSet
 )
 
 router = DefaultRouter()
 router.register(r'config', ContractConfigurationViewSet, basename='contract-config')
 router.register(r'salary-scales', SalaryScaleViewSet, basename='salary-scale')
+router.register(r'calculation-scales', CalculationScaleViewSet, basename='calculation-scale')
+router.register(r'scale-ranges', ScaleRangeViewSet, basename='scale-range')
 router.register(r'templates', ContractTemplateViewSet, basename='contract-template')
 router.register(r'', ContractViewSet, basename='contract')
 

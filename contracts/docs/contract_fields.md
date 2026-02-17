@@ -164,10 +164,35 @@ Note: job-specific metadata (e.g., `job_position`) is now captured via `recruitm
 
 ## Allowance & Deduction metadata
 
-Both `Allowance` and `Deduction` entries now capture optional identifiers and effective dates:
-- `allowance_id` / `deduction_id` (`IntegerField`): Optional reference to shared allowance/deduction templates or master records.
-- `effective_from` (`DateField`): Date when the component starts applying.
-- `advantage` (`UUIDField`): Optional link to the payroll advantages catalog (Allowance only).
+Both `Allowance` and `Deduction` entries now capture richer optional metadata in addition to
+`name`, `type`, `amount`, `taxable`, and `cnps_base`.
+
+Shared metadata:
+- `code` (`CharField`)
+- `calculation_basis` (`CharField`)
+- `is_enable` (`BooleanField`)
+- `institution_id` (`IntegerField`)
+- `component_branch_id` (`UUIDField`)
+- `component_user_id` (`IntegerField`)
+- `component_year` (`CharField`)
+- `position` (`IntegerField`)
+- `sys` (`CharField`)
+
+Allowance-specific metadata:
+- `allowance_id` (`IntegerField`)
+- `effective_from` (`DateField`)
+- `advantage` (`UUIDField`)
+- `advantage_type` (`CharField`)
+- `is_contribution`, `is_permanent`, `is_variable`, `is_manual`, `is_nature`, `is_nature_cnps` (`BooleanField`)
+- `majoration`, `cnps_majoration` (`CharField`)
+- `taux` (`DecimalField`)
+
+Deduction-specific metadata:
+- `deduction_id` (`IntegerField`)
+- `effective_from` (`DateField`)
+- `affectation`, `deduction_type`, `deduction_basis`, `deduction_base`, `calculation_scale`, `partner` (`CharField`)
+- `is_employee`, `is_employer`, `is_scale`, `is_rate`, `is_base`, `is_count` (`BooleanField`)
+- `employee_rate`, `employer_rate` (`DecimalField`)
 
 ## ContractSignature metadata
 

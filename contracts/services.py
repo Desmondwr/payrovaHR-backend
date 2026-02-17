@@ -1,4 +1,4 @@
-import os
+﻿import os
 from io import BytesIO
 
 from django.contrib.auth import get_user_model
@@ -105,19 +105,31 @@ def _should_skip_body_line(line: str, employer_info=None, employee_info=None) ->
     if not lower:
         return False
 
-    if lower.startswith("created by") or lower.startswith("prepared for"):
+    if (
+        lower.startswith("created by")
+        or lower.startswith("prepared by")
+        or lower.startswith("prepared for")
+        or lower.startswith("contract parties")
+        or lower.startswith("employer date")
+        or lower.startswith("employee date")
+    ):
         return True
 
     # Skip placeholder tokens
     if "{co_address" in lower or "{emp_address" in lower or "{co_city" in lower or "{emp_city" in lower:
         return True
 
-    # Skip lines containing actual employer/employee name/address values
+    # Skip lines containing actual employer/employee name/address/date values
     for info in (employer_info or {}, employee_info or {}):
         if isinstance(info, dict):
-            for key in ("name", "address"):
+            for key in ("name", "address", "date"):
                 val = (info.get(key) or "").strip().lower()
-                if val and val in lower:
+                if not val:
+                    continue
+                if key == "date":
+                    if lower == val:
+                        return True
+                elif val in lower:
                     return True
 
     return False
@@ -318,110 +330,65 @@ def generate_contract_pdf(contract, template=None):
         c = canvas.Canvas(buffer, pagesize=A4)
         width, height = A4
 
-        # Layout constants
-        margin = 20
-        header_h = 56
-        footer_h = 34
+        # Layout constants (formal document spacing)
+        margin = 48
+        header_h = 54
+        footer_h = 26
         content_top = height - margin - header_h
         content_bottom = margin + footer_h
         max_width = width - (2 * margin)
-
-        # Subtle brand-ish palette (no dependency on external assets)
-        ink = colors.HexColor("#111827")        # near-black
-        muted = colors.HexColor("#6B7280")      # gray
-        line = colors.HexColor("#E5E7EB")       # light gray
-        accent = colors.HexColor("#111827")     # keep monochrome-professional
-        soft = colors.HexColor("#F9FAFB")       # very light gray
-
+        # Monochrome palette for professional/legal docs
+        ink = colors.HexColor("#111111")
+        muted = colors.HexColor("#666666")
+        line = colors.HexColor("#CFCFCF")
         y = content_top
-
         header_drawn = False
-
         def draw_page_frame():
-            # Background
-            c.setFillColor(soft)
-            c.rect(0, 0, width, height, fill=1, stroke=0)
-
-            # White "paper" panel
-            c.setFillColor(colors.white)
-            c.rect(
-                margin - 20,
-                margin - 1,
-                width - 2 * (margin - 20),
-                height - 2 * (margin - 12),
-                fill=1,
-                stroke=0,
-            )
-
-            # Header bar line
-            c.setStrokeColor(line)
-            c.setLineWidth(1)
-            c.line(margin, height - margin - header_h + 10, width - margin, height - margin - header_h + 10)
-
-            # Footer divider
-            c.line(margin, margin + footer_h, width - margin, margin + footer_h)
-
-            # Footer text
+            # Minimal footer only (no decorative separators)
             c.setFillColor(muted)
             c.setFont("Helvetica", 8.5)
-            c.drawString(margin, margin + 12, f"{employer_info['name']} • Contract Document")
-            c.drawRightString(width - margin, margin + 1, f"Page {c.getPageNumber()}")
-
+            c.drawString(margin, margin + 10, f"{employer_info['name']} - Employment Contract")
+            c.drawRightString(width - margin, margin + 10, f"Page {c.getPageNumber()}")
         def draw_title_block():
             nonlocal y
             c.setFillColor(ink)
-            c.setFont("Helvetica-Bold", 16)
-            c.drawString(margin, height - margin - 28, title)
-
-            # Small metadata under title
+            c.setFont("Helvetica-Bold", 15)
+            c.drawString(margin, height - margin - 24, title)
+            # Generation metadata
             c.setFillColor(muted)
-            c.setFont("Helvetica", 9.5)
-            c.drawString(margin, height - margin - 44, f"Generated: {timezone.now().strftime('%Y-%m-%d %H:%M')}")
-
-            y = content_top - 18
-
+            c.setFont("Helvetica", 9)
+            c.drawString(margin, height - margin - 39, f"Generated on {timezone.now().strftime('%Y-%m-%d %H:%M')}")
+            y = content_top - 8
         def draw_header_block():
-            """Side-by-side 'Created by' / 'Prepared for' cards."""
+            """Render formal party metadata rows."""
             nonlocal y, header_drawn
             if header_drawn:
                 return
-
-            card_h = 54
-            gap = 14
-            card_w = (max_width - gap) / 2
-            x1 = margin
-            x2 = margin + card_w + gap
-            top = y - 8  # reduce space above the cards
-
-            # Card backgrounds
-            c.setFillColor(colors.HexColor("#FFFFFF"))
-            c.setStrokeColor(line)
-            c.setLineWidth(1)
-            c.roundRect(x1, top - card_h, card_w, card_h, 8, fill=1, stroke=1)
-            c.roundRect(x2, top - card_h, card_w, card_h, 8, fill=1, stroke=1)
-
-            # Left: Employer
             c.setFillColor(ink)
-            c.setFont("Helvetica-Bold", 9.5)
-            c.drawString(x1 + 10, top - 16, "Created by")
-            c.setFont("Helvetica", 9.5)
-            c.drawString(x1 + 10, top - 32, employer_info["name"])
-            c.setFillColor(muted)
-            c.setFont("Helvetica", 8.8)
-            c.drawString(x1 + 10, top - 46, f"Date: {employer_info['date']}")
-
-            # Right: Employee
-            c.setFillColor(ink)
-            c.setFont("Helvetica-Bold", 9.5)
-            c.drawString(x2 + 10, top - 16, "Prepared for")
-            c.setFont("Helvetica", 9.5)
-            c.drawString(x2 + 10, top - 32, employee_info["name"] or "—")
-            c.setFillColor(muted)
-            c.setFont("Helvetica", 8.8)
-            c.drawString(x2 + 10, top - 46, f"Date: {employee_info['date']}")
-
-            # Add extra bottom margin before the next section
-            y = top - card_h - 32
+            c.setFont("Helvetica-Bold", 10.2)
+            c.drawString(margin, y, "Contract Parties")
+            y -= 16
+            c.setFont("Helvetica", 9.6)
+            rows = [
+                ("Prepared by", employer_info["name"] or "-"),
+                ("Prepared for", employee_info["name"] or "-"),
+                ("Employer date", employer_info["date"] or "-"),
+                ("Employee date", employee_info["date"] or "-"),
+            ]
+            label_width = 98
+            row_h = 14
+            for label, value in rows:
+                ensure_space(20)
+                c.setFillColor(muted)
+                c.drawString(margin, y, f"{label}:")
+                c.setFillColor(ink)
+                wrapped_value = wrap_lines(str(value), "Helvetica", 9.6, max_width - label_width, c)
+                c.drawString(margin + label_width, y, wrapped_value[0] if wrapped_value else "-")
+                y -= row_h
+                for continuation in wrapped_value[1:2]:
+                    c.drawString(margin + label_width, y, continuation)
+                    y -= row_h
+            y -= 8
             header_drawn = True
 
         def new_page():
@@ -433,21 +400,19 @@ def generate_contract_pdf(contract, template=None):
             nonlocal y
             if y - min_needed < content_bottom:
                 new_page()
-                y = content_top - 18
+                y = content_top - 8
 
         # Start first page
         draw_page_frame()
         draw_title_block()
+        ensure_space(90)
+        draw_header_block()
 
         # Body rendering
         c.setFillColor(ink)
         c.setFont("Helvetica", 10)
 
         for para in body.split("\n\n"):
-            if (not header_drawn) and ("introduction & recitals" in para.lower()):
-                ensure_space(90)
-                draw_header_block()
-
             # Flatten paragraph into wrapped lines
             para_lines = []
             for raw_line in para.split("\n"):
@@ -482,15 +447,11 @@ def generate_contract_pdf(contract, template=None):
                 # Headings: "1. TERM" style OR all-caps
                 is_heading = (text[:1].isdigit() and ". " in text[:6]) or (text.isupper() and len(text) > 3)
                 if is_heading:
-                    # Section heading styling (bold + underline rule)
-                    c.setFillColor(accent)
+                    # Section heading styling (no rules/lines)
+                    c.setFillColor(ink)
                     c.setFont("Helvetica-Bold", 11.2)
                     c.drawString(margin, y, text)
-                    y -= 10
-                    c.setStrokeColor(line)
-                    c.setLineWidth(1)
-                    c.line(margin, y, width - margin, y)
-                    y -= 10
+                    y -= 18
                     c.setFillColor(ink)
                     c.setFont("Helvetica", 10)
                     continue
@@ -506,76 +467,64 @@ def generate_contract_pdf(contract, template=None):
             y -= 14  # paragraph spacing
 
         # ---------------------------------------------------------------------
-        # Signature block (two columns, styled)
-        # ---------------------------------------------------------------------
-        ensure_space(220)
+        # Signature block (two columns: employer left, employee right)
+        block_height = 140
+        ensure_space(block_height + 24)
 
-        sig_y_start = max(content_bottom + 160, y - 20)
-        col_gap = 14
-        col_width = (width - 2 * margin - col_gap) / 2
-        row_h = 13
+        y_sig = y - 6
+        if y_sig - block_height < content_bottom:
+            new_page()
+            y_sig = content_top - 10
 
-        def draw_person_block(info, x, y_top, label):
-            # Card
-            card_h = 170
-            c.setStrokeColor(line)
-            c.setLineWidth(1)
-            c.setFillColor(colors.white)
-            c.roundRect(x, y_top - card_h, col_width, card_h, 10, fill=1, stroke=1)
+        c.setFillColor(ink)
+        c.setFont("Helvetica-Bold", 11)
+        c.drawString(margin, y_sig, "Signatures")
+        y_sig -= 18
 
-            # Label
+        col_gap = 28
+        col_width = (width - (2 * margin) - col_gap) / 2
+        left_x = margin
+        right_x = margin + col_width + col_gap
+
+        def draw_signature_party(info, x, y_top, role_label):
+            row_h = 14
             c.setFillColor(ink)
             c.setFont("Helvetica-Bold", 10)
-            c.drawString(x + 10, y_top - 18, label)
+            c.drawString(x, y_top, role_label)
 
-            # Details
-            y_line = y_top - 36
             c.setFont("Helvetica", 9.5)
+            c.drawString(x, y_top - row_h, f"Name: {info['name'] or '-'}")
+            c.setFillColor(muted)
+            c.drawString(x, y_top - (2 * row_h), f"Email: {info['email'] or '-'}")
+            c.drawString(x, y_top - (3 * row_h), f"Phone: {info['phone'] or '-'}")
+            c.drawString(x, y_top - (4 * row_h), f"Date: {info['date'] or '-'}")
+
             c.setFillColor(ink)
-            c.drawString(x + 10, y_line, f"Name: {info['name']}"); y_line -= row_h
-            c.setFillColor(muted)
-            c.drawString(x + 10, y_line, f"Email: {info['email']}"); y_line -= row_h
-            c.drawString(x + 10, y_line, f"Phone: {info['phone']}"); y_line -= row_h
-
-            c.setFillColor(muted)
-            addr_lines = wrap_lines(f"Address: {info['address']}", "Helvetica", 9.5, col_width - 20, c)
-            for addr in addr_lines[:3]:
-                c.drawString(x + 10, y_line, addr)
-                y_line -= row_h
-
-            c.setFillColor(muted)
-            c.drawString(x + 10, y_line, f"Date: {info['date']}"); y_line -= (row_h + 8)
-
-            # Signature image
-            c.setFillColor(ink)
-            c.setFont("Helvetica-Bold", 9.5)
-            c.drawString(x + 10, y_line, "Signature:")
-            y_line -= 8
+            c.setFont("Helvetica", 9.5)
+            sig_label_y = y_top - (5 * row_h) - 4
+            c.drawString(x, sig_label_y, "Signature:")
 
             if info["sig_path"]:
                 try:
                     c.drawImage(
                         info["sig_path"],
-                        x + 10,
-                        y_top - card_h + 14,
-                        width=col_width - 20,
-                        height=52,
+                        x + 62,
+                        sig_label_y - 2,
+                        width=max(80, col_width - 72),
+                        height=24,
                         preserveAspectRatio=True,
                         mask="auto",
                     )
                 except Exception:
-                    c.setFont("Helvetica", 9.5)
                     c.setFillColor(muted)
-                    c.drawString(x + 10, y_top - card_h + 28, "Signature on file")
+                    c.drawString(x + 62, sig_label_y + 8, "Signature on file")
             else:
-                c.setFont("Helvetica", 9.5)
                 c.setFillColor(muted)
-                c.drawString(x + 10, y_top - card_h + 28, "Signature missing")
+                c.drawString(x + 62, sig_label_y + 8, "Signature missing")
 
-        draw_person_block(employer_info, margin, sig_y_start, "Employer")
-        draw_person_block(employee_info, margin + col_width + col_gap, sig_y_start, "Employee")
+        draw_signature_party(employer_info, left_x, y_sig, "Employer")
+        draw_signature_party(employee_info, right_x, y_sig, "Employee")
 
-        c.showPage()
         c.save()
 
         buffer.seek(0)
@@ -612,6 +561,8 @@ def generate_contract_pdf(contract, template=None):
         # DOCX path with python-docx
         try:
             from docx import Document
+            from docx.oxml import OxmlElement
+            from docx.oxml.ns import qn
             from docx.shared import Inches
 
             template.file.open("rb")
@@ -640,14 +591,17 @@ def generate_contract_pdf(contract, template=None):
                     if key in paragraph.text:
                         replace_text_in_paragraph(paragraph, key, value)
 
-                # Insert header table (side by side) just before INTRODUCTION & RECITALS
-                if "introduction & recitals" in lower_text:
-                    header_table = paragraph.insert_table_before(rows=2, cols=2)
-                    header_table.style = "Table Grid"
-                    header_table.cell(0, 0).text = f"Created by: {employer_info['name']}"
-                    header_table.cell(0, 1).text = f"Prepared for: {employee_info['name']}"
-                    header_table.cell(1, 0).text = f"Date: {employer_info['date']}"
-                    header_table.cell(1, 1).text = f"Date: {employee_info['date']}"
+            # Insert canonical parties metadata at the top of the document
+            if doc.paragraphs:
+                anchor = doc.paragraphs[0]
+                anchor.insert_paragraph_before("")
+                anchor.insert_paragraph_before(f"Employee date: {employee_info['date']}")
+                anchor.insert_paragraph_before(f"Employer date: {employer_info['date']}")
+                anchor.insert_paragraph_before(f"Prepared for: {employee_info['name']}")
+                anchor.insert_paragraph_before(f"Prepared by: {employer_info['name']}")
+                party_title = anchor.insert_paragraph_before("Contract Parties")
+                if party_title.runs:
+                    party_title.runs[0].bold = True
 
             for table in doc.tables:
                 for row in table.rows:
@@ -657,57 +611,45 @@ def generate_contract_pdf(contract, template=None):
                                 if key in paragraph.text:
                                     replace_text_in_paragraph(paragraph, key, value)
 
-            # Add signature table with employer left, employee right in required order
-            sig_table = doc.add_table(rows=7, cols=2)
-            sig_table.style = "Table Grid"
+            # Add signature section in two columns (Employer left, Employee right)
+            doc.add_paragraph("")
+            sig_title = doc.add_paragraph("Signatures")
+            if sig_title.runs:
+                sig_title.runs[0].bold = True
 
-            headers = ["Employer", "Employee"]
-            sig_table.cell(0, 0).text = headers[0]
-            sig_table.cell(0, 1).text = headers[1]
+            sig_table = doc.add_table(rows=1, cols=2)
 
-            values = [
-                ("Name", employer_info["name"], employee_info["name"]),
-                ("Email", employer_info["email"], employee_info["email"]),
-                ("Phone", employer_info["phone"], employee_info["phone"]),
-                ("Address", employer_info["address"], employee_info["address"]),
-                ("Date", employer_info["date"], employee_info["date"]),
-            ]
+            # Remove table borders to keep the section clean while preserving left/right layout.
+            tbl = sig_table._tbl
+            tbl_pr = tbl.tblPr
+            borders = OxmlElement("w:tblBorders")
+            for edge in ("top", "left", "bottom", "right", "insideH", "insideV"):
+                edge_tag = OxmlElement(f"w:{edge}")
+                edge_tag.set(qn("w:val"), "nil")
+                borders.append(edge_tag)
+            tbl_pr.append(borders)
 
-            for idx, (label, left_val, right_val) in enumerate(values, start=1):
-                left_para = sig_table.cell(idx, 0).paragraphs[0]
-                right_para = sig_table.cell(idx, 1).paragraphs[0]
+            def fill_signature_cell(cell, role_label, info):
+                cell.text = ""
+                role_para = cell.add_paragraph(role_label)
+                if role_para.runs:
+                    role_para.runs[0].bold = True
+                cell.add_paragraph(f"Name: {info['name'] or '-'}")
+                cell.add_paragraph(f"Email: {info['email'] or '-'}")
+                cell.add_paragraph(f"Phone: {info['phone'] or '-'}")
+                cell.add_paragraph(f"Date: {info['date'] or '-'}")
 
-                l_run_label = left_para.add_run(f"{label}: ")
-                r_run_label = right_para.add_run(f"{label}: ")
-                l_run_value = left_para.add_run(left_val)
-                r_run_value = right_para.add_run(right_val)
+                sig_para = cell.add_paragraph("Signature:")
+                if info["sig_path"]:
+                    try:
+                        sig_para.add_run().add_picture(info["sig_path"], width=Inches(2.0))
+                    except Exception:
+                        sig_para.add_run(" [Signature on file]")
+                else:
+                    sig_para.add_run(" Missing signature")
 
-                if label == "Name":
-                    l_run_label.bold = True
-                    l_run_value.bold = True
-                    r_run_label.bold = True
-                    r_run_value.bold = True
-
-            # Signature row (last row)
-            sig_row = sig_table.rows[-1]
-            sig_row.cells[0].text = "Signature:"
-            sig_row.cells[1].text = "Signature:"
-
-            if employer_info["sig_path"]:
-                try:
-                    sig_row.cells[0].paragraphs[0].add_run().add_picture(employer_info["sig_path"], width=Inches(2.0))
-                except Exception:
-                    sig_row.cells[0].paragraphs[0].add_run(" [Signature on file]")
-            else:
-                sig_row.cells[0].paragraphs[0].add_run(" Missing signature")
-
-            if employee_info["sig_path"]:
-                try:
-                    sig_row.cells[1].paragraphs[0].add_run().add_picture(employee_info["sig_path"], width=Inches(2.0))
-                except Exception:
-                    sig_row.cells[1].paragraphs[0].add_run(" [Signature on file]")
-            else:
-                sig_row.cells[1].paragraphs[0].add_run(" Missing signature")
+            fill_signature_cell(sig_table.cell(0, 0), "Employer", employer_info)
+            fill_signature_cell(sig_table.cell(0, 1), "Employee", employee_info)
 
             docx_io = BytesIO()
             doc.save(docx_io)
@@ -744,3 +686,4 @@ def generate_contract_pdf(contract, template=None):
     doc_obj.file.save(file_name, content_file, save=False)
     doc_obj.save(using=db_alias)
     return doc_obj
+

@@ -51,6 +51,7 @@ INSTALLED_APPS = [
     'accounts',
     'employees.apps.EmployeesConfig',
     'contracts',
+    'payroll.apps.PayrollConfig',
     'timeoff',
     'fleets.apps.FleetsConfig',
     'frontdesk',
@@ -59,7 +60,7 @@ INSTALLED_APPS = [
     'treasury.apps.TreasuryConfig',
     'income_expense.apps.IncomeExpenseConfig',
     'recruitment.apps.RecruitmentConfig',
-    'payroll.apps.PayrollConfig',
+    'assistant.apps.AssistantConfig',
 ]
 
 MIDDLEWARE = [
@@ -237,6 +238,13 @@ DEFAULT_FROM_EMAIL = config('DEFAULT_FROM_EMAIL', default='blair.keebler32@ether
 # Application Settings
 FRONTEND_URL = config('FRONTEND_URL', default='http://localhost:5173')
 ACTIVATION_TOKEN_EXPIRY_HOURS = 48
+
+# Assistant (LLM + retrieval)
+ASSISTANT_ENABLE_LLM = config('ASSISTANT_ENABLE_LLM', default=True, cast=bool)
+ASSISTANT_OPENAI_API_KEY = config('ASSISTANT_OPENAI_API_KEY', default='')
+ASSISTANT_OPENAI_MODEL = config('ASSISTANT_OPENAI_MODEL', default='gpt-4.1-mini')
+ASSISTANT_OPENAI_TEMPERATURE = config('ASSISTANT_OPENAI_TEMPERATURE', default=0.2, cast=float)
+ASSISTANT_OPENAI_MAX_TOKENS = config('ASSISTANT_OPENAI_MAX_TOKENS', default=700, cast=int)
 
 # Multi-tenancy Settings
 CURRENT_TENANT_DB = None  # Thread-local storage for current tenant database

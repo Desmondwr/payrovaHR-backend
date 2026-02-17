@@ -302,7 +302,7 @@ class CreateEmployeeSerializer(serializers.ModelSerializer):
             'job_title', 'employment_type', 'employment_status', 'hire_date',
             'probation_end_date',
             
-            # Payroll Information
+            # Compensation Information
             'bank_name', 'bank_account_number', 'bank_account_name',
             
             # Emergency Contact
@@ -635,7 +635,7 @@ class UpdateEmployeeSerializer(serializers.ModelSerializer):
             'job_title', 'department', 'branch', 'manager',
             'employment_type', 'employment_status', 'probation_end_date',
             
-            # Payroll Information
+            # Compensation Information
             'bank_name', 'bank_account_number', 'bank_account_name',
             
             # Emergency Contact
@@ -1017,7 +1017,7 @@ class CreateEmployeeWithDetectionSerializer(serializers.ModelSerializer):
             'job_title', 'employment_type', 'employment_status', 'hire_date',
             'probation_end_date', 'department', 'branch', 'manager',
             
-            # Payroll Information
+            # Compensation Information
             'bank_name', 'bank_account_number', 'bank_account_name',
             
             # Emergency Contact
@@ -1909,7 +1909,7 @@ class EmployeeProfileCompletionSerializer(serializers.ModelSerializer):
             # Legal Identification
             'national_id_number', 'passport_number', 'cnps_number', 'tax_number',
             
-            # Payroll Information
+            # Compensation Information
             'bank_name', 'bank_account_number', 'bank_account_name',
             
             # Emergency Contact
