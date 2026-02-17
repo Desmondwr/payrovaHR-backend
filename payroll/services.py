@@ -63,6 +63,18 @@ BASIS_ALIASES = {
     "NON-TAX": "SAL-NON-TAX",
 }
 
+DEFAULT_IRPP_WITHHOLDING_THRESHOLD = Decimal("62000.00")
+DEFAULT_CAC_RATE_PERCENTAGE = Decimal("10.00")
+
+SOCIAL_DEDUCTION_SYS_CODES = {
+    "AF",
+    "AT",
+    "CNPS",
+    "PENSION",
+    "PV",
+    "PVID",
+}
+
 
 def _to_decimal(value, default=Decimal("0.00")) -> Decimal:
     if value is None:
@@ -217,6 +229,16 @@ class PayrollCalculationService:
         except Exception:
             return raw == selected_text
 
+    def _is_element_effective_for_period(self, element: ContractElement) -> bool:
+        target = element.advantage or element.deduction
+        if not target:
+            return True
+        effective_from = getattr(target, "effective_from", None)
+        if not effective_from:
+            return True
+        _, month_end, _ = _month_bounds(self.year, self.month)
+        return effective_from <= month_end
+
     def _filter_elements(self, elements: Iterable[ContractElement]) -> List[ContractElement]:
         month_text = f"{self.month:02d}"
         year_text = str(self.year)
@@ -225,6 +247,8 @@ class PayrollCalculationService:
             if not self._matches_period_value(element.month, self.month, month_text):
                 continue
             if not self._matches_period_value(element.year, self.year, year_text):
+                continue
+            if not self._is_element_effective_for_period(element):
                 continue
             filtered.append(element)
         return filtered
@@ -539,8 +563,54 @@ class PayrollCalculationService:
             "SAL-BRUT-COT-AT": contribution_base,
         }
 
-    def _calculate_bases(self, advantage_lines: List[SalaryAdvantage], adjusted_basic_salary: Decimal) -> Dict[str, Decimal]:
-        membership = self._build_basis_membership()
+    def _is_basic_advantage_line(self, line: SalaryAdvantage) -> bool:
+        if line.allowance and self._is_basic_salary(line.allowance):
+            return True
+        return _normalize_sys_code(line.code) == "BASICSALARY"
+
+    def _sum_advantage_amounts(self, advantage_lines: List[SalaryAdvantage]) -> Decimal:
+        return sum((_to_decimal(line.amount) for line in advantage_lines), Decimal("0.00"))
+
+    def _sum_basic_advantages(self, advantage_lines: List[SalaryAdvantage]) -> Decimal:
+        total = Decimal("0.00")
+        for line in advantage_lines:
+            if self._is_basic_advantage_line(line):
+                total += _to_decimal(line.amount)
+        return total
+
+    def _line_matches_basis(self, line: SalaryAdvantage, basis_links: Dict[str, set]) -> bool:
+        if line.allowance_id and line.allowance_id in basis_links.get("allowance_ids", set()):
+            return True
+        normalized_code = _normalize_code(line.code)
+        if normalized_code and normalized_code in basis_links.get("codes", set()):
+            return True
+        return False
+
+    def _gross_basis_has_basic_mapping(
+        self,
+        *,
+        advantage_lines: List[SalaryAdvantage],
+        membership: Dict[str, Dict[str, set]],
+    ) -> bool:
+        sal_brut_links = membership.get("SAL-BRUT")
+        # If SAL-BRUT has no explicit mapping rows, fallback bases already include the basic component.
+        if not sal_brut_links:
+            return True
+
+        for line in advantage_lines:
+            if not self._is_basic_advantage_line(line):
+                continue
+            if self._line_matches_basis(line, sal_brut_links):
+                return True
+        return False
+
+    def _calculate_bases(
+        self,
+        advantage_lines: List[SalaryAdvantage],
+        adjusted_basic_salary: Decimal,
+        membership: Optional[Dict[str, Dict[str, set]]] = None,
+    ) -> Dict[str, Decimal]:
+        membership = membership or self._build_basis_membership()
         bases = {code: Decimal("0.00") for code in REQUIRED_BASIS_CODES}
 
         for line in advantage_lines:
@@ -566,7 +636,7 @@ class PayrollCalculationService:
         return bases
 
     def _resolve_scale_ranges(self, deduction: Deduction) -> List[ScaleRange]:
-        sys_code = _normalize_sys_code(deduction.sys or deduction.code)
+        sys_code = self._deduction_sys_code(deduction)
         raw_ref = str(getattr(deduction, "calculation_scale", "") or "").strip()
         if not raw_ref and sys_code == "IRPP":
             raw_ref = CAMEROON_IRPP_DEFAULT_SCALE_CODE
@@ -620,6 +690,20 @@ class PayrollCalculationService:
         self._ranges_cache[cache_key] = ranges
         return ranges
 
+    def _deduction_sys_code(self, deduction: Optional[Deduction]) -> str:
+        if not deduction:
+            return ""
+        candidates = [
+            getattr(deduction, "sys", None),
+            getattr(deduction, "code", None),
+            getattr(deduction, "name", None),
+        ]
+        for value in candidates:
+            normalized = _normalize_sys_code(value)
+            if normalized:
+                return normalized
+        return ""
+
     def _compute_scale_amount(self, deduction: Deduction, base_amount: Decimal) -> Decimal:
         ranges = self._resolve_scale_ranges(deduction)
         if not ranges:
@@ -662,6 +746,14 @@ class PayrollCalculationService:
         return _to_decimal(ordered[-1].indice, default=Decimal("0.00"))
 
     def _compute_irpp_progressive(self, deduction: Deduction, monthly_base: Decimal, pvid_amount: Decimal) -> Decimal:
+        monthly_base = _to_decimal(monthly_base, default=Decimal("0.00"))
+        irpp_withholding_threshold = _to_decimal(
+            getattr(self.config, "irpp_withholding_threshold", None),
+            default=DEFAULT_IRPP_WITHHOLDING_THRESHOLD,
+        )
+        if monthly_base <= irpp_withholding_threshold:
+            return Decimal("0.00")
+
         professional_expense = monthly_base * _to_decimal(self.config.professional_expense_rate) / Decimal("100")
         max_professional = _to_decimal(self.config.max_professional_expense_amount)
         if max_professional > 0 and professional_expense > max_professional:
@@ -714,7 +806,7 @@ class PayrollCalculationService:
         rate: Optional[Decimal],
         is_employee: bool,
         is_employer: bool,
-    ) -> None:
+    ) -> Decimal:
         rounded_amount = self._round_money(amount)
         lines.append(
             SalaryDeduction(
@@ -731,11 +823,184 @@ class PayrollCalculationService:
         )
 
         if deduction.is_count is False:
-            return
+            return rounded_amount
         if is_employee:
             totals["employee"] += rounded_amount
         if is_employer:
             totals["employer"] += rounded_amount
+        return rounded_amount
+
+    def _deduction_sort_key(self, element: ContractElement):
+        deduction = element.deduction
+        position = getattr(deduction, "position", None)
+        if position is None:
+            position = 1_000_000
+        sys_code = self._deduction_sys_code(deduction)
+        code = _normalize_code(getattr(deduction, "code", None) or getattr(deduction, "name", None))
+        deduction_id = str(getattr(deduction, "id", "") or "")
+        element_id = str(getattr(element, "id", "") or "")
+        return (int(position), sys_code, code, deduction_id, element_id)
+
+    def _is_social_deduction(self, deduction: Deduction, sys_code: str) -> bool:
+        if not deduction:
+            return False
+        if sys_code in SOCIAL_DEDUCTION_SYS_CODES or sys_code.startswith("CNPS"):
+            return True
+
+        haystack = " ".join(
+            [
+                str(getattr(deduction, "deduction_type", "") or "").upper(),
+                str(getattr(deduction, "name", "") or "").upper(),
+                str(getattr(deduction, "code", "") or "").upper(),
+                str(getattr(deduction, "sys", "") or "").upper(),
+            ]
+        )
+        if "IRPP" in haystack or "CAC" in haystack:
+            return False
+        return any(token in haystack for token in ["SOCIAL", "CNPS", "PENSION", "ACCIDENT", "FAMILY"])
+
+    def _compute_regular_deduction_element(
+        self,
+        *,
+        element: ContractElement,
+        lines: List[SalaryDeduction],
+        totals: Dict[str, Decimal],
+        bases: Dict[str, Decimal],
+        adjusted_basic_salary: Decimal,
+    ) -> Tuple[str, Decimal]:
+        deduction = element.deduction
+        if not deduction:
+            return "", Decimal("0.00")
+
+        sys_code = self._deduction_sys_code(deduction)
+        basis_code = deduction.calculation_basis or deduction.deduction_basis
+        if not basis_code and sys_code == "TDL":
+            basis_code = "SAL-BASE"
+        elif not basis_code and sys_code in {"RAV", "CRTV"}:
+            basis_code = "SAL-BRUT"
+        base_amount = self._resolve_basis_amount(
+            basis_code,
+            bases,
+            adjusted_basic_salary,
+        )
+
+        is_rate = bool(deduction.is_rate)
+        is_scale = bool(deduction.is_scale)
+        is_base_table = bool(deduction.is_base) and not is_rate and not is_scale
+        if not is_rate and not is_scale and not is_base_table:
+            if deduction.employee_rate is not None or deduction.employer_rate is not None:
+                is_rate = True
+            elif sys_code in {"TDL", "RAV", "CRTV"}:
+                is_base_table = True
+
+        apply_employee = deduction.is_employee if deduction.is_employee is not None else True
+        apply_employer = bool(deduction.is_employer)
+        if not apply_employee and not apply_employer:
+            apply_employee = True
+
+        total_employee_amount = Decimal("0.00")
+
+        if is_rate:
+            employee_rate = _to_decimal(element.employee_rate, default=_to_decimal(deduction.employee_rate))
+            employer_rate = _to_decimal(element.employer_rate, default=_to_decimal(deduction.employer_rate))
+            if apply_employee:
+                employee_amount = base_amount * employee_rate / Decimal("100")
+                total_employee_amount += self._append_deduction_line(
+                    lines,
+                    totals,
+                    deduction=deduction,
+                    base_amount=base_amount,
+                    amount=employee_amount,
+                    rate=employee_rate,
+                    is_employee=True,
+                    is_employer=False,
+                )
+            if apply_employer:
+                employer_amount = base_amount * employer_rate / Decimal("100")
+                self._append_deduction_line(
+                    lines,
+                    totals,
+                    deduction=deduction,
+                    base_amount=base_amount,
+                    amount=employer_amount,
+                    rate=employer_rate,
+                    is_employee=False,
+                    is_employer=True,
+                )
+        elif is_base_table:
+            amount = self._compute_base_table_amount(deduction, base_amount)
+            if apply_employee:
+                total_employee_amount += self._append_deduction_line(
+                    lines,
+                    totals,
+                    deduction=deduction,
+                    base_amount=base_amount,
+                    amount=amount,
+                    rate=None,
+                    is_employee=True,
+                    is_employer=False,
+                )
+            if apply_employer:
+                self._append_deduction_line(
+                    lines,
+                    totals,
+                    deduction=deduction,
+                    base_amount=base_amount,
+                    amount=amount,
+                    rate=None,
+                    is_employee=False,
+                    is_employer=True,
+                )
+        elif is_scale:
+            amount = self._compute_scale_amount(deduction, base_amount)
+            if apply_employee:
+                total_employee_amount += self._append_deduction_line(
+                    lines,
+                    totals,
+                    deduction=deduction,
+                    base_amount=base_amount,
+                    amount=amount,
+                    rate=None,
+                    is_employee=True,
+                    is_employer=False,
+                )
+            if apply_employer:
+                self._append_deduction_line(
+                    lines,
+                    totals,
+                    deduction=deduction,
+                    base_amount=base_amount,
+                    amount=amount,
+                    rate=None,
+                    is_employee=False,
+                    is_employer=True,
+                )
+        else:
+            fixed_amount = _to_decimal(element.amount, default=_to_decimal(deduction.amount))
+            if apply_employee:
+                total_employee_amount += self._append_deduction_line(
+                    lines,
+                    totals,
+                    deduction=deduction,
+                    base_amount=base_amount,
+                    amount=fixed_amount,
+                    rate=None,
+                    is_employee=True,
+                    is_employer=False,
+                )
+            if apply_employer:
+                self._append_deduction_line(
+                    lines,
+                    totals,
+                    deduction=deduction,
+                    base_amount=base_amount,
+                    amount=fixed_amount,
+                    rate=None,
+                    is_employee=False,
+                    is_employer=True,
+                )
+
+        return sys_code, self._round_money(total_employee_amount)
 
     def _compute_deductions(
         self,
@@ -748,133 +1013,34 @@ class PayrollCalculationService:
         totals = {"employee": Decimal("0.00"), "employer": Decimal("0.00")}
         computed_sys_amounts: Dict[str, Decimal] = {}
 
-        regular_elements: List[ContractElement] = []
+        social_elements: List[ContractElement] = []
+        other_elements: List[ContractElement] = []
         irpp_elements: List[ContractElement] = []
         cac_elements: List[ContractElement] = []
 
-        for element in deduction_elements:
+        for element in sorted(deduction_elements, key=self._deduction_sort_key):
             deduction = element.deduction
             if not deduction or not deduction.is_enable:
                 continue
-            sys_code = _normalize_sys_code(deduction.sys or deduction.code)
+            sys_code = self._deduction_sys_code(deduction)
             if sys_code == "IRPP":
                 irpp_elements.append(element)
             elif sys_code == "CAC":
                 cac_elements.append(element)
+            elif self._is_social_deduction(deduction, sys_code):
+                social_elements.append(element)
             else:
-                regular_elements.append(element)
+                other_elements.append(element)
 
-        for element in regular_elements:
-            deduction = element.deduction
-            if not deduction:
-                continue
-
-            sys_code = _normalize_sys_code(deduction.sys or deduction.code)
-            basis_code = deduction.calculation_basis or deduction.deduction_basis
-            if not basis_code and sys_code == "TDL":
-                basis_code = "SAL-BASE"
-            elif not basis_code and sys_code in {"RAV", "CRTV"}:
-                basis_code = "SAL-BRUT"
-            base_amount = self._resolve_basis_amount(
-                basis_code,
-                bases,
-                adjusted_basic_salary,
+        # Pass 1: social contributions (CNPS/PVID/etc.) so IRPP can subtract them.
+        for element in social_elements:
+            sys_code, employee_amount = self._compute_regular_deduction_element(
+                element=element,
+                lines=lines,
+                totals=totals,
+                bases=bases,
+                adjusted_basic_salary=adjusted_basic_salary,
             )
-
-            is_rate = bool(deduction.is_rate)
-            is_scale = bool(deduction.is_scale)
-            is_base_table = bool(deduction.is_base) and not is_rate and not is_scale
-            if not is_rate and not is_scale and not is_base_table:
-                if deduction.employee_rate is not None or deduction.employer_rate is not None:
-                    is_rate = True
-                elif sys_code in {"TDL", "RAV", "CRTV"}:
-                    is_base_table = True
-
-            apply_employee = deduction.is_employee if deduction.is_employee is not None else True
-            apply_employer = bool(deduction.is_employer)
-            if not apply_employee and not apply_employer:
-                apply_employee = True
-
-            employee_amount = Decimal("0.00")
-
-            if is_rate:
-                employee_rate = _to_decimal(element.employee_rate, default=_to_decimal(deduction.employee_rate))
-                employer_rate = _to_decimal(element.employer_rate, default=_to_decimal(deduction.employer_rate))
-                if apply_employee:
-                    employee_amount = base_amount * employee_rate / Decimal("100")
-                    self._append_deduction_line(
-                        lines,
-                        totals,
-                        deduction=deduction,
-                        base_amount=base_amount,
-                        amount=employee_amount,
-                        rate=employee_rate,
-                        is_employee=True,
-                        is_employer=False,
-                    )
-                if apply_employer:
-                    employer_amount = base_amount * employer_rate / Decimal("100")
-                    self._append_deduction_line(
-                        lines,
-                        totals,
-                        deduction=deduction,
-                        base_amount=base_amount,
-                        amount=employer_amount,
-                        rate=employer_rate,
-                        is_employee=False,
-                        is_employer=True,
-                    )
-            elif is_base_table:
-                amount = self._compute_base_table_amount(deduction, base_amount)
-                if apply_employee:
-                    employee_amount = amount
-                    self._append_deduction_line(
-                        lines,
-                        totals,
-                        deduction=deduction,
-                        base_amount=base_amount,
-                        amount=amount,
-                        rate=None,
-                        is_employee=True,
-                        is_employer=False,
-                    )
-                if apply_employer:
-                    self._append_deduction_line(
-                        lines,
-                        totals,
-                        deduction=deduction,
-                        base_amount=base_amount,
-                        amount=amount,
-                        rate=None,
-                        is_employee=False,
-                        is_employer=True,
-                    )
-            elif is_scale:
-                amount = self._compute_scale_amount(deduction, base_amount)
-                if apply_employee:
-                    employee_amount = amount
-                    self._append_deduction_line(
-                        lines,
-                        totals,
-                        deduction=deduction,
-                        base_amount=base_amount,
-                        amount=amount,
-                        rate=None,
-                        is_employee=True,
-                        is_employer=False,
-                    )
-                if apply_employer:
-                    self._append_deduction_line(
-                        lines,
-                        totals,
-                        deduction=deduction,
-                        base_amount=base_amount,
-                        amount=amount,
-                        rate=None,
-                        is_employee=False,
-                        is_employer=True,
-                    )
-
             if sys_code:
                 computed_sys_amounts[sys_code] = computed_sys_amounts.get(sys_code, Decimal("0.00")) + employee_amount
 
@@ -923,32 +1089,57 @@ class PayrollCalculationService:
                 continue
 
             irpp_amount = _to_decimal(computed_sys_amounts.get("IRPP"), default=Decimal("0.00"))
-            cac_amount = irpp_amount * Decimal("0.10")
 
             apply_employee = deduction.is_employee is not False
             apply_employer = bool(deduction.is_employer)
+            default_rate = _to_decimal(
+                getattr(self.config, "cac_rate_percentage", None),
+                default=DEFAULT_CAC_RATE_PERCENTAGE,
+            )
+            employee_rate = _to_decimal(
+                element.employee_rate,
+                default=_to_decimal(deduction.employee_rate, default=default_rate),
+            )
+            employer_rate = _to_decimal(
+                element.employer_rate,
+                default=_to_decimal(deduction.employer_rate, default=employee_rate),
+            )
             if apply_employee:
+                cac_amount = irpp_amount * employee_rate / Decimal("100")
                 self._append_deduction_line(
                     lines,
                     totals,
                     deduction=deduction,
                     base_amount=irpp_amount,
                     amount=cac_amount,
-                    rate=Decimal("10.00"),
+                    rate=employee_rate,
                     is_employee=True,
                     is_employer=False,
                 )
             if apply_employer:
+                cac_amount = irpp_amount * employer_rate / Decimal("100")
                 self._append_deduction_line(
                     lines,
                     totals,
                     deduction=deduction,
                     base_amount=irpp_amount,
                     amount=cac_amount,
-                    rate=Decimal("10.00"),
+                    rate=employer_rate,
                     is_employee=False,
                     is_employer=True,
                 )
+
+        # Pass 3: remaining non-social deductions.
+        for element in other_elements:
+            sys_code, employee_amount = self._compute_regular_deduction_element(
+                element=element,
+                lines=lines,
+                totals=totals,
+                bases=bases,
+                adjusted_basic_salary=adjusted_basic_salary,
+            )
+            if sys_code:
+                computed_sys_amounts[sys_code] = computed_sys_amounts.get(sys_code, Decimal("0.00")) + employee_amount
 
         return lines, totals
 
@@ -1062,8 +1253,21 @@ class PayrollCalculationService:
                 adjustments=adjustments,
             )
 
-            bases = self._calculate_bases(advantage_lines, adjusted_basic_salary)
+            membership = self._build_basis_membership()
+            bases = self._calculate_bases(
+                advantage_lines,
+                adjusted_basic_salary,
+                membership=membership,
+            )
             gross_salary = _to_decimal(bases.get("SAL-BRUT"), default=Decimal("0.00"))
+            basic_component = self._sum_basic_advantages(advantage_lines)
+            if basic_component > Decimal("0.00") and not self._gross_basis_has_basic_mapping(
+                advantage_lines=advantage_lines,
+                membership=membership,
+            ):
+                gross_salary += basic_component
+                bases["SAL-BRUT"] = gross_salary
+
             non_taxable_amount = _to_decimal(bases.get("SAL-NON-TAX"), default=Decimal("0.00"))
 
             if self.config.pit_gross_salary_percentage_mode:
@@ -1084,7 +1288,7 @@ class PayrollCalculationService:
                 adjusted_basic_salary=adjusted_basic_salary,
             )
 
-            total_advantages = sum((_to_decimal(line.amount) for line in advantage_lines), Decimal("0.00"))
+            total_advantages = self._sum_advantage_amounts(advantage_lines)
             total_employee_deductions = deduction_totals["employee"]
             total_employer_deductions = deduction_totals["employer"]
             net_salary = gross_salary - total_employee_deductions

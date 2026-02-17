@@ -54,6 +54,18 @@ class PayrollConfiguration(models.Model):
         decimal_places=2,
         default=Decimal("0.00"),
     )
+    irpp_withholding_threshold = models.DecimalField(
+        max_digits=12,
+        decimal_places=2,
+        default=Decimal("62000.00"),
+        help_text="Monthly taxable gross threshold below which IRPP withholding is not applied.",
+    )
+    cac_rate_percentage = models.DecimalField(
+        max_digits=6,
+        decimal_places=2,
+        default=Decimal("10.00"),
+        help_text="CAC rate as a percentage of IRPP amount.",
+    )
 
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
@@ -294,4 +306,3 @@ class SalaryDeduction(models.Model):
 
     def __str__(self):
         return f"{self.code} {self.amount}"
-

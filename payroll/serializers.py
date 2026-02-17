@@ -1,5 +1,6 @@
 from rest_framework import serializers
 
+from accounts.models import EmployerProfile
 from contracts.models import Allowance
 
 from .models import (
@@ -170,6 +171,17 @@ class SalarySummarySerializer(serializers.ModelSerializer):
 class SalaryDetailSerializer(serializers.ModelSerializer):
     employee_name = serializers.SerializerMethodField()
     employee_number = serializers.CharField(source="employee.employee_id", read_only=True)
+    contract_ref = serializers.CharField(source="contract.contract_id", read_only=True)
+    currency = serializers.CharField(source="contract.currency", read_only=True)
+    department_name = serializers.CharField(source="contract.department.name", read_only=True)
+    position = serializers.CharField(source="employee.job_title", read_only=True)
+    cnps_number = serializers.CharField(source="employee.cnps_number", read_only=True)
+    company_name = serializers.SerializerMethodField()
+    company_address = serializers.SerializerMethodField()
+    company_phone = serializers.SerializerMethodField()
+    company_email = serializers.SerializerMethodField()
+    company_logo = serializers.SerializerMethodField()
+    company_logo_url = serializers.SerializerMethodField()
     advantages = SalaryAdvantageSerializer(many=True, read_only=True)
     deductions = SalaryDeductionSerializer(many=True, read_only=True)
 
@@ -178,9 +190,20 @@ class SalaryDetailSerializer(serializers.ModelSerializer):
         fields = [
             "id",
             "contract",
+            "contract_ref",
             "employee",
             "employee_name",
             "employee_number",
+            "currency",
+            "department_name",
+            "position",
+            "cnps_number",
+            "company_name",
+            "company_address",
+            "company_phone",
+            "company_email",
+            "company_logo",
+            "company_logo_url",
             "year",
             "month",
             "status",
@@ -207,6 +230,68 @@ class SalaryDetailSerializer(serializers.ModelSerializer):
         return " ".join(
             part for part in [obj.employee.first_name, obj.employee.middle_name, obj.employee.last_name] if part
         )
+
+    def _get_employer_profile(self, obj):
+        employer_id = getattr(obj, "employer_id", None)
+        if not employer_id:
+            return None
+        cache = self.context.setdefault("_employer_profile_cache", {})
+        if employer_id not in cache:
+            cache[employer_id] = EmployerProfile.objects.filter(id=employer_id).first()
+        return cache[employer_id]
+
+    def get_company_name(self, obj):
+        employer = self._get_employer_profile(obj)
+        return getattr(employer, "company_name", "") if employer else ""
+
+    def get_company_address(self, obj):
+        employer = self._get_employer_profile(obj)
+        if not employer:
+            return ""
+        physical = str(getattr(employer, "physical_address", "") or "").strip()
+        location = str(getattr(employer, "company_location", "") or "").strip()
+        if physical and location:
+            return f"{physical}, {location}"
+        return physical or location or ""
+
+    def get_company_phone(self, obj):
+        employer = self._get_employer_profile(obj)
+        return str(getattr(employer, "phone_number", "") or "") if employer else ""
+
+    def get_company_email(self, obj):
+        employer = self._get_employer_profile(obj)
+        return str(getattr(employer, "official_company_email", "") or "") if employer else ""
+
+    def get_company_logo(self, obj):
+        employer = self._get_employer_profile(obj)
+        if not employer:
+            return ""
+        logo_field = getattr(employer, "company_logo", None)
+        if not logo_field:
+            return ""
+        try:
+            return logo_field.url or ""
+        except Exception:
+            return str(logo_field or "")
+
+    def get_company_logo_url(self, obj):
+        logo_path = self.get_company_logo(obj)
+        if not logo_path:
+            return ""
+        if str(logo_path).startswith("http://") or str(logo_path).startswith("https://"):
+            return logo_path
+
+        request = self.context.get("request")
+        if not request:
+            return logo_path
+
+        normalized_path = str(logo_path)
+        if not normalized_path.startswith("/"):
+            normalized_path = f"/{normalized_path}"
+        try:
+            return request.build_absolute_uri(normalized_path)
+        except Exception:
+            return logo_path
 
 
 class PayrollRunSerializer(serializers.Serializer):

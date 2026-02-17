@@ -25,6 +25,24 @@ from .serializers import (
 from .services import PayrollCalculationService, validate_payroll
 
 
+def _resolve_employee_tenant_db(employee):
+    tenant_db = get_current_tenant_db()
+    if tenant_db and tenant_db != "default":
+        return tenant_db
+
+    employer_id = getattr(employee, "employer_id", None)
+    if not employer_id:
+        return tenant_db or "default"
+
+    employer = EmployerProfile.objects.filter(id=employer_id).first()
+    if not employer:
+        return tenant_db or "default"
+
+    if employer.database_name:
+        return ensure_tenant_database_loaded(employer)
+    return get_tenant_database_alias(employer)
+
+
 class EmployerContextMixin:
     def _resolve_employer(self):
         user = self.request.user
@@ -152,7 +170,7 @@ class PayrollRunView(EmployerContextMixin, APIView):
         payload = []
         skipped = 0
         for result in results:
-            row = SalaryDetailSerializer(result.salary).data
+            row = SalaryDetailSerializer(result.salary, context={"request": request}).data
             row["outcome"] = result.outcome
             if result.reason:
                 row["reason"] = result.reason
@@ -224,7 +242,7 @@ class PayrollPayslipDetailView(EmployerContextMixin, APIView):
             id=salary_id,
             employer_id=employer_id,
         )
-        serializer = SalaryDetailSerializer(salary)
+        serializer = SalaryDetailSerializer(salary, context={"request": request})
         return api_response(success=True, message="Payslip retrieved.", data=serializer.data)
 
 
@@ -236,8 +254,11 @@ class PayrollMyPayslipListView(APIView):
         if not employee:
             raise PermissionDenied("Employee profile not available.")
 
-        tenant_db = get_current_tenant_db() or "default"
-        qs = Salary.objects.using(tenant_db).filter(employee=employee)
+        tenant_db = _resolve_employee_tenant_db(employee)
+        qs = Salary.objects.using(tenant_db).filter(
+            employee=employee,
+            status=Salary.STATUS_VALIDATED,
+        )
         year = request.query_params.get("year")
         month = request.query_params.get("month")
         if year:
@@ -261,9 +282,14 @@ class PayrollMyPayslipDetailView(APIView):
         if not employee:
             raise PermissionDenied("Employee profile not available.")
 
-        tenant_db = get_current_tenant_db() or "default"
-        salary = get_object_or_404(Salary.objects.using(tenant_db), id=salary_id, employee=employee)
-        serializer = SalaryDetailSerializer(salary)
+        tenant_db = _resolve_employee_tenant_db(employee)
+        salary = get_object_or_404(
+            Salary.objects.using(tenant_db),
+            id=salary_id,
+            employee=employee,
+            status=Salary.STATUS_VALIDATED,
+        )
+        serializer = SalaryDetailSerializer(salary, context={"request": request})
         return api_response(success=True, message="Payslip retrieved.", data=serializer.data)
 
 

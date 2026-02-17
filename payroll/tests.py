@@ -109,7 +109,7 @@ class PayrollFeatureTests(TestCase):
             allowance_code=allowance_code,
         )
 
-    def _create_allowance(self, *, name, code, amount, sys=None, type="FIXED"):
+    def _create_allowance(self, *, name, code, amount, sys=None, type="FIXED", effective_from=None):
         return Allowance.objects.create(
             contract=self.contract,
             name=name,
@@ -117,6 +117,7 @@ class PayrollFeatureTests(TestCase):
             type=type,
             amount=Decimal(str(amount)),
             sys=sys,
+            effective_from=effective_from,
             is_enable=True,
         )
 
@@ -167,11 +168,12 @@ class PayrollFeatureTests(TestCase):
             is_enable=True,
         )
 
-    def _add_deduction_element(self, deduction, month="__", year="__"):
-        ContractElement.objects.create(
+    def _add_deduction_element(self, deduction, month="__", year="__", amount=None):
+        deduction_amount = amount if amount is not None else getattr(deduction, "amount", Decimal("0.00"))
+        return ContractElement.objects.create(
             contract=self.contract,
             deduction=deduction,
-            amount=Decimal("0.00"),
+            amount=Decimal(str(deduction_amount or "0")),
             month=month,
             year=year,
             institution_id=self.employer.id,
@@ -240,6 +242,20 @@ class PayrollFeatureTests(TestCase):
         self.assertEqual(salary.contribution_base_at, Decimal("100000"))
         self.assertEqual(salary.net_salary, Decimal("120000"))
 
+    def test_gross_includes_basic_when_sal_brut_mapping_omits_basic(self):
+        basic = self._create_allowance(name="Basic Salary", code="BASIC", amount="100000", sys="BASIC_SALARY")
+        transport = self._create_allowance(name="Transport", code="TRSP", amount="20000")
+
+        self._link_basis("SAL-BRUT", allowance=transport)
+        self._link_basis("SAL-BRUT-TAX", allowance=transport)
+        self._link_basis("SAL-BRUT-TAX-IRPP", allowance=transport)
+
+        self._add_advantage_element(basic, amount="100000")
+        self._add_advantage_element(transport, amount="20000")
+
+        salary = self._run()
+        self.assertEqual(salary.gross_salary, Decimal("120000"))
+
     def test_default_basis_codes_are_seeded_automatically(self):
         CalculationBasis.objects.filter(employer_id=self.employer.id).delete()
 
@@ -279,6 +295,29 @@ class PayrollFeatureTests(TestCase):
         self.assertEqual(jan_salary.gross_salary, Decimal("105000"))
         self.assertEqual(feb_salary.gross_salary, Decimal("109000"))
 
+    def test_effective_from_applies_to_wildcard_elements(self):
+        basic = self._create_allowance(name="Basic Salary", code="BASIC", amount="100000", sys="BASIC_SALARY")
+        bonus = self._create_allowance(
+            name="Bonus",
+            code="BONUS",
+            amount="5000",
+            effective_from=date(2026, 2, 1),
+        )
+
+        self._link_basis("SAL-BRUT", allowance=basic)
+        self._link_basis("SAL-BRUT", allowance=bonus)
+        self._link_basis("SAL-BRUT-TAX", allowance=basic)
+        self._link_basis("SAL-BRUT-TAX-IRPP", allowance=basic)
+
+        self._add_advantage_element(basic, amount="100000", month="__", year="__")
+        self._add_advantage_element(bonus, amount="5000", month="__", year="__")
+
+        jan_salary = self._run(year=2026, month=1)
+        feb_salary = self._run(year=2026, month=2)
+
+        self.assertEqual(jan_salary.gross_salary, Decimal("100000"))
+        self.assertEqual(feb_salary.gross_salary, Decimal("105000"))
+
     def test_rate_deduction(self):
         basic = self._create_allowance(name="Basic Salary", code="BASIC", amount="100000", sys="BASIC_SALARY")
         self._link_basis("SAL-BRUT", allowance=basic)
@@ -298,6 +337,63 @@ class PayrollFeatureTests(TestCase):
         salary = self._run()
         line = SalaryDeduction.objects.get(salary=salary, code="CNPS_EMP")
         self.assertEqual(line.amount, Decimal("10000"))
+
+    def test_fixed_deduction_without_code_or_sys_uses_element_amount(self):
+        basic = self._create_allowance(name="Basic Salary", code="BASIC", amount="100000", sys="BASIC_SALARY")
+        self._link_basis("SAL-BRUT", allowance=basic)
+        self._link_basis("SAL-BRUT-TAX", allowance=basic)
+        self._link_basis("SAL-BRUT-TAX-IRPP", allowance=basic)
+        self._add_advantage_element(basic, amount="100000")
+
+        loan = self._create_deduction(
+            name="Staff Loan",
+            code="",
+            sys="",
+            calculation_basis="SAL-BRUT",
+            is_rate=False,
+            is_scale=False,
+            is_base=False,
+        )
+        self._add_deduction_element(loan, amount="5000")
+
+        salary = self._run()
+        line = SalaryDeduction.objects.get(salary=salary, name="Staff Loan")
+        self.assertEqual(line.amount, Decimal("5000"))
+        self.assertEqual(salary.total_employee_deductions, Decimal("5000"))
+        self.assertEqual(salary.net_salary, Decimal("95000"))
+
+    def test_irpp_and_cac_are_detected_from_name_when_code_is_blank(self):
+        self.config.irpp_withholding_threshold = Decimal("0.00")
+        self.config.save(update_fields=["irpp_withholding_threshold", "updated_at"])
+
+        basic = self._create_allowance(name="Basic Salary", code="BASIC", amount="100000", sys="BASIC_SALARY")
+        self._link_basis("SAL-BRUT", allowance=basic)
+        self._link_basis("SAL-BRUT-TAX", allowance=basic)
+        self._link_basis("SAL-BRUT-TAX-IRPP", allowance=basic)
+        self._add_advantage_element(basic, amount="100000")
+
+        irpp = self._create_deduction(
+            name="IRPP",
+            code="",
+            sys="",
+            calculation_basis="SAL-BRUT-TAX-IRPP",
+            is_scale=True,
+        )
+        cac = self._create_deduction(
+            name="CAC",
+            code="",
+            sys="",
+            calculation_basis="SAL-BRUT-TAX-IRPP",
+        )
+        self._add_deduction_element(irpp)
+        self._add_deduction_element(cac)
+
+        salary = self._run()
+        irpp_line = SalaryDeduction.objects.get(salary=salary, name="IRPP")
+        cac_line = SalaryDeduction.objects.get(salary=salary, name="CAC")
+
+        self.assertGreater(irpp_line.amount, Decimal("0"))
+        self.assertGreater(cac_line.amount, Decimal("0"))
 
     def test_scale_deduction(self):
         basic = self._create_allowance(name="Basic Salary", code="BASIC", amount="100000", sys="BASIC_SALARY")
@@ -333,6 +429,159 @@ class PayrollFeatureTests(TestCase):
         salary = self._run()
         line = SalaryDeduction.objects.get(salary=salary, code="SCALE")
         self.assertEqual(line.amount, Decimal("5000"))
+
+    def test_deductions_are_computed_in_social_irpp_cac_then_other_order(self):
+        basic = self._create_allowance(name="Basic Salary", code="BASIC", amount="100000", sys="BASIC_SALARY")
+        self._link_basis("SAL-BRUT", allowance=basic)
+        self._link_basis("SAL-BRUT-TAX", allowance=basic)
+        self._link_basis("SAL-BRUT-TAX-IRPP", allowance=basic)
+        self._add_advantage_element(basic, amount="100000")
+
+        pvid = self._create_deduction(
+            name="PVID",
+            code="PVID",
+            sys="PVID",
+            calculation_basis="SAL-BRUT",
+            is_rate=True,
+            employee_rate=Decimal("2.50"),
+        )
+        irpp = self._create_deduction(
+            name="IRPP",
+            code="IRPP",
+            sys="IRPP",
+            calculation_basis="SAL-BRUT-TAX-IRPP",
+            is_scale=True,
+            calculation_scale=None,
+        )
+        cac = self._create_deduction(
+            name="CAC",
+            code="CAC",
+            sys="CAC",
+            calculation_basis="SAL-BRUT-TAX-IRPP",
+        )
+        loan = self._create_deduction(
+            name="Loan",
+            code="LOAN",
+            calculation_basis="SAL-BRUT",
+            is_rate=True,
+            employee_rate=Decimal("5.00"),
+        )
+
+        loan_element = self._add_deduction_element(loan)
+        cac_element = self._add_deduction_element(cac)
+        irpp_element = self._add_deduction_element(irpp)
+        pvid_element = self._add_deduction_element(pvid)
+
+        service = PayrollCalculationService(
+            employer_id=self.employer.id,
+            year=self.year,
+            month=self.month,
+            tenant_db="default",
+        )
+        adjustments = service.build_monthly_adjustments(self.contract)
+        prorata = service._resolve_prorata_factor(self.contract, adjustments)
+        adjusted_basic_salary = self.contract.base_salary * prorata
+
+        advantage_elements = service._filter_elements(
+            ContractElement.objects.filter(
+                institution_id=self.employer.id,
+                contract=self.contract,
+                is_enable=True,
+                advantage__isnull=False,
+            ).select_related("advantage")
+        )
+        advantage_lines = service._build_advantage_lines(
+            contract=self.contract,
+            advantage_elements=advantage_elements,
+            adjusted_basic_salary=adjusted_basic_salary,
+            adjustments=adjustments,
+        )
+        bases = service._calculate_bases(advantage_lines, adjusted_basic_salary)
+
+        lines, _ = service._compute_deductions(
+            deduction_elements=[loan_element, cac_element, irpp_element, pvid_element],
+            bases=bases,
+            adjusted_basic_salary=adjusted_basic_salary,
+        )
+        self.assertEqual([line.code for line in lines], ["PVID", "IRPP", "CAC", "LOAN"])
+
+    def test_irpp_withholding_threshold_applies_below_62000(self):
+        basic = self._create_allowance(name="Basic Salary", code="BASIC", amount="60000", sys="BASIC_SALARY")
+        self.contract.base_salary = Decimal("60000.00")
+        self.contract.save()
+
+        self._link_basis("SAL-BRUT", allowance=basic)
+        self._link_basis("SAL-BRUT-TAX", allowance=basic)
+        self._link_basis("SAL-BRUT-TAX-IRPP", allowance=basic)
+        self._add_advantage_element(basic, amount="60000")
+
+        irpp = self._create_deduction(
+            name="IRPP",
+            code="IRPP",
+            sys="IRPP",
+            calculation_basis="SAL-BRUT-TAX-IRPP",
+            is_scale=True,
+            calculation_scale=None,
+            is_employee=True,
+        )
+        cac = self._create_deduction(
+            name="CAC",
+            code="CAC",
+            sys="CAC",
+            calculation_basis="SAL-BRUT-TAX-IRPP",
+            is_employee=True,
+        )
+        self._add_deduction_element(irpp)
+        self._add_deduction_element(cac)
+
+        salary = self._run()
+        irpp_line = SalaryDeduction.objects.get(salary=salary, code="IRPP")
+        cac_line = SalaryDeduction.objects.get(salary=salary, code="CAC")
+
+        self.assertEqual(irpp_line.amount, Decimal("0"))
+        self.assertEqual(cac_line.amount, Decimal("0"))
+        self.assertEqual(salary.net_salary, Decimal("60000"))
+
+    def test_irpp_threshold_and_cac_rate_are_configurable(self):
+        self.config.irpp_withholding_threshold = Decimal("0.00")
+        self.config.cac_rate_percentage = Decimal("12.50")
+        self.config.save(update_fields=["irpp_withholding_threshold", "cac_rate_percentage", "updated_at"])
+
+        basic = self._create_allowance(name="Basic Salary", code="BASIC", amount="60000", sys="BASIC_SALARY")
+        self.contract.base_salary = Decimal("60000.00")
+        self.contract.save()
+
+        self._link_basis("SAL-BRUT", allowance=basic)
+        self._link_basis("SAL-BRUT-TAX", allowance=basic)
+        self._link_basis("SAL-BRUT-TAX-IRPP", allowance=basic)
+        self._add_advantage_element(basic, amount="60000")
+
+        irpp = self._create_deduction(
+            name="IRPP",
+            code="IRPP",
+            sys="IRPP",
+            calculation_basis="SAL-BRUT-TAX-IRPP",
+            is_scale=True,
+            calculation_scale=None,
+            is_employee=True,
+        )
+        cac = self._create_deduction(
+            name="CAC",
+            code="CAC",
+            sys="CAC",
+            calculation_basis="SAL-BRUT-TAX-IRPP",
+            is_employee=True,
+        )
+        self._add_deduction_element(irpp)
+        self._add_deduction_element(cac)
+
+        salary = self._run()
+        irpp_line = SalaryDeduction.objects.get(salary=salary, code="IRPP")
+        cac_line = SalaryDeduction.objects.get(salary=salary, code="CAC")
+
+        self.assertEqual(irpp_line.amount, Decimal("6000"))
+        self.assertEqual(cac_line.amount, Decimal("750"))
+        self.assertEqual(cac_line.rate, Decimal("12.50"))
 
     def test_irpp_special_progressive_with_cac(self):
         basic = self._create_allowance(name="Basic Salary", code="BASIC", amount="300000", sys="BASIC_SALARY")

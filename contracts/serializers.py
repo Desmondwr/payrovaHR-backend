@@ -2,7 +2,6 @@ from rest_framework import serializers
 from rest_framework.exceptions import PermissionDenied
 from decimal import Decimal
 from django.db import transaction
-from django.utils import timezone
 from .models import (
     Contract, Allowance, Deduction, ContractElement, ContractAmendment,
     ContractConfiguration, SalaryScale, CalculationScale, ScaleRange,
@@ -440,18 +439,46 @@ class ContractSerializer(serializers.ModelSerializer):
 
         return data
 
-    def _resolve_element_period(self, contract):
-        period_date = getattr(contract, 'start_date', None) or timezone.now().date()
-        year = str(period_date.year)
-        month = f"{period_date.month:02d}"
+    def _normalize_element_period_values(self, year_value, month_value):
+        raw_year = str(year_value or '').strip()
+        raw_month = str(month_value or '').strip()
+
+        if raw_year == '__':
+            year = '__'
+        elif raw_year:
+            try:
+                year = str(int(raw_year))
+            except Exception:
+                year = '__'
+        else:
+            year = '__'
+
+        if raw_month == '__':
+            month = '__'
+        elif raw_month:
+            try:
+                month_number = int(raw_month)
+            except Exception:
+                month_number = 0
+            month = f"{month_number:02d}" if 1 <= month_number <= 12 else '__'
+        else:
+            month = '__'
+
         return year, month
 
-    def _build_element_from_allowance(self, contract, allowance, year, month):
+    def _resolve_component_period(self, component):
+        return self._normalize_element_period_values(
+            getattr(component, 'year', None),
+            getattr(component, 'month', None),
+        )
+
+    def _build_element_from_allowance(self, contract, allowance):
         sys_label = (allowance.sys or '').strip().upper()
         if sys_label == 'BASIC SALARY':
             amount = contract.base_salary
         else:
             amount = allowance.amount
+        year, month = self._resolve_component_period(allowance)
 
         return ContractElement(
             contract=contract,
@@ -467,7 +494,8 @@ class ContractSerializer(serializers.ModelSerializer):
             is_enable=allowance.is_enable,
         )
 
-    def _build_element_from_deduction(self, contract, deduction, year, month):
+    def _build_element_from_deduction(self, contract, deduction):
+        year, month = self._resolve_component_period(deduction)
         return ContractElement(
             contract=contract,
             deduction=deduction,
@@ -486,7 +514,6 @@ class ContractSerializer(serializers.ModelSerializer):
         if replace:
             ContractElement.objects.using(tenant_db).filter(contract=contract).delete()
 
-        year, month = self._resolve_element_period(contract)
         allowance_items = allowances
         deduction_items = deductions
 
@@ -497,9 +524,9 @@ class ContractSerializer(serializers.ModelSerializer):
 
         elements = []
         for allowance in allowance_items:
-            elements.append(self._build_element_from_allowance(contract, allowance, year, month))
+            elements.append(self._build_element_from_allowance(contract, allowance))
         for deduction in deduction_items:
-            elements.append(self._build_element_from_deduction(contract, deduction, year, month))
+            elements.append(self._build_element_from_deduction(contract, deduction))
 
         if elements:
             ContractElement.objects.using(tenant_db).bulk_create(elements)
