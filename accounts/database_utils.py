@@ -169,6 +169,7 @@ def run_migrations_on_tenant_database(db_name, employer_id):
         call_command('migrate', 'income_expense', database=alias, verbosity=2)
         call_command('migrate', 'recruitment', database=alias, verbosity=2)
         call_command('migrate', 'payroll', database=alias, verbosity=2)
+        call_command('migrate', 'communications', database=alias, verbosity=2)
         
         logger.info(f"Successfully ran migrations on database: {db_name}")
         return True
@@ -184,7 +185,10 @@ def get_tenant_database_alias(employer_profile):
     Returns 'default' if no tenant database exists
     """
     if employer_profile and employer_profile.database_name:
-        return f"tenant_{employer_profile.id}"
+        alias = f"tenant_{employer_profile.id}"
+        if alias not in settings.DATABASES:
+            ensure_tenant_database_loaded(employer_profile)
+        return alias
     return 'default'
 
 
