@@ -1,24 +1,17 @@
 from rest_framework import serializers
+from rest_framework.exceptions import PermissionDenied
 from decimal import Decimal
+from django.db import transaction
 from .models import (
-    Contract, Allowance, Deduction, ContractAmendment,
-    ContractConfiguration, SalaryScale, ContractTemplate, ContractTemplateVersion
+    Contract, Allowance, Deduction, ContractElement, ContractAmendment,
+    ContractConfiguration, SalaryScale, CalculationScale, ScaleRange,
+    ContractTemplate, ContractTemplateVersion
 )
-from payroll.models import Advantage as PayrollAdvantage
 from timeoff.defaults import merge_time_off_defaults, validate_time_off_config
 from accounts.rbac import get_active_employer, is_delegate_user
 from .configuration_defaults import CONFIGURATION_MERGE_FUNCTIONS
-from .payroll_sync import sync_contract_payroll_elements
 
 class AllowanceSerializer(serializers.ModelSerializer):
-    advantage = serializers.PrimaryKeyRelatedField(
-        queryset=PayrollAdvantage.objects.none(),
-        required=False,
-        allow_null=True,
-    )
-    advantage_name = serializers.CharField(source='advantage.name', read_only=True)
-    advantage_code = serializers.CharField(source='advantage.code', read_only=True)
-
     class Meta:
         model = Allowance
         exclude = ('contract', 'created_at', 'updated_at')
@@ -26,15 +19,6 @@ class AllowanceSerializer(serializers.ModelSerializer):
         extra_kwargs = {
             'name': {'required': False},
         }
-
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        tenant_db = self.context.get('tenant_db') or 'default'
-        employer_id = self.context.get('employer_id')
-        qs = PayrollAdvantage.objects.using(tenant_db)
-        if employer_id:
-            qs = qs.filter(employer_id=employer_id)
-        self.fields['advantage'].queryset = qs
 
 class DeductionSerializer(serializers.ModelSerializer):
     class Meta:
@@ -52,6 +36,61 @@ class SalaryScaleSerializer(serializers.ModelSerializer):
         tenant_db = self.context.get('tenant_db')
         if tenant_db:
             return SalaryScale.objects.using(tenant_db).create(**validated_data)
+        return super().create(validated_data)
+
+
+class CalculationScaleSerializer(serializers.ModelSerializer):
+    range_count = serializers.SerializerMethodField()
+
+    class Meta:
+        model = CalculationScale
+        fields = '__all__'
+        read_only_fields = ('id', 'employer_id', 'created_at', 'updated_at', 'range_count')
+
+    def get_range_count(self, obj):
+        try:
+            return obj.ranges.count()
+        except Exception:
+            return 0
+
+    def create(self, validated_data):
+        tenant_db = self.context.get('tenant_db')
+        if tenant_db:
+            return CalculationScale.objects.using(tenant_db).create(**validated_data)
+        return super().create(validated_data)
+
+
+class ScaleRangeSerializer(serializers.ModelSerializer):
+    calculation_scale_name = serializers.CharField(source='calculation_scale.name', read_only=True)
+    calculation_scale_code = serializers.CharField(source='calculation_scale.code', read_only=True)
+
+    class Meta:
+        model = ScaleRange
+        fields = '__all__'
+        read_only_fields = (
+            'id',
+            'employer_id',
+            'created_at',
+            'updated_at',
+            'calculation_scale_name',
+            'calculation_scale_code',
+        )
+
+    def validate_calculation_scale(self, value):
+        if value is None:
+            return value
+
+        employer_id = self.context.get('employer_id')
+        if employer_id is not None and value.employer_id != employer_id:
+            raise serializers.ValidationError(
+                'Selected calculation scale does not belong to the active employer.'
+            )
+        return value
+
+    def create(self, validated_data):
+        tenant_db = self.context.get('tenant_db')
+        if tenant_db:
+            return ScaleRange.objects.using(tenant_db).create(**validated_data)
         return super().create(validated_data)
 
 
@@ -161,7 +200,10 @@ class ContractSerializer(serializers.ModelSerializer):
             if getattr(request.user, 'employer_profile', None):
                 employer = request.user.employer_profile
             else:
-                resolved = get_active_employer(request, require_context=False)
+                try:
+                    resolved = get_active_employer(request, require_context=False)
+                except PermissionDenied:
+                    resolved = None
                 if resolved and is_delegate_user(request.user, resolved.id):
                     employer = resolved
 
@@ -206,7 +248,10 @@ class ContractSerializer(serializers.ModelSerializer):
             if getattr(request.user, 'employer_profile', None):
                 employer = request.user.employer_profile
             else:
-                resolved = get_active_employer(request, require_context=False)
+                try:
+                    resolved = get_active_employer(request, require_context=False)
+                except PermissionDenied:
+                    resolved = None
                 if resolved and is_delegate_user(request.user, resolved.id):
                     employer = resolved
             if employer:
@@ -320,13 +365,8 @@ class ContractSerializer(serializers.ModelSerializer):
             seen = set()
             duplicates = set()
             for allowance in allowances_data:
-                advantage_key = allowance.get('advantage')
-                if advantage_key:
-                    key = f"advantage:{advantage_key}"
-                    label = allowance.get('name') or str(advantage_key)
-                else:
-                    key = (allowance.get('name') or '').strip().lower()
-                    label = allowance.get('name') or key
+                key = (allowance.get('name') or '').strip().lower()
+                label = allowance.get('name') or key
                 if not key:
                     continue
                 if key in seen:
@@ -337,8 +377,8 @@ class ContractSerializer(serializers.ModelSerializer):
 
         if allowances_data:
             for allowance in allowances_data:
-                if not allowance.get('name') and not allowance.get('advantage'):
-                    add_error('allowances', 'Each allowance must include a name or advantage.')
+                if not allowance.get('name'):
+                    add_error('allowances', 'Each allowance must include a name.')
                     break
 
         allow_pct = config_get('allow_percentage_allowances', True)
@@ -399,6 +439,98 @@ class ContractSerializer(serializers.ModelSerializer):
 
         return data
 
+    def _normalize_element_period_values(self, year_value, month_value):
+        raw_year = str(year_value or '').strip()
+        raw_month = str(month_value or '').strip()
+
+        if raw_year == '__':
+            year = '__'
+        elif raw_year:
+            try:
+                year = str(int(raw_year))
+            except Exception:
+                year = '__'
+        else:
+            year = '__'
+
+        if raw_month == '__':
+            month = '__'
+        elif raw_month:
+            try:
+                month_number = int(raw_month)
+            except Exception:
+                month_number = 0
+            month = f"{month_number:02d}" if 1 <= month_number <= 12 else '__'
+        else:
+            month = '__'
+
+        return year, month
+
+    def _resolve_component_period(self, component):
+        return self._normalize_element_period_values(
+            getattr(component, 'year', None),
+            getattr(component, 'month', None),
+        )
+
+    def _build_element_from_allowance(self, contract, allowance):
+        sys_label = (allowance.sys or '').strip().upper()
+        if sys_label == 'BASIC SALARY':
+            amount = contract.base_salary
+        else:
+            amount = allowance.amount
+        year, month = self._resolve_component_period(allowance)
+
+        return ContractElement(
+            contract=contract,
+            advantage=allowance,
+            amount=amount or Decimal('0'),
+            year=year,
+            month=month,
+            employee_rate=None,
+            employer_rate=None,
+            institution_id=contract.employer_id,
+            branch=contract.branch,
+            user_id=contract.created_by,
+            is_enable=allowance.is_enable,
+        )
+
+    def _build_element_from_deduction(self, contract, deduction):
+        year, month = self._resolve_component_period(deduction)
+        return ContractElement(
+            contract=contract,
+            deduction=deduction,
+            amount=deduction.amount or Decimal('0'),
+            year=year,
+            month=month,
+            employee_rate=deduction.employee_rate,
+            employer_rate=deduction.employer_rate,
+            institution_id=contract.employer_id,
+            branch=contract.branch,
+            user_id=contract.created_by,
+            is_enable=deduction.is_enable,
+        )
+
+    def _sync_contract_elements(self, contract, tenant_db, allowances=None, deductions=None, replace=False):
+        if replace:
+            ContractElement.objects.using(tenant_db).filter(contract=contract).delete()
+
+        allowance_items = allowances
+        deduction_items = deductions
+
+        if allowance_items is None:
+            allowance_items = list(contract.allowances.using(tenant_db).all())
+        if deduction_items is None:
+            deduction_items = list(contract.deductions.using(tenant_db).all())
+
+        elements = []
+        for allowance in allowance_items:
+            elements.append(self._build_element_from_allowance(contract, allowance))
+        for deduction in deduction_items:
+            elements.append(self._build_element_from_deduction(contract, deduction))
+
+        if elements:
+            ContractElement.objects.using(tenant_db).bulk_create(elements)
+
     def create(self, validated_data):
         allowances_data = validated_data.pop('allowances', [])
         deductions_data = validated_data.pop('deductions', [])
@@ -444,24 +576,31 @@ class ContractSerializer(serializers.ModelSerializer):
                 validated_data['created_by'] = request.user.id
                 
                 tenant_db = get_tenant_database_alias(employer)
-                contract = Contract.objects.using(tenant_db).create(**validated_data)
-            
-                # Create nested objects
-                for allowance_data in allowances_data:
-                    advantage = allowance_data.get('advantage')
-                    if advantage and not allowance_data.get('name'):
-                        allowance_data['name'] = advantage.name
-                    if advantage and 'taxable' not in allowance_data:
-                        allowance_data['taxable'] = advantage.is_taxable
-                    if advantage and 'cnps_base' not in allowance_data:
-                        allowance_data['cnps_base'] = advantage.is_contributory
-                    Allowance.objects.using(tenant_db).create(contract=contract, **allowance_data)
-                    
-                for deduction_data in deductions_data:
-                    Deduction.objects.using(tenant_db).create(contract=contract, **deduction_data)
+                with transaction.atomic(using=tenant_db):
+                    contract = Contract.objects.using(tenant_db).create(**validated_data)
 
-                sync_contract_payroll_elements(contract, tenant_db=tenant_db)
-                    
+                    created_allowances = []
+                    created_deductions = []
+
+                    # Create nested objects
+                    for allowance_data in allowances_data:
+                        created_allowances.append(
+                            Allowance.objects.using(tenant_db).create(contract=contract, **allowance_data)
+                        )
+
+                    for deduction_data in deductions_data:
+                        created_deductions.append(
+                            Deduction.objects.using(tenant_db).create(contract=contract, **deduction_data)
+                        )
+
+                    self._sync_contract_elements(
+                        contract=contract,
+                        tenant_db=tenant_db,
+                        allowances=created_allowances,
+                        deductions=created_deductions,
+                        replace=False,
+                    )
+
                 return contract
             
         return super().create(validated_data)
@@ -469,15 +608,6 @@ class ContractSerializer(serializers.ModelSerializer):
     def update(self, instance, validated_data):
         allowances_data = validated_data.pop('allowances', None)
         deductions_data = validated_data.pop('deductions', None)
-        base_salary_changed = (
-            'base_salary' in validated_data
-            and validated_data.get('base_salary') != instance.base_salary
-        )
-        previous_allowance_advantage_ids = []
-        if allowances_data is not None or base_salary_changed:
-            previous_allowance_advantage_ids = list(
-                instance.allowances.all().values_list('advantage_id', flat=True)
-            )
         
         # Get tenant DB
         request = self.context.get('request')
@@ -494,41 +624,34 @@ class ContractSerializer(serializers.ModelSerializer):
             if employer:
                 tenant_db = get_tenant_database_alias(employer)
 
-        # Update contract fields
-        for attr, value in validated_data.items():
-            setattr(instance, attr, value)
-        instance.save(using=tenant_db)
+        with transaction.atomic(using=tenant_db):
+            # Update contract fields
+            for attr, value in validated_data.items():
+                setattr(instance, attr, value)
+            instance.save(using=tenant_db)
 
-        # Update nested allowances if provided
-        if allowances_data is not None:
-            # Delete existing
-            instance.allowances.all().using(tenant_db).delete()
-            # Create new
-            for allowance_data in allowances_data:
-                advantage = allowance_data.get('advantage')
-                if advantage and not allowance_data.get('name'):
-                    allowance_data['name'] = advantage.name
-                if advantage and 'taxable' not in allowance_data:
-                    allowance_data['taxable'] = advantage.is_taxable
-                if advantage and 'cnps_base' not in allowance_data:
-                    allowance_data['cnps_base'] = advantage.is_contributory
-                Allowance.objects.using(tenant_db).create(contract=instance, **allowance_data)
+            # Update nested allowances if provided
+            if allowances_data is not None:
+                # Delete existing
+                instance.allowances.all().using(tenant_db).delete()
+                # Create new
+                for allowance_data in allowances_data:
+                    Allowance.objects.using(tenant_db).create(contract=instance, **allowance_data)
 
-        # Update nested deductions if provided
-        if deductions_data is not None:
-             # Delete existing
-            instance.deductions.all().using(tenant_db).delete()
-            # Create new
-            for deduction_data in deductions_data:
-                Deduction.objects.using(tenant_db).create(contract=instance, **deduction_data)
+            # Update nested deductions if provided
+            if deductions_data is not None:
+                # Delete existing
+                instance.deductions.all().using(tenant_db).delete()
+                # Create new
+                for deduction_data in deductions_data:
+                    Deduction.objects.using(tenant_db).create(contract=instance, **deduction_data)
 
-        sync_contract_payroll_elements(
-            instance,
-            tenant_db=tenant_db,
-            sync_allowances=allowances_data is not None or base_salary_changed,
-            sync_deductions=deductions_data is not None,
-            previous_allowance_advantage_ids=previous_allowance_advantage_ids,
-        )
+            if allowances_data is not None or deductions_data is not None:
+                self._sync_contract_elements(
+                    contract=instance,
+                    tenant_db=tenant_db,
+                    replace=True,
+                )
 
         return instance
 

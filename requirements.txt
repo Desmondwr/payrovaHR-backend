@@ -20,3 +20,6 @@ django-anymail>=10.2
 # Throttling and Security
 django-ratelimit>=4.1.0
 
+# Assistant LLM provider
+openai>=1.61.0
+

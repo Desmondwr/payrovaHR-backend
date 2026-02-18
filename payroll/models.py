@@ -22,15 +22,50 @@ class PayrollConfiguration(models.Model):
     module_enabled = models.BooleanField(default=True)
     default_currency = models.CharField(max_length=10, default="XAF")
 
-    rounding_scale = models.IntegerField(default=0, help_text="Number of decimal places for money rounding.")
-    rounding_mode = models.CharField(max_length=10, choices=ROUNDING_CHOICES, default=ROUND_HALF_UP)
+    rounding_scale = models.IntegerField(
+        default=0,
+        help_text="Number of decimal places for money rounding.",
+    )
+    rounding_mode = models.CharField(
+        max_length=10,
+        choices=ROUNDING_CHOICES,
+        default=ROUND_HALF_UP,
+    )
 
     pit_gross_salary_percentage_mode = models.BooleanField(default=False)
-    pit_gross_salary_percentage = models.DecimalField(max_digits=6, decimal_places=2, default=Decimal("0.00"))
+    pit_gross_salary_percentage = models.DecimalField(
+        max_digits=6,
+        decimal_places=2,
+        default=Decimal("0.00"),
+    )
 
-    professional_expense_rate = models.DecimalField(max_digits=6, decimal_places=2, default=Decimal("0.00"))
-    max_professional_expense_amount = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal("0.00"))
-    tax_exempt_threshold = models.DecimalField(max_digits=12, decimal_places=2, default=Decimal("0.00"))
+    professional_expense_rate = models.DecimalField(
+        max_digits=6,
+        decimal_places=2,
+        default=Decimal("0.00"),
+    )
+    max_professional_expense_amount = models.DecimalField(
+        max_digits=12,
+        decimal_places=2,
+        default=Decimal("0.00"),
+    )
+    tax_exempt_threshold = models.DecimalField(
+        max_digits=12,
+        decimal_places=2,
+        default=Decimal("0.00"),
+    )
+    irpp_withholding_threshold = models.DecimalField(
+        max_digits=12,
+        decimal_places=2,
+        default=Decimal("62000.00"),
+        help_text="Monthly taxable gross threshold below which IRPP withholding is not applied.",
+    )
+    cac_rate_percentage = models.DecimalField(
+        max_digits=6,
+        decimal_places=2,
+        default=Decimal("10.00"),
+        help_text="CAC rate as a percentage of IRPP amount.",
+    )
 
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
@@ -49,127 +84,6 @@ class PayrollConfiguration(models.Model):
 
     def __str__(self):
         return f"Payroll Config ({self.employer_id})"
-
-
-class Advantage(models.Model):
-    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    employer_id = models.IntegerField(db_index=True)
-    code = models.CharField(max_length=50)
-    name = models.CharField(max_length=255)
-    sys_code = models.CharField(max_length=50, blank=True, null=True)
-    is_manual = models.BooleanField(default=False)
-    is_taxable = models.BooleanField(default=True)
-    is_contributory = models.BooleanField(default=True)
-    is_active = models.BooleanField(default=True)
-    created_at = models.DateTimeField(auto_now_add=True)
-    updated_at = models.DateTimeField(auto_now=True)
-
-    class Meta:
-        db_table = "payroll_advantages"
-        verbose_name = "Advantage"
-        verbose_name_plural = "Advantages"
-        unique_together = [["employer_id", "code"]]
-        indexes = [
-            models.Index(fields=["employer_id", "is_active"]),
-            models.Index(fields=["employer_id", "sys_code"]),
-        ]
-
-    def __str__(self):
-        return f"{self.code} - {self.name}"
-
-
-class CalculationScale(models.Model):
-    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    employer_id = models.IntegerField(db_index=True)
-    code = models.CharField(max_length=50)
-    name = models.CharField(max_length=255)
-    description = models.TextField(blank=True, null=True)
-    is_active = models.BooleanField(default=True)
-    created_at = models.DateTimeField(auto_now_add=True)
-    updated_at = models.DateTimeField(auto_now=True)
-
-    class Meta:
-        db_table = "payroll_scales"
-        verbose_name = "Calculation Scale"
-        verbose_name_plural = "Calculation Scales"
-        unique_together = [["employer_id", "code"]]
-        indexes = [
-            models.Index(fields=["employer_id", "is_active"]),
-        ]
-
-    def __str__(self):
-        return f"{self.code} - {self.name}"
-
-
-class ScaleRange(models.Model):
-    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    employer_id = models.IntegerField(db_index=True)
-    scale = models.ForeignKey(
-        CalculationScale,
-        on_delete=models.CASCADE,
-        related_name="ranges",
-    )
-    range_min = models.DecimalField(max_digits=20, decimal_places=2, default=Decimal("0.00"))
-    range_max = models.DecimalField(max_digits=20, decimal_places=2, blank=True, null=True)
-    coefficient = models.DecimalField(max_digits=7, decimal_places=4, default=Decimal("0.0000"))
-    indice = models.DecimalField(max_digits=20, decimal_places=2, default=Decimal("0.00"))
-    base_threshold = models.DecimalField(max_digits=20, decimal_places=2, default=Decimal("0.00"))
-    position = models.IntegerField(default=0)
-    is_active = models.BooleanField(default=True)
-    created_at = models.DateTimeField(auto_now_add=True)
-    updated_at = models.DateTimeField(auto_now=True)
-
-    class Meta:
-        db_table = "payroll_scale_ranges"
-        verbose_name = "Scale Range"
-        verbose_name_plural = "Scale Ranges"
-        unique_together = [["scale", "position"]]
-        indexes = [
-            models.Index(fields=["employer_id", "scale"]),
-        ]
-
-    def __str__(self):
-        return f"{self.scale.code} #{self.position}"
-
-
-class Deduction(models.Model):
-    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    employer_id = models.IntegerField(db_index=True)
-    code = models.CharField(max_length=50)
-    name = models.CharField(max_length=255)
-    sys_code = models.CharField(max_length=50, blank=True, null=True)
-    is_employee = models.BooleanField(default=True)
-    is_employer = models.BooleanField(default=False)
-    is_count = models.BooleanField(default=True)
-    calculation_basis_code = models.CharField(max_length=50, blank=True, null=True)
-    employee_rate = models.DecimalField(max_digits=7, decimal_places=4, blank=True, null=True)
-    employer_rate = models.DecimalField(max_digits=7, decimal_places=4, blank=True, null=True)
-    scale = models.ForeignKey(
-        CalculationScale,
-        on_delete=models.SET_NULL,
-        blank=True,
-        null=True,
-        related_name="deductions",
-    )
-    is_rate = models.BooleanField(default=False)
-    is_scale = models.BooleanField(default=False)
-    is_base_table = models.BooleanField(default=False)
-    is_active = models.BooleanField(default=True)
-    created_at = models.DateTimeField(auto_now_add=True)
-    updated_at = models.DateTimeField(auto_now=True)
-
-    class Meta:
-        db_table = "payroll_deductions"
-        verbose_name = "Deduction"
-        verbose_name_plural = "Deductions"
-        unique_together = [["employer_id", "code"]]
-        indexes = [
-            models.Index(fields=["employer_id", "is_active"]),
-            models.Index(fields=["employer_id", "sys_code"]),
-        ]
-
-    def __str__(self):
-        return f"{self.code} - {self.name}"
 
 
 class CalculationBasis(models.Model):
@@ -191,21 +105,35 @@ class CalculationBasis(models.Model):
         ]
 
     def __str__(self):
-        return f"{self.code}"
+        return self.code
 
 
 class CalculationBasisAdvantage(models.Model):
+    """
+    Basis membership rows.
+    Uses existing contract allowances instead of introducing a new Advantage table.
+    """
+
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     employer_id = models.IntegerField(db_index=True)
     basis = models.ForeignKey(
         CalculationBasis,
         on_delete=models.CASCADE,
-        related_name="advantage_links",
+        related_name="allowance_links",
     )
-    advantage = models.ForeignKey(
-        Advantage,
+    allowance = models.ForeignKey(
+        "contracts.Allowance",
         on_delete=models.CASCADE,
         related_name="basis_links",
+        null=True,
+        blank=True,
+        help_text="Optional direct link to an allowance.",
+    )
+    allowance_code = models.CharField(
+        max_length=255,
+        null=True,
+        blank=True,
+        help_text="Optional code-based mapping when allowance rows differ per contract.",
     )
     is_active = models.BooleanField(default=True)
     created_at = models.DateTimeField(auto_now_add=True)
@@ -215,61 +143,32 @@ class CalculationBasisAdvantage(models.Model):
         db_table = "payroll_basis_advantages"
         verbose_name = "Calculation Basis Advantage"
         verbose_name_plural = "Calculation Basis Advantages"
-        unique_together = [["employer_id", "basis", "advantage"]]
-
-    def __str__(self):
-        return f"{self.basis.code} -> {self.advantage.code}"
-
-
-class PayrollElement(models.Model):
-    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    employer_id = models.IntegerField(db_index=True)
-    contract = models.ForeignKey(
-        "contracts.Contract",
-        on_delete=models.CASCADE,
-        related_name="payroll_elements",
-    )
-    advantage = models.ForeignKey(
-        Advantage,
-        on_delete=models.SET_NULL,
-        null=True,
-        blank=True,
-        related_name="elements",
-    )
-    deduction = models.ForeignKey(
-        Deduction,
-        on_delete=models.SET_NULL,
-        null=True,
-        blank=True,
-        related_name="elements",
-    )
-    amount = models.DecimalField(max_digits=20, decimal_places=2, default=Decimal("0.00"))
-    month = models.CharField(max_length=2, default="__")
-    year = models.CharField(max_length=4, default="__")
-    is_active = models.BooleanField(default=True)
-    created_at = models.DateTimeField(auto_now_add=True)
-    updated_at = models.DateTimeField(auto_now=True)
-
-    class Meta:
-        db_table = "payroll_elements"
-        verbose_name = "Payroll Element"
-        verbose_name_plural = "Payroll Elements"
         constraints = [
             models.CheckConstraint(
                 check=(
-                    (Q(advantage__isnull=False) & Q(deduction__isnull=True))
-                    | (Q(advantage__isnull=True) & Q(deduction__isnull=False))
+                    (Q(allowance__isnull=False) & Q(allowance_code__isnull=True))
+                    | (Q(allowance__isnull=True) & Q(allowance_code__isnull=False))
                 ),
-                name="payroll_element_single_target",
-            )
+                name="payroll_basis_advantage_single_mapping",
+            ),
+            models.UniqueConstraint(
+                fields=["employer_id", "basis", "allowance"],
+                condition=Q(allowance__isnull=False),
+                name="uniq_payroll_basis_allowance_link",
+            ),
+            models.UniqueConstraint(
+                fields=["employer_id", "basis", "allowance_code"],
+                condition=Q(allowance_code__isnull=False),
+                name="uniq_payroll_basis_allowance_code_link",
+            ),
         ]
         indexes = [
-            models.Index(fields=["employer_id", "contract"]),
+            models.Index(fields=["employer_id", "is_active"]),
         ]
 
     def __str__(self):
-        target = self.advantage.code if self.advantage_id else self.deduction.code
-        return f"{self.contract_id} -> {target}"
+        target = self.allowance_code or getattr(self.allowance, "code", None) or self.allowance_id
+        return f"{self.basis.code} -> {target}"
 
 
 class Salary(models.Model):
@@ -299,7 +198,11 @@ class Salary(models.Model):
     )
     year = models.IntegerField()
     month = models.IntegerField()
-    status = models.CharField(max_length=15, choices=STATUS_CHOICES, default=STATUS_SIMULATED)
+    status = models.CharField(
+        max_length=15,
+        choices=STATUS_CHOICES,
+        default=STATUS_SIMULATED,
+    )
 
     base_salary = models.DecimalField(max_digits=20, decimal_places=2, default=Decimal("0.00"))
     gross_salary = models.DecimalField(max_digits=20, decimal_places=2, default=Decimal("0.00"))
@@ -331,15 +234,24 @@ class Salary(models.Model):
         ]
 
     def __str__(self):
-        return f"Salary {self.contract_id} {self.month}/{self.year}"
+        return f"Salary {self.contract_id} {self.month:02d}/{self.year}"
 
 
 class SalaryAdvantage(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     employer_id = models.IntegerField(db_index=True)
-    salary = models.ForeignKey(Salary, on_delete=models.CASCADE, related_name="advantages")
-    advantage = models.ForeignKey(Advantage, on_delete=models.SET_NULL, null=True, blank=True)
-    code = models.CharField(max_length=50)
+    salary = models.ForeignKey(
+        Salary,
+        on_delete=models.CASCADE,
+        related_name="advantages",
+    )
+    allowance = models.ForeignKey(
+        "contracts.Allowance",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+    )
+    code = models.CharField(max_length=255)
     name = models.CharField(max_length=255)
     base = models.DecimalField(max_digits=20, decimal_places=2, null=True, blank=True)
     amount = models.DecimalField(max_digits=20, decimal_places=2, default=Decimal("0.00"))
@@ -362,9 +274,18 @@ class SalaryAdvantage(models.Model):
 class SalaryDeduction(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     employer_id = models.IntegerField(db_index=True)
-    salary = models.ForeignKey(Salary, on_delete=models.CASCADE, related_name="deductions")
-    deduction = models.ForeignKey(Deduction, on_delete=models.SET_NULL, null=True, blank=True)
-    code = models.CharField(max_length=50)
+    salary = models.ForeignKey(
+        Salary,
+        on_delete=models.CASCADE,
+        related_name="deductions",
+    )
+    deduction = models.ForeignKey(
+        "contracts.Deduction",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+    )
+    code = models.CharField(max_length=255)
     name = models.CharField(max_length=255)
     base_amount = models.DecimalField(max_digits=20, decimal_places=2, default=Decimal("0.00"))
     rate = models.DecimalField(max_digits=7, decimal_places=4, null=True, blank=True)

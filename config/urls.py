@@ -24,6 +24,7 @@ urlpatterns = [
     path('api/', include('accounts.urls')),
     path('api/employees/', include('employees.urls')),
     path('api/contracts/', include('contracts.urls')),
+    path('api/payroll/', include('payroll.urls')),
     path('api/timeoff/', include('timeoff.urls')),
     path('api/fleets/', include('fleets.urls')),
     path('api/frontdesk/', include('frontdesk.urls')),
@@ -34,10 +35,10 @@ urlpatterns = [
     path('api/config/treasury/', include('treasury.config_urls')),
     path('api/treasury/', include('treasury.urls')),
     path('api/income-expense/', include('income_expense.urls')),
+    path('api/assistant/', include('assistant.urls')),
     path('api/v1/recruitment/', include('recruitment.urls')),
     path('api/v1/public/', include('recruitment.public_urls')),
     path('api/v1/internal/', include('recruitment.internal_urls')),
-    path('api/payroll/', include('payroll.urls')),
 ]
 
 # Serve media files in development

@@ -122,7 +122,7 @@ class EmployeeAdmin(admin.ModelAdmin):
                       'employment_status', 'hire_date', 'probation_end_date',
                       'termination_date', 'termination_reason')
         }),
-        ('Payroll Information', {
+        ('Compensation Information', {
             'fields': ('bank_name', 'bank_account_number', 'bank_account_name')
         }),
         ('Emergency Contact', {

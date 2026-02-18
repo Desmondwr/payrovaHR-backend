@@ -1,14 +1,17 @@
 from rest_framework import viewsets, permissions, status
 from rest_framework.decorators import action
 from rest_framework.response import Response
+from rest_framework.exceptions import PermissionDenied
 from .models import (
     Contract, ContractConfiguration, ContractTemplate, ContractTemplateVersion, SalaryScale,
-    ContractDocument, ContractSignature
+    CalculationScale, ScaleRange, ContractDocument, ContractSignature
 )
 from .serializers import (
     ContractSerializer,
     ContractConfigurationSerializer,
     SalaryScaleSerializer,
+    CalculationScaleSerializer,
+    ScaleRangeSerializer,
     ContractTemplateSerializer,
     ContractTemplateVersionSerializer,
 )
@@ -20,6 +23,7 @@ from .notifications import (
     notify_expired,
     notify_renewed,
 )
+from .payroll_defaults import ensure_cameroon_default_scales
 from timeoff.defaults import merge_time_off_defaults
 from django.utils import timezone
 from django.core.exceptions import ValidationError
@@ -121,7 +125,10 @@ class ContractViewSet(viewsets.ModelViewSet):
         if user.is_authenticated and getattr(user, 'employer_profile', None):
             employer = user.employer_profile
         else:
-            resolved = get_active_employer(self.request, require_context=False)
+            try:
+                resolved = get_active_employer(self.request, require_context=False)
+            except PermissionDenied:
+                resolved = None
             if resolved and (user.is_admin or user.is_superuser or is_delegate_user(user, resolved.id)):
                 employer = resolved
 
@@ -346,16 +353,12 @@ class ContractViewSet(viewsets.ModelViewSet):
     def sign_contract(self, request, pk=None):
         """
         Sign the contract.
-        Requires 'signature_text' in body.
+        Employer signing uses the signature already saved on the user's profile.
         'document_hash' is optional.
         """
         contract = self.get_object()
         self._set_tenant_context(contract)
         user = request.user
-
-        signature_text = request.data.get('signature_text')
-        if not signature_text:
-            return Response({'error': 'Signature text is required.'}, status=status.HTTP_400_BAD_REQUEST)
 
         role = None
         if contract.employee and contract.employee.user_id == user.id:
@@ -365,6 +368,25 @@ class ContractViewSet(viewsets.ModelViewSet):
 
         if not role:
             return Response({'error': 'You are not authorized to sign this contract.'}, status=status.HTTP_403_FORBIDDEN)
+
+        signature_on_file = self._get_user_signature_path(user.id)
+        if role == 'EMPLOYER':
+            if not signature_on_file:
+                return Response(
+                    {'error': 'Employer signature on file is required. Please upload your signature first.'},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            signature_text = 'Employer signature on file'
+        else:
+            signature_text = request.data.get('signature_text')
+            if not signature_text:
+                if signature_on_file:
+                    signature_text = 'Employee signature on file'
+                else:
+                    return Response(
+                        {'error': 'Signature text is required.'},
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
 
         x_forwarded_for = request.META.get('HTTP_X_FORWARDED_FOR')
         if x_forwarded_for:
@@ -389,6 +411,9 @@ class ContractViewSet(viewsets.ModelViewSet):
                     status=status.HTTP_400_BAD_REQUEST
                 )
 
+        document_hash_raw = request.data.get('document_hash')
+        document_hash = f"{document_hash_raw}".strip() if document_hash_raw is not None else ''
+
         signature = ContractSignature.objects.using(db_alias).create(
             contract=contract,
             signer_user_id=user.id,
@@ -400,7 +425,7 @@ class ContractViewSet(viewsets.ModelViewSet):
             signature_method=request.data.get('signature_method'),
             signature_audit_id=request.data.get('signature_audit_id'),
             signed_document=signed_document,
-            document_hash=request.data.get('document_hash')
+            document_hash=document_hash
         )
 
         try:
@@ -956,6 +981,139 @@ class SalaryScaleViewSet(viewsets.ModelViewSet):
     def perform_create(self, serializer):
         employer = get_active_employer(self.request, require_context=True)
         serializer.save(employer_id=employer.id)
+
+    def perform_update(self, serializer):
+        serializer.save()
+
+    def perform_destroy(self, instance):
+        from accounts.database_utils import get_tenant_database_alias
+        employer = get_active_employer(self.request, require_context=True)
+        tenant_db = get_tenant_database_alias(employer)
+        instance.delete(using=tenant_db)
+
+
+class CalculationScaleViewSet(viewsets.ModelViewSet):
+    """API endpoint for managing calculation scales."""
+
+    permission_classes = [permissions.IsAuthenticated, EmployerAccessPermission]
+    permission_map = {
+        "list": ["contracts.salary_scale.view", "contracts.manage"],
+        "retrieve": ["contracts.salary_scale.view", "contracts.manage"],
+        "create": ["contracts.salary_scale.create", "contracts.manage"],
+        "update": ["contracts.salary_scale.update", "contracts.manage"],
+        "partial_update": ["contracts.salary_scale.update", "contracts.manage"],
+        "destroy": ["contracts.salary_scale.delete", "contracts.manage"],
+        "*": ["contracts.manage"],
+    }
+    serializer_class = CalculationScaleSerializer
+
+    def get_serializer_context(self):
+        context = super().get_serializer_context()
+        employer = get_active_employer(self.request, require_context=False)
+        if employer and (
+            getattr(self.request.user, 'employer_profile', None)
+            or self.request.user.is_admin
+            or self.request.user.is_superuser
+            or is_delegate_user(self.request.user, employer.id)
+        ):
+            from accounts.database_utils import ensure_tenant_database_loaded
+            tenant_db = ensure_tenant_database_loaded(employer)
+            context['tenant_db'] = tenant_db
+            context['employer_id'] = employer.id
+        return context
+
+    def get_queryset(self):
+        from accounts.database_utils import get_tenant_database_alias
+        user = self.request.user
+        employer = None
+        if getattr(user, 'employer_profile', None):
+            employer = user.employer_profile
+        else:
+            resolved = get_active_employer(self.request, require_context=False)
+            if resolved and (user.is_admin or user.is_superuser or is_delegate_user(user, resolved.id)):
+                employer = resolved
+        if employer:
+            tenant_db = get_tenant_database_alias(employer)
+            ensure_cameroon_default_scales(
+                employer_id=employer.id,
+                tenant_db=tenant_db,
+                user_id=getattr(self.request.user, "id", None),
+            )
+            return CalculationScale.objects.using(tenant_db).filter(employer_id=employer.id)
+        return CalculationScale.objects.none()
+
+    def perform_create(self, serializer):
+        employer = get_active_employer(self.request, require_context=True)
+        serializer.save(employer_id=employer.id, user_id=self.request.user.id)
+
+    def perform_update(self, serializer):
+        serializer.save()
+
+    def perform_destroy(self, instance):
+        from accounts.database_utils import get_tenant_database_alias
+        employer = get_active_employer(self.request, require_context=True)
+        tenant_db = get_tenant_database_alias(employer)
+        instance.delete(using=tenant_db)
+
+
+class ScaleRangeViewSet(viewsets.ModelViewSet):
+    """API endpoint for managing scale ranges."""
+
+    permission_classes = [permissions.IsAuthenticated, EmployerAccessPermission]
+    permission_map = {
+        "list": ["contracts.salary_scale.view", "contracts.manage"],
+        "retrieve": ["contracts.salary_scale.view", "contracts.manage"],
+        "create": ["contracts.salary_scale.create", "contracts.manage"],
+        "update": ["contracts.salary_scale.update", "contracts.manage"],
+        "partial_update": ["contracts.salary_scale.update", "contracts.manage"],
+        "destroy": ["contracts.salary_scale.delete", "contracts.manage"],
+        "*": ["contracts.manage"],
+    }
+    serializer_class = ScaleRangeSerializer
+
+    def get_serializer_context(self):
+        context = super().get_serializer_context()
+        employer = get_active_employer(self.request, require_context=False)
+        if employer and (
+            getattr(self.request.user, 'employer_profile', None)
+            or self.request.user.is_admin
+            or self.request.user.is_superuser
+            or is_delegate_user(self.request.user, employer.id)
+        ):
+            from accounts.database_utils import ensure_tenant_database_loaded
+            tenant_db = ensure_tenant_database_loaded(employer)
+            context['tenant_db'] = tenant_db
+            context['employer_id'] = employer.id
+        return context
+
+    def get_queryset(self):
+        from accounts.database_utils import get_tenant_database_alias
+        user = self.request.user
+        employer = None
+        if getattr(user, 'employer_profile', None):
+            employer = user.employer_profile
+        else:
+            resolved = get_active_employer(self.request, require_context=False)
+            if resolved and (user.is_admin or user.is_superuser or is_delegate_user(user, resolved.id)):
+                employer = resolved
+        if not employer:
+            return ScaleRange.objects.none()
+
+        tenant_db = get_tenant_database_alias(employer)
+        ensure_cameroon_default_scales(
+            employer_id=employer.id,
+            tenant_db=tenant_db,
+            user_id=getattr(self.request.user, "id", None),
+        )
+        qs = ScaleRange.objects.using(tenant_db).filter(employer_id=employer.id)
+        calculation_scale_id = self.request.query_params.get('calculation_scale')
+        if calculation_scale_id:
+            qs = qs.filter(calculation_scale_id=calculation_scale_id)
+        return qs
+
+    def perform_create(self, serializer):
+        employer = get_active_employer(self.request, require_context=True)
+        serializer.save(employer_id=employer.id, user_id=self.request.user.id)
 
     def perform_update(self, serializer):
         serializer.save()

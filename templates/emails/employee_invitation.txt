@@ -21,7 +21,7 @@ Once you accept the invitation, you will be able to:
 - Complete your employee profile
 - Upload required documents
 - View your employment details
-- Access payroll information
+- Access compensation information
 - And much more...
 
 If you have any questions or did not expect this invitation, please contact the HR department at {{ employer.official_company_email }}.

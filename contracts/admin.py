@@ -1,5 +1,13 @@
 from django.contrib import admin
-from .models import Contract, Allowance, Deduction, ContractConfiguration, SalaryScale
+from .models import (
+    Contract,
+    Allowance,
+    Deduction,
+    ContractConfiguration,
+    SalaryScale,
+    CalculationScale,
+    ScaleRange,
+)
 
 class AllowanceInline(admin.TabularInline):
     model = Allowance
@@ -58,3 +66,27 @@ class SalaryScaleAdmin(admin.ModelAdmin):
     list_display = ('salary_category', 'echelon', 'amount', 'status', 'employer_id', 'created_at')
     list_filter = ('status', 'employer_id')
     search_fields = ('salary_category', 'echelon')
+
+
+@admin.register(CalculationScale)
+class CalculationScaleAdmin(admin.ModelAdmin):
+    list_display = ('id', 'code', 'name', 'employer_id', 'year', 'is_enable', 'created_at')
+    list_filter = ('is_enable', 'employer_id', 'year')
+    search_fields = ('code', 'name')
+
+
+@admin.register(ScaleRange)
+class ScaleRangeAdmin(admin.ModelAdmin):
+    list_display = (
+        'id',
+        'calculation_scale',
+        'range1',
+        'range2',
+        'coefficient',
+        'indice',
+        'base',
+        'employer_id',
+        'is_enable',
+    )
+    list_filter = ('is_enable', 'employer_id', 'year')
+    search_fields = ('calculation_scale__code', 'calculation_scale__name')

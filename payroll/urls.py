@@ -1,30 +1,24 @@
-from django.urls import path, include
+from django.urls import include, path
 from rest_framework.routers import DefaultRouter
 
+from .models import Salary
 from .views import (
     CalculationBasisAdvantageViewSet,
     CalculationBasisViewSet,
-    CalculationScaleViewSet,
     PayrollArchiveView,
     PayrollConfigurationViewSet,
-    PayrollElementViewSet,
-    PayrollPayslipDetailView,
-    PayrollPayslipListView,
     PayrollMyPayslipDetailView,
     PayrollMyPayslipListView,
+    PayrollPayslipDetailView,
+    PayrollPayslipListView,
     PayrollRunView,
     PayrollValidateView,
-    ScaleRangeViewSet,
 )
-from .models import Salary
 
 router = DefaultRouter()
 router.register(r"config", PayrollConfigurationViewSet, basename="payroll-config")
 router.register(r"bases", CalculationBasisViewSet, basename="payroll-bases")
 router.register(r"basis-advantages", CalculationBasisAdvantageViewSet, basename="payroll-basis-advantages")
-router.register(r"scales", CalculationScaleViewSet, basename="payroll-scales")
-router.register(r"scale-ranges", ScaleRangeViewSet, basename="payroll-scale-ranges")
-router.register(r"elements", PayrollElementViewSet, basename="payroll-elements")
 
 urlpatterns = [
     path("", include(router.urls)),
@@ -37,3 +31,4 @@ urlpatterns = [
     path("validate/", PayrollValidateView.as_view()),
     path("archive/", PayrollArchiveView.as_view()),
 ]
+
