@@ -92,6 +92,7 @@ def _employee_from_request(request, tenant_db=None) -> Employee:
                     Employee.objects.using(db_alias).filter(id=employee.id),
                     scope,
                     branch_field="branch_id",
+                    branch_secondary_field="secondary_branches__id",
                     department_field="department_id",
                     self_field="id",
                 )
@@ -686,6 +687,7 @@ class AttendanceRecordViewSet(viewsets.ReadOnlyModelViewSet):
                     qs,
                     scope,
                     branch_field="employee__branch_id",
+                    branch_secondary_field="employee__secondary_branches__id",
                     department_field="employee__department_id",
                     self_field="employee_id",
                 )
@@ -730,6 +732,7 @@ class AttendanceRecordViewSet(viewsets.ReadOnlyModelViewSet):
                     qs,
                     scope,
                     branch_field="employee__branch_id",
+                    branch_secondary_field="employee__secondary_branches__id",
                     department_field="employee__department_id",
                     self_field="employee_id",
                 )
@@ -774,6 +777,7 @@ class AttendanceRecordViewSet(viewsets.ReadOnlyModelViewSet):
                 qs,
                 scope,
                 branch_field="employee__branch_id",
+                branch_secondary_field="employee__secondary_branches__id",
                 department_field="employee__department_id",
                 self_field="employee_id",
             )
@@ -936,8 +940,10 @@ class KioskCheckView(APIView):
         )
         if not employee:
             return Response({"detail": "Employee not found."}, status=status.HTTP_404_NOT_FOUND)
-        if station and station.branch_id and employee.branch_id != station.branch_id:
-            return Response({"detail": "Employee not assigned to this kiosk branch."}, status=status.HTTP_403_FORBIDDEN)
+        if station and station.branch_id:
+            assigned_branch_ids = {str(branch_id) for branch_id in employee.assigned_branch_ids}
+            if str(station.branch_id) not in assigned_branch_ids:
+                return Response({"detail": "Employee not assigned to this kiosk branch."}, status=status.HTTP_403_FORBIDDEN)
         if config.require_pin_for_kiosk and not employee.check_pin_code(payload.get("pin")):
             return Response({"detail": "Invalid PIN."}, status=status.HTTP_403_FORBIDDEN)
 
@@ -1045,6 +1051,7 @@ class ManualAttendanceCreateView(APIView):
                 Employee.objects.using(tenant_db).filter(id=employee.id),
                 scope,
                 branch_field="branch_id",
+                branch_secondary_field="secondary_branches__id",
                 department_field="department_id",
                 self_field="id",
             )
@@ -1141,6 +1148,7 @@ class AttendanceReportView(APIView):
                     qs,
                     scope,
                     branch_field="employee__branch_id",
+                    branch_secondary_field="employee__secondary_branches__id",
                     department_field="employee__department_id",
                     self_field="employee_id",
                 )

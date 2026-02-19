@@ -327,6 +327,7 @@ class TimeOffRequestViewSet(viewsets.ModelViewSet):
                     qs,
                     scope_data,
                     branch_field="employee__branch_id",
+                    branch_secondary_field="employee__secondary_branches__id",
                     department_field="employee__department_id",
                     self_field="employee_id",
                 )
@@ -513,6 +514,7 @@ class TimeOffBalanceViewSet(viewsets.ViewSet):
                     Employee.objects.using(tenant_db).filter(id=employee.id),
                     scope,
                     branch_field="branch_id",
+                    branch_secondary_field="secondary_branches__id",
                     department_field="department_id",
                     self_field="id",
                 )
@@ -595,6 +597,7 @@ class TimeOffLedgerViewSet(viewsets.ReadOnlyModelViewSet):
                 qs,
                 scope,
                 branch_field="employee__branch_id",
+                branch_secondary_field="employee__secondary_branches__id",
                 department_field="employee__department_id",
                 self_field="employee_id",
             )
@@ -664,6 +667,7 @@ class TimeOffAllocationViewSet(viewsets.ModelViewSet):
                 qs,
                 scope,
                 branch_field="lines__employee__branch_id",
+                branch_secondary_field="lines__employee__secondary_branches__id",
                 department_field="lines__employee__department_id",
                 self_field="lines__employee_id",
             )
@@ -768,6 +772,7 @@ class TimeOffAllocationRequestViewSet(viewsets.ModelViewSet):
                     qs,
                     scope,
                     branch_field="employee__branch_id",
+                    branch_secondary_field="employee__secondary_branches__id",
                     department_field="employee__department_id",
                     self_field="employee_id",
                 )

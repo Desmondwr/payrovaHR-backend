@@ -221,6 +221,7 @@ def apply_scope_filter(
     scope,
     *,
     branch_field=None,
+    branch_secondary_field=None,
     department_field=None,
     self_field=None,
 ):
@@ -235,7 +236,10 @@ def apply_scope_filter(
     self_employee_ids = scope.get("self_employee_ids") or set()
 
     if branch_field and branch_ids:
-        filters |= Q(**{f"{branch_field}__in": list(branch_ids)})
+        branch_filter = Q(**{f"{branch_field}__in": list(branch_ids)})
+        if branch_secondary_field:
+            branch_filter |= Q(**{f"{branch_secondary_field}__in": list(branch_ids)})
+        filters |= branch_filter
     if department_field and department_ids:
         filters |= Q(**{f"{department_field}__in": list(department_ids)})
     if self_field and self_employee_ids:
@@ -244,4 +248,7 @@ def apply_scope_filter(
     if not filters:
         return queryset.none()
 
-    return queryset.filter(filters)
+    scoped = queryset.filter(filters)
+    if branch_secondary_field:
+        return scoped.distinct()
+    return scoped

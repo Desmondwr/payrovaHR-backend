@@ -362,6 +362,7 @@ class TimeOffRequestInputSerializer(serializers.ModelSerializer):
                     Employee.objects.using(tenant_db).filter(id=employee_obj.id),
                     scope,
                     branch_field="branch_id",
+                    branch_secondary_field="secondary_branches__id",
                     department_field="department_id",
                     self_field="id",
                 )
@@ -768,6 +769,7 @@ class TimeOffAllocationCreateSerializer(serializers.ModelSerializer):
                     Employee.objects.using(tenant_db).filter(id=employee_obj.id),
                     scope,
                     branch_field="branch_id",
+                    branch_secondary_field="secondary_branches__id",
                     department_field="department_id",
                     self_field="id",
                 )
@@ -852,6 +854,7 @@ class TimeOffBulkAllocationSerializer(serializers.Serializer):
                 Employee.objects.using(tenant_db).filter(id__in=[emp.id for emp in employees]),
                 scope,
                 branch_field="branch_id",
+                branch_secondary_field="secondary_branches__id",
                 department_field="department_id",
                 self_field="id",
             )

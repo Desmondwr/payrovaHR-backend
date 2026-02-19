@@ -61,6 +61,11 @@ REQUIRED_BASIS_CODES = [
 
 BASIS_ALIASES = {
     "NON-TAX": "SAL-NON-TAX",
+    "BASE-SALARY": "SAL-BASE",
+    "BASIC-SALARY": "SAL-BASE",
+    "GROSS-SALARY": "SAL-BRUT",
+    "TAXABLE-GROSS-SALARY": "SAL-BRUT-TAX",
+    "IRPP-TAXABLE-GROSS-SALARY": "SAL-BRUT-TAX-IRPP",
 }
 
 DEFAULT_IRPP_WITHHOLDING_THRESHOLD = Decimal("62000.00")
@@ -1187,7 +1192,9 @@ class PayrollCalculationService:
         if contract_id:
             contracts_qs = contracts_qs.filter(id=contract_id)
         if branch_id:
-            contracts_qs = contracts_qs.filter(branch_id=branch_id)
+            contracts_qs = contracts_qs.filter(
+                Q(branch_id=branch_id) | Q(employee__secondary_branches__id=branch_id)
+            ).distinct()
         if department_id:
             contracts_qs = contracts_qs.filter(department_id=department_id)
 

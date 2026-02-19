@@ -543,6 +543,8 @@ def validate_employee_data(data, config):
     }
     
     for field_name, config_field in required_field_map.items():
+        if config_field == 'require_branch' and not getattr(config, 'multi_branch_enabled', False):
+            continue
         if config.is_field_required(config_field.replace('require_', '')):
             if not data.get(field_name):
                 errors[field_name] = f"{field_name.replace('_', ' ').title()} is required"
@@ -909,6 +911,8 @@ def check_missing_fields_against_config(employee_data, config):
     missing_non_critical = []
     
     for field_name, config_attr in field_config_map.items():
+        if config_attr == 'require_branch' and not getattr(config, 'multi_branch_enabled', False):
+            continue
         requirement = getattr(config, config_attr, 'OPTIONAL')
         
         # Skip if field is hidden - don't track at all

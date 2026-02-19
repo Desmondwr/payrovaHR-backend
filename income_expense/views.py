@@ -379,6 +379,7 @@ class ExpenseClaimViewSet(SoftDeleteMixin, IncomeExpenseTenantViewSet):
                 qs,
                 scope,
                 branch_field="employee__branch_id",
+                branch_secondary_field="employee__secondary_branches__id",
                 department_field="employee__department_id",
                 self_field="employee_id",
             )
@@ -442,6 +443,7 @@ class ExpenseClaimViewSet(SoftDeleteMixin, IncomeExpenseTenantViewSet):
                         Employee.objects.using(tenant_db).filter(id=employee_obj.id),
                         scope,
                         branch_field="branch_id",
+                        branch_secondary_field="secondary_branches__id",
                         department_field="department_id",
                         self_field="id",
                     )

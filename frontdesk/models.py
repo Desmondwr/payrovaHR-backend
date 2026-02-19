@@ -100,7 +100,8 @@ class StationResponsible(models.Model):
 
     def clean(self):
         if self.station and self.employee:
-            if self.station.branch_id and self.employee.branch_id and self.station.branch_id != self.employee.branch_id:
+            assigned_branch_ids = {str(branch_id) for branch_id in self.employee.assigned_branch_ids}
+            if self.station.branch_id and str(self.station.branch_id) not in assigned_branch_ids:
                 raise ValidationError({"employee": "Responsible must belong to the same branch as the station."})
             if self.employee.employment_status != "ACTIVE":
                 raise ValidationError({"employee": "Responsible must be an active employee."})
@@ -212,9 +213,10 @@ class Visit(models.Model):
         errors = {}
         if self.branch_id and self.station_id and self.branch_id != self.station.branch_id:
             errors["station"] = "Station must belong to the same branch."
-        if self.branch_id and self.host_id and self.host.branch_id and self.branch_id != self.host.branch_id:
+        assigned_branch_ids = {str(branch_id) for branch_id in self.host.assigned_branch_ids} if self.host_id else set()
+        if self.branch_id and self.host_id and str(self.branch_id) not in assigned_branch_ids:
             errors["host"] = "Host must belong to the same branch as the visit."
-        if self.host_id and not self.host.branch_id:
+        if self.host_id and not assigned_branch_ids:
             errors["host"] = "Host must belong to a branch."
         if self.host_id and self.host.employment_status != "ACTIVE":
             errors["host"] = "Host must be an active employee."

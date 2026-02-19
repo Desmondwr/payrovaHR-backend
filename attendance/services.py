@@ -61,12 +61,12 @@ def find_matching_site(
     latitude: float,
     longitude: float,
     db_alias: str,
-    branch_id: Optional[str] = None,
+    branch_ids: Optional[list] = None,
 ) -> Optional[AttendanceLocationSite]:
     """Return the first active site that matches provided coordinates within radius (optionally branch-scoped)."""
     sites = AttendanceLocationSite.objects.using(db_alias).filter(employer_id=employer_id, is_active=True)
-    if branch_id:
-        sites = sites.filter(models.Q(branch_id=branch_id) | models.Q(branch__isnull=True))
+    if branch_ids:
+        sites = sites.filter(models.Q(branch_id__in=branch_ids) | models.Q(branch__isnull=True))
     for site in sites:
         distance = haversine_distance_meters(float(latitude), float(longitude), float(site.latitude), float(site.longitude))
         if distance <= site.radius_meters:
@@ -80,7 +80,7 @@ def find_matching_wifi(
     bssid: Optional[str],
     db_alias: str,
     site: Optional[AttendanceLocationSite] = None,
-    branch_id: Optional[str] = None,
+    branch_ids: Optional[list] = None,
 ) -> Optional[AttendanceAllowedWifi]:
     """Return matching Wi-Fi entry based on SSID/BSSID and optional site."""
     if not ssid:
@@ -89,8 +89,8 @@ def find_matching_wifi(
         employer_id=employer_id,
         is_active=True,
     )
-    if branch_id:
-        qs = qs.filter(models.Q(branch_id=branch_id) | models.Q(branch__isnull=True))
+    if branch_ids:
+        qs = qs.filter(models.Q(branch_id__in=branch_ids) | models.Q(branch__isnull=True))
     if site:
         qs = qs.filter(models.Q(site=site) | models.Q(site__isnull=True))
     if bssid:
@@ -456,23 +456,23 @@ def perform_check_in(
     longitude = payload.get("longitude")
     wifi_ssid = payload.get("wifi_ssid")
     wifi_bssid = payload.get("wifi_bssid")
-    branch_id = getattr(employee, "branch_id", None)
+    branch_ids = [str(branch_id) for branch_id in employee.assigned_branch_ids]
     site_match = None
 
     if enforce_geo:
         if latitude is None or longitude is None:
             raise ValidationError({"detail": "You are not within the allowed company area"})
-        site_match = find_matching_site(employee.employer_id, float(latitude), float(longitude), db_alias, branch_id)
+        site_match = find_matching_site(employee.employer_id, float(latitude), float(longitude), db_alias, branch_ids)
         if not site_match:
             raise ValidationError({"detail": "You are not within the allowed company area"})
     elif latitude is not None and longitude is not None:
-        site_match = find_matching_site(employee.employer_id, float(latitude), float(longitude), db_alias, branch_id)
+        site_match = find_matching_site(employee.employer_id, float(latitude), float(longitude), db_alias, branch_ids)
 
     wifi_match = None
     if enforce_wifi:
         if not wifi_ssid:
             raise ValidationError({"detail": "Connect to company Wi-Fi before checking in"})
-        wifi_match = find_matching_wifi(employee.employer_id, wifi_ssid, wifi_bssid, db_alias, site_match, branch_id)
+        wifi_match = find_matching_wifi(employee.employer_id, wifi_ssid, wifi_bssid, db_alias, site_match, branch_ids)
         if not wifi_match:
             raise ValidationError({"detail": "Connect to company Wi-Fi before checking in"})
 
@@ -577,23 +577,23 @@ def perform_check_out(
     longitude = payload.get("longitude")
     wifi_ssid = payload.get("wifi_ssid")
     wifi_bssid = payload.get("wifi_bssid")
-    branch_id = getattr(employee, "branch_id", None)
+    branch_ids = [str(branch_id) for branch_id in employee.assigned_branch_ids]
 
     site_match = None
     if enforce_geo:
         if latitude is None or longitude is None:
             raise ValidationError({"detail": "You are not within the allowed company area"})
-        site_match = find_matching_site(employee.employer_id, float(latitude), float(longitude), db_alias, branch_id)
+        site_match = find_matching_site(employee.employer_id, float(latitude), float(longitude), db_alias, branch_ids)
         if not site_match:
             raise ValidationError({"detail": "You are not within the allowed company area"})
     elif latitude is not None and longitude is not None:
-        site_match = find_matching_site(employee.employer_id, float(latitude), float(longitude), db_alias, branch_id)
+        site_match = find_matching_site(employee.employer_id, float(latitude), float(longitude), db_alias, branch_ids)
 
     wifi_match = None
     if enforce_wifi:
         if not wifi_ssid:
             raise ValidationError({"detail": "Connect to company Wi-Fi before checking out"})
-        wifi_match = find_matching_wifi(employee.employer_id, wifi_ssid, wifi_bssid, db_alias, site_match, branch_id)
+        wifi_match = find_matching_wifi(employee.employer_id, wifi_ssid, wifi_bssid, db_alias, site_match, branch_ids)
         if not wifi_match:
             raise ValidationError({"detail": "Connect to company Wi-Fi before checking out"})
 

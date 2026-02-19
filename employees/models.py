@@ -112,6 +112,10 @@ class EmployeeConfiguration(models.Model):
     
     # Employment Details
     require_department = models.CharField(max_length=20, choices=FIELD_REQUIREMENT_CHOICES, default=FIELD_REQUIRED)
+    multi_branch_enabled = models.BooleanField(
+        default=False,
+        help_text='Enable branch assignment fields across employee management workflows'
+    )
     require_branch = models.CharField(max_length=20, choices=FIELD_REQUIREMENT_CHOICES, default=FIELD_OPTIONAL)
     require_manager = models.CharField(max_length=20, choices=FIELD_REQUIREMENT_CHOICES, default=FIELD_OPTIONAL)
     require_probation_period = models.CharField(max_length=20, choices=FIELD_REQUIREMENT_CHOICES, default=FIELD_OPTIONAL)
@@ -458,6 +462,16 @@ class Employee(models.Model):
     job_title = models.CharField(max_length=255)  # Required by employer
     department = models.ForeignKey(Department, on_delete=models.SET_NULL, null=True, blank=True, related_name='employees')
     branch = models.ForeignKey(Branch, on_delete=models.SET_NULL, null=True, blank=True, related_name='employees')
+    is_multi_branch = models.BooleanField(
+        default=False,
+        help_text='Employee can be assigned to multiple branches'
+    )
+    secondary_branches = models.ManyToManyField(
+        Branch,
+        blank=True,
+        related_name='secondary_employees',
+        help_text='Additional branch assignments for multi-branch employees'
+    )
     working_schedule_id = models.UUIDField(
         null=True,
         blank=True,
@@ -551,6 +565,23 @@ class Employee(models.Model):
     @property
     def is_terminated(self):
         return self.employment_status in ['TERMINATED', 'RESIGNED', 'RETIRED']
+
+    @property
+    def assigned_branch_ids(self):
+        """Return all assigned branch IDs (primary + additional)."""
+        branch_ids = []
+        if self.branch_id:
+            branch_ids.append(self.branch_id)
+        if not self.pk:
+            return branch_ids
+        try:
+            extra_ids = list(self.secondary_branches.values_list('id', flat=True))
+        except ValueError:
+            extra_ids = []
+        for branch_id in extra_ids:
+            if branch_id and branch_id not in branch_ids:
+                branch_ids.append(branch_id)
+        return branch_ids
 
     def set_pin_code(self, raw_pin: str) -> None:
         if raw_pin:

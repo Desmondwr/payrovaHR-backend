@@ -12,6 +12,45 @@ from accounts.models import EmployerProfile, EmployeeMembership
 User = get_user_model()
 
 
+def _unique_uuid_list(values):
+    seen = set()
+    ordered = []
+    for value in values or []:
+        if value is None:
+            continue
+        as_str = str(value)
+        if as_str in seen:
+            continue
+        seen.add(as_str)
+        ordered.append(value)
+    return ordered
+
+
+def _employee_branch_ids(employee):
+    branch_ids = []
+    if getattr(employee, 'branch_id', None):
+        branch_ids.append(str(employee.branch_id))
+    for branch_id in list(employee.secondary_branches.values_list('id', flat=True)):
+        if branch_id is None:
+            continue
+        as_str = str(branch_id)
+        if as_str not in branch_ids:
+            branch_ids.append(as_str)
+    return branch_ids
+
+
+def _employee_branch_names(employee):
+    names = []
+    if getattr(employee, 'branch', None):
+        names.append(employee.branch.name)
+    for branch in employee.secondary_branches.all():
+        if not branch:
+            continue
+        if branch.name not in names:
+            names.append(branch.name)
+    return names
+
+
 class DepartmentSerializer(serializers.ModelSerializer):
     """Serializer for Department model"""
     branch = serializers.PrimaryKeyRelatedField(
@@ -121,6 +160,8 @@ class EmployeeListSerializer(serializers.ModelSerializer):
     
     department_name = serializers.SerializerMethodField()
     branch_name = serializers.SerializerMethodField()
+    branch_names = serializers.SerializerMethodField()
+    branches = serializers.SerializerMethodField()
     manager_name = serializers.SerializerMethodField()
     
     class Meta:
@@ -128,7 +169,8 @@ class EmployeeListSerializer(serializers.ModelSerializer):
         fields = [
             'id', 'employee_id', 'first_name', 'last_name', 'full_name',
             'email', 'phone_number', 'job_title', 'department', 'department_name',
-            'branch', 'branch_name', 'manager_name', 'employment_status',
+            'branch', 'branch_name', 'branch_names', 'branches', 'is_multi_branch',
+            'manager_name', 'employment_status',
             'employment_type', 'hire_date', 'profile_photo', 'is_concurrent_employment'
         ]
     
@@ -163,6 +205,12 @@ class EmployeeListSerializer(serializers.ModelSerializer):
         except Branch.DoesNotExist:
             pass
         return None
+
+    def get_branch_names(self, obj):
+        return _employee_branch_names(obj)
+
+    def get_branches(self, obj):
+        return _employee_branch_ids(obj)
     
     def get_manager_name(self, obj):
         """Get manager name from tenant database"""
@@ -186,6 +234,8 @@ class EmployeeDetailSerializer(serializers.ModelSerializer):
     
     department_name = serializers.SerializerMethodField()
     branch_name = serializers.SerializerMethodField()
+    branch_names = serializers.SerializerMethodField()
+    branches = serializers.SerializerMethodField()
     manager_name = serializers.SerializerMethodField()
     has_user_account = serializers.SerializerMethodField()
     cross_institution_count = serializers.SerializerMethodField()
@@ -230,6 +280,12 @@ class EmployeeDetailSerializer(serializers.ModelSerializer):
         except Branch.DoesNotExist:
             pass
         return None
+
+    def get_branch_names(self, obj):
+        return _employee_branch_names(obj)
+
+    def get_branches(self, obj):
+        return _employee_branch_ids(obj)
     
     def get_manager_name(self, obj):
         """Get manager name from tenant database"""
@@ -264,6 +320,14 @@ class CreateEmployeeSerializer(serializers.ModelSerializer):
     
     send_invitation = serializers.BooleanField(default=True, write_only=True)
     pin_code = serializers.CharField(write_only=True, required=False, allow_blank=True)
+    is_multi_branch = serializers.BooleanField(required=False, default=False)
+    branches = serializers.ListField(
+        child=serializers.UUIDField(),
+        required=False,
+        allow_empty=True,
+        write_only=True,
+        help_text='Optional list of additional branch UUIDs (multi-branch mode)'
+    )
     # Define as explicit UUID fields OUTSIDE of Meta.fields to prevent auto ForeignKey handling
     department = serializers.UUIDField(
         required=False, 
@@ -300,7 +364,7 @@ class CreateEmployeeSerializer(serializers.ModelSerializer):
             
             # Employment Details - department, branch, manager NOT in fields (defined above)
             'job_title', 'employment_type', 'employment_status', 'hire_date',
-            'probation_end_date',
+            'probation_end_date', 'is_multi_branch', 'branches',
             
             # Compensation Information
             'bank_name', 'bank_account_number', 'bank_account_name',
@@ -347,11 +411,15 @@ class CreateEmployeeSerializer(serializers.ModelSerializer):
         
         request = self.context['request']
         from accounts.rbac import get_active_employer
+        from employees.utils import get_or_create_employee_config
         employer = get_active_employer(request, require_context=True)
         employer_id = employer.id
         
         from accounts.database_utils import get_tenant_database_alias
         tenant_db = get_tenant_database_alias(employer)
+        config = get_or_create_employee_config(employer_id, tenant_db)
+        if not getattr(config, 'multi_branch_enabled', False):
+            return None
         
         # Check if branch exists in tenant database
         try:
@@ -363,6 +431,38 @@ class CreateEmployeeSerializer(serializers.ModelSerializer):
                 "Branch does not exist or does not belong to your organization."
             )
         return value
+
+    def validate_branches(self, value):
+        """Validate list of branch UUIDs exists in tenant database."""
+        branch_ids = _unique_uuid_list(value)
+        if not branch_ids:
+            return []
+
+        request = self.context['request']
+        from accounts.rbac import get_active_employer
+        from employees.utils import get_or_create_employee_config
+        employer = get_active_employer(request, require_context=True)
+        employer_id = employer.id
+
+        from accounts.database_utils import get_tenant_database_alias
+        tenant_db = get_tenant_database_alias(employer)
+        config = get_or_create_employee_config(employer_id, tenant_db)
+        if not getattr(config, 'multi_branch_enabled', False):
+            return []
+
+        found_ids = set(
+            str(item)
+            for item in Branch.objects.using(tenant_db).filter(
+                employer_id=employer_id,
+                id__in=branch_ids,
+            ).values_list('id', flat=True)
+        )
+        missing = [str(item) for item in branch_ids if str(item) not in found_ids]
+        if missing:
+            raise serializers.ValidationError(
+                f"Branch does not exist or does not belong to your organization: {', '.join(missing)}"
+            )
+        return branch_ids
     
     def validate_manager(self, value):
         """Validate that manager UUID exists in tenant database"""
@@ -431,6 +531,32 @@ class CreateEmployeeSerializer(serializers.ModelSerializer):
         config, created = EmployeeConfiguration.objects.using(tenant_db).get_or_create(
             employer_id=employer_id
         )
+        branch_feature_enabled = bool(getattr(config, 'multi_branch_enabled', False))
+
+        if not branch_feature_enabled:
+            data['is_multi_branch'] = False
+            data['branch'] = None
+            data['branches'] = []
+        else:
+            is_multi_branch = bool(data.get('is_multi_branch', False))
+            primary_branch = data.get('branch')
+            branch_list = _unique_uuid_list(data.get('branches') or [])
+            combined = _unique_uuid_list(([primary_branch] if primary_branch else []) + branch_list)
+
+            if is_multi_branch:
+                if not combined and config.require_branch == config.FIELD_REQUIRED:
+                    raise serializers.ValidationError({'branch': 'At least one branch is required in multi-branch mode.'})
+                if not primary_branch and combined:
+                    data['branch'] = combined[0]
+                data['branches'] = combined
+            else:
+                if not combined and config.require_branch == config.FIELD_REQUIRED:
+                    raise serializers.ValidationError({'branch': 'Branch is required.'})
+                if len(combined) > 1:
+                    raise serializers.ValidationError({'branches': 'Single-branch mode accepts only one branch.'})
+                if not primary_branch and combined:
+                    data['branch'] = combined[0]
+                data['branches'] = combined[:1]
         
         # Validate data against employer configuration
         try:
@@ -463,11 +589,23 @@ class CreateEmployeeSerializer(serializers.ModelSerializer):
         
         # Ensure EmployeeConfiguration exists using helper function
         config = get_or_create_employee_config(validated_data['employer_id'], tenant_db)
+        branch_feature_enabled = bool(getattr(config, 'multi_branch_enabled', False))
         
         # Extract UUID values and convert to _id fields
         department_uuid = validated_data.pop('department', None)
         branch_uuid = validated_data.pop('branch', None)
+        branch_uuids = _unique_uuid_list(validated_data.pop('branches', []))
         manager_uuid = validated_data.pop('manager', None)
+        is_multi_branch = bool(validated_data.get('is_multi_branch', False))
+        if not branch_feature_enabled:
+            branch_uuid = None
+            branch_uuids = []
+            is_multi_branch = False
+            validated_data['is_multi_branch'] = False
+
+        resolved_branch_ids = _unique_uuid_list(([branch_uuid] if branch_uuid else []) + branch_uuids)
+        if not branch_uuid and resolved_branch_ids:
+            branch_uuid = resolved_branch_ids[0]
         
         # Set the _id fields with UUIDs
         if department_uuid:
@@ -553,6 +691,13 @@ class CreateEmployeeSerializer(serializers.ModelSerializer):
         
         # Create employee in tenant database
         employee = Employee.objects.using(tenant_db).create(**validated_data)
+        secondary_branch_ids = [branch_id for branch_id in resolved_branch_ids if str(branch_id) != str(employee.branch_id)]
+        if is_multi_branch and secondary_branch_ids:
+            employee.secondary_branches.set(
+                Branch.objects.using(tenant_db).filter(id__in=secondary_branch_ids)
+            )
+        else:
+            employee.secondary_branches.clear()
 
         # Evaluate profile completion state based on configuration
         from employees.utils import check_missing_fields_against_config
@@ -615,6 +760,13 @@ class UpdateEmployeeSerializer(serializers.ModelSerializer):
     """Serializer for updating employee information"""
 
     pin_code = serializers.CharField(write_only=True, required=False, allow_blank=True)
+    branches = serializers.ListField(
+        child=serializers.UUIDField(),
+        required=False,
+        allow_empty=True,
+        write_only=True,
+        help_text='Optional list of branch UUIDs for multi-branch employees'
+    )
     
     class Meta:
         model = Employee
@@ -632,7 +784,7 @@ class UpdateEmployeeSerializer(serializers.ModelSerializer):
             'national_id_number', 'passport_number', 'cnps_number', 'tax_number',
             
             # Employment Details
-            'job_title', 'department', 'branch', 'manager',
+            'job_title', 'department', 'branch', 'branches', 'manager', 'is_multi_branch',
             'employment_type', 'employment_status', 'probation_end_date',
             
             # Compensation Information
@@ -642,6 +794,38 @@ class UpdateEmployeeSerializer(serializers.ModelSerializer):
             'emergency_contact_name', 'emergency_contact_relationship',
             'emergency_contact_phone',
         ]
+
+    def validate_branches(self, value):
+        branch_ids = _unique_uuid_list(value)
+        if not branch_ids:
+            return []
+
+        request = self.context.get('request')
+        if not request:
+            return branch_ids
+
+        from accounts.rbac import get_active_employer
+        from accounts.database_utils import get_tenant_database_alias
+        from employees.utils import get_or_create_employee_config
+
+        employer = get_active_employer(request, require_context=True)
+        tenant_db = get_tenant_database_alias(employer)
+        config = get_or_create_employee_config(employer.id, tenant_db)
+        if not getattr(config, 'multi_branch_enabled', False):
+            return []
+        found_ids = set(
+            str(item)
+            for item in Branch.objects.using(tenant_db).filter(
+                employer_id=employer.id,
+                id__in=branch_ids,
+            ).values_list('id', flat=True)
+        )
+        missing = [str(item) for item in branch_ids if str(item) not in found_ids]
+        if missing:
+            raise serializers.ValidationError(
+                f"Branch does not exist or does not belong to your organization: {', '.join(missing)}"
+            )
+        return branch_ids
     
     def update(self, instance, validated_data):
         """Update employee with validation of foreign key references"""
@@ -651,9 +835,41 @@ class UpdateEmployeeSerializer(serializers.ModelSerializer):
         request = self.context.get('request')
         if request:
             from accounts.rbac import get_active_employer
+            from employees.utils import get_or_create_employee_config
             employer = get_active_employer(request, require_context=True)
             tenant_db = get_tenant_database_alias(employer)
+            config = get_or_create_employee_config(employer.id, tenant_db)
+            branch_feature_enabled = bool(getattr(config, 'multi_branch_enabled', False))
             pin_code = validated_data.pop("pin_code", None)
+            if not branch_feature_enabled:
+                validated_data.pop("branches", None)
+                validated_data.pop("branch", None)
+                validated_data.pop("is_multi_branch", None)
+
+                # Before updating, validate and clean up any invalid foreign key references
+                if instance.department_id:
+                    dept_exists = Department.objects.using(tenant_db).filter(id=instance.department_id).exists()
+                    if not dept_exists:
+                        instance.department_id = None
+
+                if instance.manager_id:
+                    manager_exists = Employee.objects.using(tenant_db).filter(id=instance.manager_id).exists()
+                    if not manager_exists:
+                        instance.manager_id = None
+
+                for attr, value in validated_data.items():
+                    setattr(instance, attr, value)
+
+                if pin_code:
+                    instance.set_pin_code(pin_code)
+
+                instance.save(using=tenant_db)
+                return instance
+
+            raw_branches = validated_data.pop("branches", serializers.empty)
+            branch_uuids = None if raw_branches is serializers.empty else _unique_uuid_list(raw_branches)
+            requested_primary_branch = validated_data.get("branch")
+            effective_is_multi = bool(validated_data.get("is_multi_branch", instance.is_multi_branch))
             
             # Before updating, validate and clean up any invalid foreign key references
             # This prevents IntegrityError for existing invalid references
@@ -671,6 +887,29 @@ class UpdateEmployeeSerializer(serializers.ModelSerializer):
                 manager_exists = Employee.objects.using(tenant_db).filter(id=instance.manager_id).exists()
                 if not manager_exists:
                     instance.manager_id = None
+
+            if branch_uuids is not None:
+                primary_branch_id = None
+                if requested_primary_branch is not None:
+                    primary_branch_id = requested_primary_branch.id if hasattr(requested_primary_branch, "id") else requested_primary_branch
+                elif instance.branch_id:
+                    primary_branch_id = instance.branch_id
+
+                resolved_branch_ids = _unique_uuid_list(([primary_branch_id] if primary_branch_id else []) + branch_uuids)
+                if not effective_is_multi and len(resolved_branch_ids) > 1:
+                    raise serializers.ValidationError({"branches": "Single-branch mode accepts only one branch."})
+                if not primary_branch_id and resolved_branch_ids:
+                    primary_branch = Branch.objects.using(tenant_db).filter(id=resolved_branch_ids[0]).first()
+                    if primary_branch:
+                        validated_data["branch"] = primary_branch
+                        primary_branch_id = primary_branch.id
+                secondary_branch_ids = [
+                    branch_id
+                    for branch_id in resolved_branch_ids
+                    if primary_branch_id is None or str(branch_id) != str(primary_branch_id)
+                ]
+            else:
+                secondary_branch_ids = None
             
             # Update instance with validated data
             for attr, value in validated_data.items():
@@ -680,6 +919,16 @@ class UpdateEmployeeSerializer(serializers.ModelSerializer):
                 instance.set_pin_code(pin_code)
             
             instance.save(using=tenant_db)
+
+            if secondary_branch_ids is not None:
+                if effective_is_multi and secondary_branch_ids:
+                    instance.secondary_branches.set(
+                        Branch.objects.using(tenant_db).filter(id__in=secondary_branch_ids)
+                    )
+                else:
+                    instance.secondary_branches.clear()
+            elif not effective_is_multi:
+                instance.secondary_branches.clear()
             return instance
         
         return super().update(instance, validated_data)
@@ -978,6 +1227,14 @@ class CreateEmployeeWithDetectionSerializer(serializers.ModelSerializer):
         help_text='ID of existing user account to link (from main database)')
     user_id = serializers.IntegerField(required=False, allow_null=True, write_only=True,
         help_text='Explicit user account ID to link (from main database)')
+    is_multi_branch = serializers.BooleanField(required=False, default=False)
+    branches = serializers.ListField(
+        child=serializers.UUIDField(),
+        required=False,
+        allow_empty=True,
+        write_only=True,
+        help_text='Optional list of additional branch UUIDs (multi-branch mode)'
+    )
     # Define as explicit UUID fields to prevent auto ForeignKey handling
     department = serializers.UUIDField(
         required=True, 
@@ -1015,7 +1272,7 @@ class CreateEmployeeWithDetectionSerializer(serializers.ModelSerializer):
             
             # Employment Details - department, branch, manager defined above as UUIDField
             'job_title', 'employment_type', 'employment_status', 'hire_date',
-            'probation_end_date', 'department', 'branch', 'manager',
+            'probation_end_date', 'department', 'branch', 'branches', 'manager', 'is_multi_branch',
             
             # Compensation Information
             'bank_name', 'bank_account_number', 'bank_account_name',
@@ -1100,8 +1357,9 @@ class CreateEmployeeWithDetectionSerializer(serializers.ModelSerializer):
                 if hasattr(field, 'allow_blank'):
                     field.allow_blank = True
 
+        branch_requirement = config.require_branch if getattr(config, 'multi_branch_enabled', False) else config.FIELD_HIDDEN
         apply_requirement('department', config.require_department)
-        apply_requirement('branch', config.require_branch)
+        apply_requirement('branch', branch_requirement)
         apply_requirement('manager', config.require_manager)
         apply_requirement('probation_end_date', config.require_probation_period)
         apply_requirement('national_id_number', config.require_national_id)
@@ -1142,11 +1400,15 @@ class CreateEmployeeWithDetectionSerializer(serializers.ModelSerializer):
         
         request = self.context['request']
         from accounts.rbac import get_active_employer
+        from employees.utils import get_or_create_employee_config
         employer = get_active_employer(request, require_context=True)
         employer_id = employer.id
         
         from accounts.database_utils import get_tenant_database_alias
         tenant_db = get_tenant_database_alias(employer)
+        config = get_or_create_employee_config(employer_id, tenant_db)
+        if not getattr(config, 'multi_branch_enabled', False):
+            return None
         
         try:
             Branch.objects.using(tenant_db).get(
@@ -1157,6 +1419,38 @@ class CreateEmployeeWithDetectionSerializer(serializers.ModelSerializer):
                 "Branch does not exist or does not belong to your organization."
             )
         return value
+
+    def validate_branches(self, value):
+        """Validate list of branch UUIDs exists in tenant database."""
+        branch_ids = _unique_uuid_list(value)
+        if not branch_ids:
+            return []
+
+        request = self.context['request']
+        from accounts.rbac import get_active_employer
+        from employees.utils import get_or_create_employee_config
+        employer = get_active_employer(request, require_context=True)
+        employer_id = employer.id
+
+        from accounts.database_utils import get_tenant_database_alias
+        tenant_db = get_tenant_database_alias(employer)
+        config = get_or_create_employee_config(employer_id, tenant_db)
+        if not getattr(config, 'multi_branch_enabled', False):
+            return []
+
+        found_ids = set(
+            str(item)
+            for item in Branch.objects.using(tenant_db).filter(
+                employer_id=employer_id,
+                id__in=branch_ids,
+            ).values_list('id', flat=True)
+        )
+        missing = [str(item) for item in branch_ids if str(item) not in found_ids]
+        if missing:
+            raise serializers.ValidationError(
+                f"Branch does not exist or does not belong to your organization: {', '.join(missing)}"
+            )
+        return branch_ids
     
     def validate_manager(self, value):
         """Validate that manager UUID exists in tenant database"""
@@ -1256,12 +1550,38 @@ class CreateEmployeeWithDetectionSerializer(serializers.ModelSerializer):
         
         # Get or create configuration using helper function
         config = get_or_create_employee_config(employer.id, tenant_db)
+        branch_feature_enabled = bool(getattr(config, 'multi_branch_enabled', False))
 
         # Enforce manual employee ID override setting
         if data.get('employee_id') and config and not config.employee_id_manual_override:
             raise serializers.ValidationError({
                 'employee_id': 'Manual employee ID entry is disabled by configuration.'
             })
+
+        if not branch_feature_enabled:
+            data['is_multi_branch'] = False
+            data['branch'] = None
+            data['branches'] = []
+        else:
+            is_multi_branch = bool(data.get('is_multi_branch', False))
+            primary_branch = data.get('branch')
+            branch_list = _unique_uuid_list(data.get('branches') or [])
+            combined = _unique_uuid_list(([primary_branch] if primary_branch else []) + branch_list)
+
+            if is_multi_branch:
+                if not combined and config.require_branch == config.FIELD_REQUIRED:
+                    raise serializers.ValidationError({'branch': 'At least one branch is required in multi-branch mode.'})
+                if not primary_branch and combined:
+                    data['branch'] = combined[0]
+                data['branches'] = combined
+            else:
+                if not combined and config.require_branch == config.FIELD_REQUIRED:
+                    raise serializers.ValidationError({'branch': 'Branch is required.'})
+                if len(combined) > 1:
+                    raise serializers.ValidationError({'branches': 'Single-branch mode accepts only one branch.'})
+                if not primary_branch and combined:
+                    data['branch'] = combined[0]
+                data['branches'] = combined[:1]
         
         # Skip strict validation during employer-initiated creation
         # The configuration requirements apply when employees complete their own profiles,
@@ -1412,7 +1732,12 @@ class CreateEmployeeWithDetectionSerializer(serializers.ModelSerializer):
         # Pop UUID fields and convert to _id fields
         department_uuid = validated_data.pop('department', None)
         branch_uuid = validated_data.pop('branch', None)
+        branch_uuids = _unique_uuid_list(validated_data.pop('branches', []))
         manager_uuid = validated_data.pop('manager', None)
+        is_multi_branch = bool(validated_data.get('is_multi_branch', False))
+        resolved_branch_ids = _unique_uuid_list(([branch_uuid] if branch_uuid else []) + branch_uuids)
+        if not branch_uuid and resolved_branch_ids:
+            branch_uuid = resolved_branch_ids[0]
         
         if department_uuid:
             validated_data['department_id'] = department_uuid
@@ -1435,6 +1760,14 @@ class CreateEmployeeWithDetectionSerializer(serializers.ModelSerializer):
         
         # Get configuration
         config = get_or_create_employee_config(employer.id, tenant_db)
+        branch_feature_enabled = bool(getattr(config, 'multi_branch_enabled', False))
+        if not branch_feature_enabled:
+            branch_uuid = None
+            branch_uuids = []
+            resolved_branch_ids = []
+            is_multi_branch = False
+            validated_data['is_multi_branch'] = False
+            validated_data.pop('branch_id', None)
 
         # Respect configuration for invitation sending
         if not config.send_invitation_email:
@@ -1519,6 +1852,13 @@ class CreateEmployeeWithDetectionSerializer(serializers.ModelSerializer):
         
         # Create employee in tenant database
         employee = Employee.objects.using(tenant_db).create(**validated_data)
+        secondary_branch_ids = [branch_id for branch_id in resolved_branch_ids if str(branch_id) != str(employee.branch_id)]
+        if is_multi_branch and secondary_branch_ids:
+            employee.secondary_branches.set(
+                Branch.objects.using(tenant_db).filter(id__in=secondary_branch_ids)
+            )
+        else:
+            employee.secondary_branches.clear()
         
         # Sync to central EmployeeRegistry for cross-institutional tracking
         if employee.user_id:
@@ -2216,6 +2556,8 @@ class EmployeeSelfProfileSerializer(serializers.ModelSerializer):
     
     department_name = serializers.SerializerMethodField()
     branch_name = serializers.SerializerMethodField()
+    branch_names = serializers.SerializerMethodField()
+    branches = serializers.SerializerMethodField()
     manager_name = serializers.SerializerMethodField()
     employer_name = serializers.SerializerMethodField()
     missing_documents = serializers.SerializerMethodField()
@@ -2229,7 +2571,8 @@ class EmployeeSelfProfileSerializer(serializers.ModelSerializer):
             'email', 'personal_email', 'phone_number', 'alternative_phone',
             'address', 'city', 'state_region', 'postal_code', 'country',
             'national_id_number', 'passport_number', 'cnps_number', 'tax_number',
-            'job_title', 'department', 'department_name', 'branch', 'branch_name', 
+            'job_title', 'department', 'department_name', 'branch', 'branch_name',
+            'branches', 'branch_names', 'is_multi_branch',
             'manager', 'manager_name',
             'employment_type', 'employment_status', 'hire_date', 'probation_end_date',
             'bank_name', 'bank_account_number', 'bank_account_name',
@@ -2292,6 +2635,12 @@ class EmployeeSelfProfileSerializer(serializers.ModelSerializer):
         if obj.branch:
             return obj.branch.name
         return None
+
+    def get_branch_names(self, obj):
+        return _employee_branch_names(obj)
+
+    def get_branches(self, obj):
+        return _employee_branch_ids(obj)
     
     def get_manager_name(self, obj):
         """Get manager name safely"""

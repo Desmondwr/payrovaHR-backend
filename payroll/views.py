@@ -1,4 +1,5 @@
 from django.db import transaction
+from django.db.models import Q
 from django.shortcuts import get_object_or_404
 from rest_framework import permissions, viewsets
 from rest_framework.exceptions import PermissionDenied, ValidationError
@@ -218,7 +219,9 @@ class PayrollPayslipListView(EmployerContextMixin, APIView):
         if contract_id:
             qs = qs.filter(contract_id=contract_id)
         if branch_id:
-            qs = qs.filter(contract__branch_id=branch_id)
+            qs = qs.filter(
+                Q(contract__branch_id=branch_id) | Q(contract__employee__secondary_branches__id=branch_id)
+            ).distinct()
         if department_id:
             qs = qs.filter(contract__department_id=department_id)
 

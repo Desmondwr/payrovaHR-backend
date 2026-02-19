@@ -1,4 +1,5 @@
 from django.utils import timezone
+from django.db.models import Q
 from rest_framework import serializers
 
 from accounts.database_utils import get_tenant_database_alias
@@ -95,7 +96,8 @@ class FrontdeskStationSerializer(serializers.ModelSerializer):
             for employee in responsibles:
                 if employee.employment_status != "ACTIVE":
                     invalid.append(f"{employee.full_name} is not active")
-                if branch and employee.branch_id and employee.branch_id != branch.id:
+                assigned_branch_ids = {str(branch_id) for branch_id in employee.assigned_branch_ids}
+                if branch and str(branch.id) not in assigned_branch_ids:
                     invalid.append(f"{employee.full_name} is not part of branch {branch.name}")
                 if employer_id and employee.employer_id != employer_id:
                     invalid.append(f"{employee.full_name} is not part of this employer")
@@ -185,7 +187,8 @@ class StationResponsibleSerializer(serializers.ModelSerializer):
         if employee:
             if employee.employment_status != "ACTIVE":
                 errors["employee"] = ["Responsible must be an active employee."]
-            if station and employee.branch_id and station.branch_id and employee.branch_id != station.branch_id:
+            assigned_branch_ids = {str(branch_id) for branch_id in employee.assigned_branch_ids}
+            if station and station.branch_id and str(station.branch_id) not in assigned_branch_ids:
                 errors["employee"] = ["Responsible must belong to the same branch as the station."]
         if errors:
             raise serializers.ValidationError(errors)
@@ -314,9 +317,10 @@ class VisitSerializer(serializers.ModelSerializer):
 
         if branch and station and branch.id != station.branch_id:
             raise serializers.ValidationError({"station": "Station must belong to the selected branch."})
-        if branch and host and host.branch_id and host.branch_id != branch.id:
+        host_branch_ids = {str(branch_id) for branch_id in host.assigned_branch_ids} if host else set()
+        if branch and host and str(branch.id) not in host_branch_ids:
             raise serializers.ValidationError({"host": "Host must belong to the selected branch."})
-        if branch and host and not host.branch_id:
+        if branch and host and not host_branch_ids:
             raise serializers.ValidationError({"host": "Host must belong to a branch to be selectable."})
         if host and host.employment_status != "ACTIVE":
             raise serializers.ValidationError({"host": "Host must be an active employee."})
@@ -377,15 +381,18 @@ class KioskCheckInSerializer(serializers.Serializer):
         tenant_db = self.context.get("tenant_db")
         if station and tenant_db:
             self.fields["host"].queryset = Employee.objects.using(tenant_db).filter(
-                employer_id=station.employer_id, branch_id=station.branch_id, employment_status="ACTIVE"
-            )
+                Q(branch_id=station.branch_id) | Q(secondary_branches__id=station.branch_id),
+                employer_id=station.employer_id,
+                employment_status="ACTIVE",
+            ).distinct()
 
     def validate(self, attrs):
         station = self.context.get("station")
         host = attrs.get("host")
         errors = {}
         if station and host:
-            if host.branch_id and host.branch_id != station.branch_id:
+            host_branch_ids = {str(branch_id) for branch_id in host.assigned_branch_ids}
+            if str(station.branch_id) not in host_branch_ids:
                 errors["host"] = ["Host must belong to the same branch as the station."]
             if host.employer_id != station.employer_id:
                 errors["host"] = ["Host must belong to this employer."]

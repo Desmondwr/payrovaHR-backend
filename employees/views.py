@@ -197,7 +197,7 @@ class EmployeeViewSet(viewsets.ModelViewSet):
             employer_id=employer.id
         ).select_related(
             'department', 'branch', 'manager'
-        ).prefetch_related('documents', 'cross_institution_records')
+        ).prefetch_related('documents', 'cross_institution_records', 'secondary_branches')
 
         if is_delegate_user(self.request.user, employer.id):
             scope = get_delegate_scope(self.request.user, employer.id)
@@ -205,6 +205,7 @@ class EmployeeViewSet(viewsets.ModelViewSet):
                 queryset,
                 scope,
                 branch_field="branch_id",
+                branch_secondary_field="secondary_branches__id",
                 department_field="department_id",
                 self_field="id",
             )
@@ -222,7 +223,7 @@ class EmployeeViewSet(viewsets.ModelViewSet):
         # Filter by branch if provided
         branch = self.request.query_params.get('branch')
         if branch:
-            queryset = queryset.filter(branch_id=branch)
+            queryset = queryset.filter(Q(branch_id=branch) | Q(secondary_branches__id=branch)).distinct()
         
         # Search by name or employee ID
         search = self.request.query_params.get('search')
@@ -938,6 +939,7 @@ class EmployeeViewSet(viewsets.ModelViewSet):
                     approvals,
                     scope,
                     branch_field="employee__branch_id",
+                    branch_secondary_field="employee__secondary_branches__id",
                     department_field="employee__department_id",
                     self_field="employee_id",
                 )
@@ -961,6 +963,7 @@ class EmployeeViewSet(viewsets.ModelViewSet):
                 TerminationApproval.objects.using(tenant_db).filter(id=approval.id),
                 scope,
                 branch_field="employee__branch_id",
+                branch_secondary_field="employee__secondary_branches__id",
                 department_field="employee__department_id",
                 self_field="employee_id",
             )
@@ -1293,6 +1296,7 @@ class EmployeeDocumentViewSet(viewsets.ModelViewSet):
                     qs,
                     scope,
                     branch_field="employee__branch_id",
+                    branch_secondary_field="employee__secondary_branches__id",
                     department_field="employee__department_id",
                     self_field="employee_id",
                 )
@@ -1363,6 +1367,7 @@ class EmployeeDocumentViewSet(viewsets.ModelViewSet):
                     Employee.objects.using(tenant_db).filter(employer_id=employer.id),
                     get_delegate_scope(user, employer.id),
                     branch_field="branch_id",
+                    branch_secondary_field="secondary_branches__id",
                     department_field="department_id",
                     self_field="id",
                 )
@@ -1558,6 +1563,7 @@ class EmployeeConfigurationViewSet(viewsets.ModelViewSet):
         config.employee_id_prefix = 'EMP'
         config.employee_id_starting_number = 1
         config.employee_id_padding = 3
+        config.multi_branch_enabled = False
         config.duplicate_detection_level = 'MODERATE'
         config.duplicate_action = 'WARN'
         config.required_documents = ['RESUME', 'ID_COPY', 'CERTIFICATE']

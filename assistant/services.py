@@ -6,15 +6,18 @@ import re
 from collections import Counter
 from dataclasses import dataclass
 from datetime import timedelta
+from decimal import Decimal
 from difflib import SequenceMatcher
 
 from django.conf import settings
 from django.core.cache import cache
+from django.db.models import Sum
 from django.utils import timezone
 from rest_framework.exceptions import PermissionDenied
 
 from accounts.rbac import (
     get_active_employer,
+    get_employee_roles_for_user,
     get_effective_permission_codes,
     is_delegate_user,
 )
@@ -24,6 +27,13 @@ logger = logging.getLogger(__name__)
 
 TOKEN_PATTERN = re.compile(r"[a-z0-9]+")
 SPACE_PATTERN = re.compile(r"\s+")
+URL_PATTERN = re.compile(r"\bhttps?://[^\s)]+", flags=re.IGNORECASE)
+PATH_PATTERN = re.compile(r"(?<![\w@])/(?:[a-zA-Z][a-zA-Z0-9._-]*)(?:/[a-zA-Z0-9._-]+)*")
+PAREN_PATH_PATTERN = re.compile(r"\(\s*/(?:[a-zA-Z][a-zA-Z0-9._-]*)(?:/[a-zA-Z0-9._-]+)*\s*\)")
+OPEN_PATH_PATTERN = re.compile(
+    r"\b(open|ouvrez)\s+/(?:[a-zA-Z][a-zA-Z0-9._-]*)(?:/[a-zA-Z0-9._-]+)*",
+    flags=re.IGNORECASE,
+)
 GREETING_TERMS = {
     "hi",
     "hello",
@@ -84,6 +94,10 @@ WORKFLOW_HINT_TERMS = {
     "contract",
     "contracts",
     "attendance",
+    "communication",
+    "communications",
+    "announcement",
+    "message",
     "time",
     "leave",
     "expense",
@@ -157,8 +171,101 @@ WORKFLOW_CONTINUE_PATTERNS = (
     "reprendre mon",
     "continuer mon",
 )
+INSIGHT_INTENT_PATTERNS = (
+    "monthly summary",
+    "month summary",
+    "summary for this month",
+    "summarize this month",
+    "operational summary",
+    "operational insights",
+    "dashboard summary",
+    "status summary",
+    "show me metrics",
+    "show metrics",
+    "show kpis",
+    "kpi",
+    "insights",
+    "insight",
+    "resume mensuel",
+    "resume de ce mois",
+    "resume du mois",
+    "donne moi les chiffres",
+    "donne moi les indicateurs",
+    "tableau de bord",
+    "statut ce mois",
+)
+INSIGHT_MONTH_PATTERN = re.compile(r"\b(20\d{2})[-/](0?[1-9]|1[0-2])\b")
+MONTH_NAME_MAP = {
+    "january": 1,
+    "jan": 1,
+    "janvier": 1,
+    "february": 2,
+    "feb": 2,
+    "fevrier": 2,
+    "march": 3,
+    "mar": 3,
+    "mars": 3,
+    "april": 4,
+    "apr": 4,
+    "avril": 4,
+    "may": 5,
+    "mai": 5,
+    "june": 6,
+    "jun": 6,
+    "juin": 6,
+    "july": 7,
+    "jul": 7,
+    "juillet": 7,
+    "august": 8,
+    "aug": 8,
+    "aout": 8,
+    "september": 9,
+    "sep": 9,
+    "sept": 9,
+    "septembre": 9,
+    "october": 10,
+    "oct": 10,
+    "octobre": 10,
+    "november": 11,
+    "nov": 11,
+    "novembre": 11,
+    "december": 12,
+    "dec": 12,
+    "decembre": 12,
+}
+EN_MONTH_LABELS = (
+    "",
+    "January",
+    "February",
+    "March",
+    "April",
+    "May",
+    "June",
+    "July",
+    "August",
+    "September",
+    "October",
+    "November",
+    "December",
+)
+FR_MONTH_LABELS = (
+    "",
+    "janvier",
+    "fevrier",
+    "mars",
+    "avril",
+    "mai",
+    "juin",
+    "juillet",
+    "aout",
+    "septembre",
+    "octobre",
+    "novembre",
+    "decembre",
+)
 WORKFLOW_MEMORY_CACHE_TTL_SECONDS = 60 * 60 * 24 * 14
 WORKFLOW_MEMORY_MAX_ITEMS = 8
+INSIGHT_SNAPSHOT_CACHE_TTL_SECONDS = 60 * 3
 
 
 @dataclass(frozen=True)
@@ -310,6 +417,30 @@ TOPICS = (
         example_question="Where can I view my payslip details?",
     ),
     AssistantTopic(
+        id="employee_communications",
+        portals=("employee",),
+        title="Employee Communications",
+        sidebar_label="Communications",
+        route="/employee/communications",
+        guidance=(
+            "Open Communications from the employee sidebar.",
+            "Open a message to review details, attachments, and required actions.",
+            "Use Acknowledge when confirmation is required.",
+            "Use Reply or Comments when that communication allows interaction.",
+        ),
+        keywords=(
+            "communication",
+            "communications",
+            "announcement",
+            "message",
+            "acknowledge",
+            "reply",
+            "comment",
+            "hr letter",
+        ),
+        example_question="How do I acknowledge or reply to a communication?",
+    ),
+    AssistantTopic(
         id="employee_profile",
         portals=("employee",),
         title="Employee Profile Completion",
@@ -445,6 +576,32 @@ TOPICS = (
         ),
         example_question="How do I configure and approve attendance records?",
         required_permissions=("attendance.record.view", "attendance.manage"),
+    ),
+    AssistantTopic(
+        id="employer_communications",
+        portals=("employer",),
+        title="Employer Communications",
+        sidebar_label="Communications",
+        route="/employer/communications",
+        guidance=(
+            "Open Communications to create announcements or HR letters.",
+            "Set targets, priorities, and whether acknowledgment or response is required.",
+            "Send immediately or schedule delivery for the right time.",
+            "Track recipient status, comments, and audit history to close the loop.",
+        ),
+        keywords=(
+            "communication",
+            "communications",
+            "announcement",
+            "message",
+            "hr letter",
+            "send communication",
+            "schedule communication",
+            "recipient",
+            "audit",
+        ),
+        example_question="How do I create, send, and track communications?",
+        required_permissions=("communications.view", "communications.manage"),
     ),
     AssistantTopic(
         id="employer_timeoff",
@@ -1022,6 +1179,75 @@ def _is_workflow_continue_request(message):
     return bool(terms & continue_terms and (terms & WORKFLOW_HINT_TERMS or terms & time_terms))
 
 
+def _is_insight_request(message):
+    compact = _compact_text(message)
+    if not compact:
+        return False
+
+    for pattern in INSIGHT_INTENT_PATTERNS:
+        if _compact_text(pattern) in compact:
+            return True
+
+    terms = set(_tokenize(compact))
+    summary_terms = {"summary", "summarize", "resume", "status", "insights", "insight", "overview", "bilan"}
+    metric_terms = {"metrics", "metric", "kpi", "kpis", "numbers", "indicateurs", "chiffres"}
+    time_terms = {"month", "monthly", "mois", "today", "now", "current"}
+    module_terms = {"payroll", "payslip", "leave", "time", "off", "contract", "contracts"}
+
+    if terms & summary_terms and (terms & metric_terms or terms & time_terms or terms & module_terms):
+        return True
+    if {"payroll", "payslip"} & terms and {"status", "summary", "metrics", "kpi"} & terms:
+        return True
+    if {"time", "off"} <= terms and {"summary", "status", "metrics"} & terms:
+        return True
+    return False
+
+
+def _previous_month(year, month):
+    if int(month) <= 1:
+        return int(year) - 1, 12
+    return int(year), int(month) - 1
+
+
+def _resolve_insight_period(message):
+    today = timezone.now().date()
+    compact = _compact_text(message)
+    if not compact:
+        return today.year, today.month
+
+    pattern_match = INSIGHT_MONTH_PATTERN.search(compact)
+    if pattern_match:
+        return int(pattern_match.group(1)), int(pattern_match.group(2))
+
+    terms = set(_tokenize(compact))
+    if ("last" in terms and "month" in terms) or ("previous" in terms and "month" in terms):
+        return _previous_month(today.year, today.month)
+    if "mois" in terms and ("dernier" in terms or "precedent" in terms):
+        return _previous_month(today.year, today.month)
+
+    tokens = _tokenize(compact)
+    for index, token in enumerate(tokens):
+        month = MONTH_NAME_MAP.get(token)
+        if not month:
+            continue
+        year = today.year
+        if index > 0 and re.fullmatch(r"20\d{2}", tokens[index - 1]):
+            year = int(tokens[index - 1])
+        elif index + 1 < len(tokens) and re.fullmatch(r"20\d{2}", tokens[index + 1]):
+            year = int(tokens[index + 1])
+        return year, month
+
+    return today.year, today.month
+
+
+def _format_period_label(year, month, language="en"):
+    month_idx = int(month)
+    if month_idx < 1 or month_idx > 12:
+        month_idx = timezone.now().month
+    labels = FR_MONTH_LABELS if language == "fr" else EN_MONTH_LABELS
+    return f"{labels[month_idx]} {int(year)}"
+
+
 def _topic_from_page_path(page_path, topics):
     if not page_path:
         return None
@@ -1138,7 +1364,6 @@ def _build_workflow_memory_reply(memory_entry, topic, language="en"):
             "Start one detailed task first, then I can continue it for you."
         )
 
-    route = memory_entry.get("route") or (topic.route if topic else "")
     topic_title = memory_entry.get("topic_title") or (topic.title if topic else "workflow")
     captured_at = memory_entry.get("captured_at") or ""
     previous_message = memory_entry.get("message") or ""
@@ -1157,8 +1382,6 @@ def _build_workflow_memory_reply(memory_entry, topic, language="en"):
             lines.append("Prochaines etapes recommandees:")
             for index, step in enumerate(steps, start=1):
                 lines.append(f"{index}. {step}")
-        if route:
-            lines.append(f"Ouvrez: {route}")
         lines.append("Donnez-moi l'etape bloquante exacte et je continue a partir de la.")
         return "\n".join(lines)
 
@@ -1171,8 +1394,6 @@ def _build_workflow_memory_reply(memory_entry, topic, language="en"):
         lines.append("Recommended next steps:")
         for index, step in enumerate(steps, start=1):
             lines.append(f"{index}. {step}")
-    if route:
-        lines.append(f"Open: {route}")
     lines.append("Tell me the exact blocked step and I will continue from there.")
     return "\n".join(lines)
 
@@ -1192,8 +1413,12 @@ def _append_attention_item(items, *, key, count, title, route, priority):
 
 
 def _resolve_employee_for_context(request, context):
+    if "_resolved_employee" in context:
+        return context.get("_resolved_employee")
+
     employer = context.get("employer")
     if not employer:
+        context["_resolved_employee"] = None
         return None
 
     user = request.user
@@ -1203,6 +1428,7 @@ def _resolve_employee_for_context(request, context):
         profile = None
 
     if profile and getattr(profile, "employer_id", None) == employer.id:
+        context["_resolved_employee"] = profile
         return profile
 
     try:
@@ -1210,11 +1436,86 @@ def _resolve_employee_for_context(request, context):
 
         employee = Employee.objects.filter(employer_id=employer.id, user_id=user.id).first()
         if employee:
+            context["_resolved_employee"] = employee
             return employee
-        return Employee.objects.filter(employer_id=employer.id, user_account_id=user.id).first()
+        employee = Employee.objects.filter(employer_id=employer.id, user_account_id=user.id).first()
+        context["_resolved_employee"] = employee
+        return employee
     except Exception as exc:
         logger.debug("Assistant employee resolution failed: %s", exc)
+        context["_resolved_employee"] = None
         return None
+
+
+def _display_name_from_user(user):
+    first = (getattr(user, "first_name", "") or "").strip()
+    last = (getattr(user, "last_name", "") or "").strip()
+    full = " ".join(part for part in [first, last] if part).strip()
+    if full:
+        return full
+
+    email = (getattr(user, "email", "") or "").strip()
+    if email:
+        local = email.split("@", 1)[0].strip()
+        if local:
+            return local
+    return "User"
+
+
+def _resolve_actor_identity(request, context):
+    user = request.user
+    portal_mode = context.get("portal_mode") or "employee"
+    employer = context.get("employer")
+
+    actor = {
+        "name": _display_name_from_user(user),
+        "role": "User",
+        "portal_mode": portal_mode,
+        "employer_name": getattr(employer, "company_name", None) if employer else None,
+        "employer_id": getattr(employer, "id", None) if employer else None,
+        "role_names": [],
+    }
+
+    if portal_mode == "admin":
+        actor["role"] = "Admin"
+        return actor
+
+    if portal_mode == "employer":
+        if context.get("is_employer_owner"):
+            actor["role"] = "Employer Owner"
+            owner_label = (getattr(employer, "employer_name_or_group", "") or "").strip()
+            if owner_label and actor["name"] == "User":
+                actor["name"] = owner_label
+            return actor
+
+        role_names = []
+        if employer:
+            try:
+                roles = get_employee_roles_for_user(user, employer.id).select_related("role")
+                for assignment in roles:
+                    role_name = (getattr(getattr(assignment, "role", None), "name", "") or "").strip()
+                    if not role_name or role_name in role_names:
+                        continue
+                    role_names.append(role_name)
+            except Exception as exc:
+                logger.debug("Assistant actor role resolution failed: %s", exc)
+
+        actor["role_names"] = role_names[:5]
+        actor["role"] = ", ".join(role_names[:2]) if role_names else "Employer Delegate"
+        return actor
+
+    employee = _resolve_employee_for_context(request, context)
+    if employee:
+        full_name = (getattr(employee, "full_name", "") or "").strip()
+        if full_name:
+            actor["name"] = full_name
+        job_title = (getattr(employee, "job_title", "") or "").strip()
+        actor["role"] = job_title or "Employee"
+        actor["employee_id"] = str(getattr(employee, "employee_id", "") or "")
+    else:
+        actor["role"] = "Employee" if getattr(user, "is_employee", False) else "User"
+
+    return actor
 
 
 def _build_attention_snapshot(request, context):
@@ -1466,21 +1767,388 @@ def _build_attention_copilot_reply(snapshot, context, language="en"):
         return "No urgent approvals or deadline alerts found right now. You are up to date."
 
     top_items = items[:4]
-    first_route = top_items[0].get("route")
+    first_title = top_items[0].get("title")
 
     if language == "fr":
         lines = ["Resume de priorite pour maintenant:"]
         for index, item in enumerate(top_items, start=1):
-            lines.append(f"{index}. {item['count']} {item['title']} ({item['route']})")
-        if first_route:
-            lines.append(f"Prochaine action recommandee: ouvrir {first_route}.")
+            lines.append(f"{index}. {item['count']} {item['title']}")
+        if first_title:
+            lines.append(f"Prochaine action recommandee: ouvrez le module {first_title}.")
         return "\n".join(lines)
 
     lines = ["Priority summary for right now:"]
     for index, item in enumerate(top_items, start=1):
-        lines.append(f"{index}. {item['count']} {item['title']} ({item['route']})")
-    if first_route:
-        lines.append(f"Recommended next action: open {first_route}.")
+        lines.append(f"{index}. {item['count']} {item['title']}")
+    if first_title:
+        lines.append(f"Recommended next action: open the {first_title} module.")
+    return "\n".join(lines)
+
+
+def _insight_snapshot_cache_key(user_id, context, year, month):
+    employer = context.get("employer")
+    employer_id = getattr(employer, "id", 0) or 0
+    portal_mode = context.get("portal_mode", "employee")
+    return f"assistant:insights:{user_id}:{portal_mode}:{employer_id}:{int(year)}:{int(month)}"
+
+
+def _money_text(amount):
+    value = amount
+    if value is None:
+        value = Decimal("0.00")
+    elif not isinstance(value, Decimal):
+        try:
+            value = Decimal(str(value))
+        except Exception:
+            value = Decimal("0.00")
+    return f"{value.quantize(Decimal('0.01')):,.2f}"
+
+
+def _build_operational_insight_snapshot(request, context, year, month):
+    cache_key = _insight_snapshot_cache_key(request.user.id, context, year, month)
+    cached = cache.get(cache_key)
+    if isinstance(cached, dict):
+        return cached
+
+    employer = context.get("employer")
+    snapshot = {
+        "has_employer_context": bool(employer),
+        "portal_mode": context.get("portal_mode"),
+        "year": int(year),
+        "month": int(month),
+        "sections": {},
+        "next_route": "",
+    }
+    if not employer:
+        return snapshot
+
+    today = timezone.now().date()
+    horizon = today + timedelta(days=30)
+    employer_id = employer.id
+    portal_mode = context.get("portal_mode")
+    employee = _resolve_employee_for_context(request, context) if portal_mode == "employee" else None
+    route_candidates = []
+
+    def add_route_candidate(*, priority, count, route):
+        if not route:
+            return
+        if not count or int(count) <= 0:
+            return
+        route_candidates.append((int(priority), int(count), route))
+
+    try:
+        from payroll.models import Salary
+
+        payroll_qs = Salary.objects.filter(employer_id=employer_id, year=year, month=month)
+        if portal_mode == "employee":
+            if employee:
+                payroll_qs = payroll_qs.filter(employee=employee)
+            else:
+                payroll_qs = payroll_qs.none()
+
+        status_counts = {
+            "simulated": payroll_qs.filter(status=Salary.STATUS_SIMULATED).count(),
+            "generated": payroll_qs.filter(status=Salary.STATUS_GENERATED).count(),
+            "validated": payroll_qs.filter(status=Salary.STATUS_VALIDATED).count(),
+            "archived": payroll_qs.filter(status=Salary.STATUS_ARCHIVED).count(),
+        }
+        totals = payroll_qs.aggregate(
+            net_total=Sum("net_salary"),
+            gross_total=Sum("gross_salary"),
+        )
+        payslip_count = payroll_qs.count()
+
+        payroll_section = {
+            "route": "/employee/payslips" if portal_mode == "employee" else "/employer/payroll",
+            "status": status_counts,
+            "count": payslip_count,
+            "net_total": _money_text(totals.get("net_total")),
+            "gross_total": _money_text(totals.get("gross_total")),
+        }
+        if portal_mode == "employee":
+            latest = payroll_qs.order_by("-updated_at", "-created_at").first()
+            payroll_section["latest_net"] = _money_text(getattr(latest, "net_salary", None))
+            add_route_candidate(
+                priority=4,
+                count=payslip_count,
+                route=payroll_section["route"],
+            )
+        else:
+            payroll_section["employees"] = payroll_qs.values("employee_id").distinct().count()
+            add_route_candidate(
+                priority=9,
+                count=status_counts["generated"],
+                route=payroll_section["route"],
+            )
+            add_route_candidate(
+                priority=5,
+                count=status_counts["simulated"],
+                route=payroll_section["route"],
+            )
+
+        snapshot["sections"]["payroll"] = payroll_section
+    except Exception as exc:
+        logger.debug("Assistant payroll insight snapshot failed: %s", exc)
+
+    try:
+        from timeoff.models import TimeOffRequest
+
+        timeoff_qs = TimeOffRequest.objects.filter(
+            employer_id=employer_id,
+            created_at__year=year,
+            created_at__month=month,
+        )
+        if portal_mode == "employee":
+            if employee:
+                timeoff_qs = timeoff_qs.filter(employee=employee)
+            else:
+                timeoff_qs = timeoff_qs.none()
+
+        pending = timeoff_qs.filter(status__in=["SUBMITTED", "PENDING"]).count()
+        approved = timeoff_qs.filter(status="APPROVED").count()
+        rejected = timeoff_qs.filter(status="REJECTED").count()
+        cancelled = timeoff_qs.filter(status="CANCELLED").count()
+
+        timeoff_section = {
+            "route": "/employee/time-off" if portal_mode == "employee" else "/employer/time-off",
+            "pending": pending,
+            "approved": approved,
+            "rejected": rejected,
+            "cancelled": cancelled,
+            "count": timeoff_qs.count(),
+        }
+        snapshot["sections"]["timeoff"] = timeoff_section
+        add_route_candidate(priority=8, count=pending, route=timeoff_section["route"])
+    except Exception as exc:
+        logger.debug("Assistant timeoff insight snapshot failed: %s", exc)
+
+    try:
+        from contracts.models import Contract
+
+        contract_qs = Contract.objects.filter(employer_id=employer_id)
+        if portal_mode == "employee":
+            if employee:
+                contract_qs = contract_qs.filter(employee=employee)
+            else:
+                contract_qs = contract_qs.none()
+
+        pending_approval = contract_qs.filter(status="PENDING_APPROVAL").count()
+        pending_signature = contract_qs.filter(status="PENDING_SIGNATURE").count()
+        active = contract_qs.filter(status="ACTIVE").count()
+        expiring_soon = contract_qs.filter(
+            end_date__isnull=False,
+            end_date__gte=today,
+            end_date__lte=horizon,
+            status__in=["ACTIVE", "SIGNED", "APPROVED", "PENDING_SIGNATURE"],
+        ).count()
+
+        contracts_section = {
+            "route": "/employee/contracts" if portal_mode == "employee" else "/employer/contracts",
+            "pending_approval": pending_approval,
+            "pending_signature": pending_signature,
+            "active": active,
+            "expiring_soon": expiring_soon,
+        }
+        snapshot["sections"]["contracts"] = contracts_section
+        add_route_candidate(priority=8, count=pending_signature, route=contracts_section["route"])
+        add_route_candidate(priority=8, count=pending_approval, route=contracts_section["route"])
+        add_route_candidate(priority=4, count=expiring_soon, route=contracts_section["route"])
+    except Exception as exc:
+        logger.debug("Assistant contract insight snapshot failed: %s", exc)
+
+    try:
+        from attendance.models import AttendanceRecord
+
+        attendance_qs = AttendanceRecord.objects.filter(
+            employer_id=employer_id,
+            check_in_at__year=year,
+            check_in_at__month=month,
+        )
+        if portal_mode == "employee":
+            if employee:
+                attendance_qs = attendance_qs.filter(employee=employee)
+            else:
+                attendance_qs = attendance_qs.none()
+
+        to_approve = attendance_qs.filter(status=AttendanceRecord.STATUS_TO_APPROVE).count()
+        missing_checkout = attendance_qs.filter(check_out_at__isnull=True).count()
+        approved = attendance_qs.filter(status=AttendanceRecord.STATUS_APPROVED).count()
+
+        attendance_section = {
+            "route": "/employee/attendance" if portal_mode == "employee" else "/employer/attendance",
+            "to_approve": to_approve,
+            "missing_checkout": missing_checkout,
+            "approved": approved,
+            "count": attendance_qs.count(),
+        }
+        snapshot["sections"]["attendance"] = attendance_section
+        add_route_candidate(priority=7, count=to_approve, route=attendance_section["route"])
+        add_route_candidate(priority=5, count=missing_checkout, route=attendance_section["route"])
+    except Exception as exc:
+        logger.debug("Assistant attendance insight snapshot failed: %s", exc)
+
+    if portal_mode != "employee":
+        try:
+            from employees.models import TerminationApproval
+
+            termination_qs = TerminationApproval.objects.filter(employee__employer_id=employer_id)
+            pending = termination_qs.filter(status="PENDING").count()
+            approved_in_period = termination_qs.filter(
+                status="APPROVED",
+                updated_at__year=year,
+                updated_at__month=month,
+            ).count()
+            created_in_period = termination_qs.filter(
+                created_at__year=year,
+                created_at__month=month,
+            ).count()
+
+            termination_section = {
+                "route": "/employer/employees",
+                "pending": pending,
+                "approved_in_period": approved_in_period,
+                "created_in_period": created_in_period,
+            }
+            snapshot["sections"]["terminations"] = termination_section
+            add_route_candidate(priority=7, count=pending, route=termination_section["route"])
+        except Exception as exc:
+            logger.debug("Assistant termination insight snapshot failed: %s", exc)
+
+    if route_candidates:
+        route_candidates.sort(key=lambda row: (row[0], row[1]), reverse=True)
+        snapshot["next_route"] = route_candidates[0][2]
+
+    cache.set(cache_key, snapshot, timeout=INSIGHT_SNAPSHOT_CACHE_TTL_SECONDS)
+    return snapshot
+
+
+def _build_operational_insight_reply(snapshot, context, language="en"):
+    if not snapshot.get("has_employer_context"):
+        if language == "fr":
+            return (
+                "Je ne peux pas produire un resume operationnel sans employeur actif. "
+                "Selectionnez un employeur puis relancez votre demande."
+            )
+        return (
+            "I cannot produce an operational summary without an active employer context. "
+            "Select an employer and ask again."
+        )
+
+    sections = snapshot.get("sections") or {}
+    if not sections:
+        if language == "fr":
+            return "Je n'ai trouve aucune donnee exploitable pour ce mois."
+        return "I could not find usable operational data for this period."
+
+    period_label = _format_period_label(snapshot.get("year"), snapshot.get("month"), language=language)
+    portal_mode = context.get("portal_mode")
+    lines = []
+
+    if language == "fr":
+        lines.append(f"Resume operationnel pour {period_label}:")
+    else:
+        lines.append(f"Operational summary for {period_label}:")
+
+    summary_lines = []
+    payroll = sections.get("payroll")
+    if payroll:
+        if portal_mode == "employee":
+            if language == "fr":
+                summary_lines.append(
+                    f"Paie: {payroll['count']} bulletin(s), dernier net {payroll['latest_net']}."
+                )
+            else:
+                summary_lines.append(
+                    f"Payslips: {payroll['count']} record(s), latest net salary {payroll['latest_net']}."
+                )
+        else:
+            status = payroll.get("status", {})
+            if language == "fr":
+                summary_lines.append(
+                    "Paie: "
+                    f"{payroll.get('employees', 0)} employe(s), "
+                    f"{status.get('generated', 0)} genere(s), "
+                    f"{status.get('validated', 0)} valide(s), "
+                    f"net total {payroll['net_total']}."
+                )
+            else:
+                summary_lines.append(
+                    "Payroll: "
+                    f"{payroll.get('employees', 0)} employee(s), "
+                    f"{status.get('generated', 0)} generated, "
+                    f"{status.get('validated', 0)} validated, "
+                    f"net total {payroll['net_total']}."
+                )
+
+    timeoff = sections.get("timeoff")
+    if timeoff:
+        if language == "fr":
+            summary_lines.append(
+                "Conges: "
+                f"{timeoff['pending']} en attente, {timeoff['approved']} approuve(s), "
+                f"{timeoff['rejected']} rejete(s)."
+            )
+        else:
+            summary_lines.append(
+                "Time Off: "
+                f"{timeoff['pending']} pending, {timeoff['approved']} approved, "
+                f"{timeoff['rejected']} rejected."
+            )
+
+    contracts = sections.get("contracts")
+    if contracts:
+        if language == "fr":
+            summary_lines.append(
+                "Contrats: "
+                f"{contracts['pending_approval']} en attente d'approbation, "
+                f"{contracts['pending_signature']} en attente de signature, "
+                f"{contracts['expiring_soon']} expirent sous 30 jours."
+            )
+        else:
+            summary_lines.append(
+                "Contracts: "
+                f"{contracts['pending_approval']} pending approval, "
+                f"{contracts['pending_signature']} pending signature, "
+                f"{contracts['expiring_soon']} expiring within 30 days."
+            )
+
+    attendance = sections.get("attendance")
+    if attendance:
+        if language == "fr":
+            summary_lines.append(
+                "Presence: "
+                f"{attendance['to_approve']} a approuver, "
+                f"{attendance['missing_checkout']} sans check-out."
+            )
+        else:
+            summary_lines.append(
+                "Attendance: "
+                f"{attendance['to_approve']} awaiting approval, "
+                f"{attendance['missing_checkout']} missing check-outs."
+            )
+
+    terminations = sections.get("terminations")
+    if terminations:
+        if language == "fr":
+            summary_lines.append(
+                "Fins de contrat: "
+                f"{terminations['pending']} en attente, {terminations['created_in_period']} creees ce mois."
+            )
+        else:
+            summary_lines.append(
+                "Terminations: "
+                f"{terminations['pending']} pending approvals, {terminations['created_in_period']} created this month."
+            )
+
+    for index, line in enumerate(summary_lines, start=1):
+        lines.append(f"{index}. {line}")
+
+    if (snapshot.get("next_route") or "").strip():
+        if language == "fr":
+            lines.append("Prochaine action recommandee: ouvrez le module prioritaire dans votre menu.")
+        else:
+            lines.append("Recommended next action: open the highest-priority module in your menu.")
+
     return "\n".join(lines)
 
 
@@ -1546,11 +2214,11 @@ def _build_proactive_nudge_reply(*, context, topics, page_path, language, snapsh
         if language == "fr":
             return (
                 f"Nudge: {module_item['count']} {module_item['title']}. "
-                f"Prochaine action: ouvrez {module_item['route']}."
+                "Prochaine action: ouvrez ce module depuis le menu et traitez l'element le plus ancien."
             )
         return (
             f"Nudge: {module_item['count']} {module_item['title']}. "
-            f"Next best action: open {module_item['route']}."
+            "Next best action: open this module from your menu and process the oldest pending item."
         )
 
     if page_topic and page_topic.guidance:
@@ -1595,6 +2263,7 @@ def _build_suggestions(matched_topics, all_topics, language="en", portal_mode="e
                 [
                     f"Comment finaliser rapidement une tache dans {main} ?",
                     f"Montre-moi les actions prioritaires dans {main}.",
+                    f"Donne-moi le resume mensuel pour {main}.",
                     f"Reprends mon workflow precedent dans {main}.",
                     f"Ou trouver {secondary} dans mon menu ?",
                 ]
@@ -1604,6 +2273,7 @@ def _build_suggestions(matched_topics, all_topics, language="en", portal_mode="e
                 [
                     f"How do I complete key tasks in {main}?",
                     f"What needs attention in {main} right now?",
+                    f"Give me the monthly summary for {main}.",
                     f"Continue my previous {main} workflow.",
                     f"Where can I find {secondary} in my menu?",
                 ]
@@ -1613,13 +2283,16 @@ def _build_suggestions(matched_topics, all_topics, language="en", portal_mode="e
         portal_defaults = {
             "admin": [
                 "Qu'est-ce qui demande mon attention maintenant ?",
+                "Donne-moi le resume operationnel de ce mois.",
                 "Comment controler rapidement les comptes employeurs ?",
             ],
             "employer": [
                 "Qu'est-ce qui demande mon attention maintenant ?",
+                "Donne-moi le resume operationnel de ce mois.",
                 "Comment approuver vite les demandes de conge ?",
             ],
             "employee": [
+                "Donne-moi le resume de ce mois.",
                 "Ou verifier mon bulletin de paie ce mois-ci ?",
                 "Comment signer rapidement mon contrat ?",
             ],
@@ -1630,13 +2303,16 @@ def _build_suggestions(matched_topics, all_topics, language="en", portal_mode="e
         portal_defaults = {
             "admin": [
                 "What needs my attention now?",
+                "Give me the operational summary for this month.",
                 "How do I quickly review employer accounts?",
             ],
             "employer": [
                 "What needs my attention now?",
+                "Give me the operational summary for this month.",
                 "How do I quickly approve leave requests?",
             ],
             "employee": [
+                "Give me a summary for this month.",
                 "Where can I view my payslip for this month?",
                 "How do I sign and download my contract?",
             ],
@@ -1744,7 +2420,6 @@ def _build_knowledge_scope(topics, limit=18):
             {
                 "title": topic.title,
                 "menu_label": topic.sidebar_label,
-                "route": topic.route,
                 "example_question": topic.example_question,
             }
         )
@@ -1767,7 +2442,7 @@ def _build_rule_based_reply(*, message, matched_topics, all_topics, context, lan
             if related:
                 lines.append("Modules proches dans votre portail:")
                 for index, topic in enumerate(related, start=1):
-                    lines.append(f"{index}. {topic.sidebar_label} ({topic.route})")
+                    lines.append(f"{index}. {topic.sidebar_label}")
             lines.extend(
                 [
                     "Verification rapide:",
@@ -1789,7 +2464,7 @@ def _build_rule_based_reply(*, message, matched_topics, all_topics, context, lan
         if related:
             lines.append("Closest modules in your portal:")
             for index, topic in enumerate(related, start=1):
-                lines.append(f"{index}. {topic.sidebar_label} ({topic.route})")
+                lines.append(f"{index}. {topic.sidebar_label}")
         lines.extend(
             [
                 "Rapid checks:",
@@ -1809,14 +2484,12 @@ def _build_rule_based_reply(*, message, matched_topics, all_topics, context, lan
             lines = [
                 topic.title,
                 f"Module: {topic.sidebar_label}",
-                f"Route: {topic.route}",
                 "Plan d'execution:",
             ]
         else:
             lines = [
                 topic.title,
                 f"Module: {topic.sidebar_label}",
-                f"Route: {topic.route}",
                 "Execution plan:",
             ]
         for index, step in enumerate(topic.guidance, start=1):
@@ -1869,6 +2542,40 @@ def _safe_json_dumps(value):
         return "{}"
 
 
+def _sanitize_user_reply_text(text):
+    if not isinstance(text, str):
+        return text
+
+    cleaned = text.strip()
+    if not cleaned:
+        return cleaned
+
+    cleaned = URL_PATTERN.sub("", cleaned)
+
+    def _open_path_replacer(match):
+        verb = (match.group(1) or "").strip().lower()
+        if verb == "ouvrez":
+            return "ouvrez le module"
+        return "open the module"
+
+    cleaned = OPEN_PATH_PATTERN.sub(_open_path_replacer, cleaned)
+    cleaned = PAREN_PATH_PATTERN.sub("", cleaned)
+    cleaned = PATH_PATTERN.sub("", cleaned)
+    cleaned = re.sub(r"(?im)^\s*(route|path|endpoint|url)\s*:\s*.*$", "", cleaned)
+    cleaned = re.sub(r"(?im)^\s*(open|ouvrez)\s*:\s*$", "", cleaned)
+    cleaned = re.sub(r"\(\s*\)", "", cleaned)
+    cleaned = re.sub(r"\s+([,.;:!?])", r"\1", cleaned)
+    cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    cleaned = "\n".join(line.rstrip() for line in cleaned.splitlines()).strip()
+    if cleaned:
+        return cleaned
+
+    if any(word in _normalize(text) for word in FRENCH_HINTS):
+        return "Ouvrez le module concerne depuis votre menu et je vous guide etape par etape."
+    return "Open the relevant module from your menu and I will guide you step by step."
+
+
 def _llm_settings():
     enable_llm = bool(getattr(settings, "ASSISTANT_ENABLE_LLM", False))
     api_key = getattr(settings, "ASSISTANT_OPENAI_API_KEY", "") or os.getenv("OPENAI_API_KEY", "")
@@ -1901,13 +2608,13 @@ def _extract_openai_text(response):
 
 
 def _build_llm_prompts(*, context, language, page_path, message, history, matched_topics, all_topics, out_of_scope):
+    current_topic = _topic_from_page_path(page_path, all_topics)
     references = []
     for topic in matched_topics[:4]:
         references.append(
             {
                 "title": topic.title,
                 "menu_label": topic.sidebar_label,
-                "route": topic.route,
                 "guidance": list(topic.guidance),
                 "keywords": list(topic.keywords),
             }
@@ -1926,7 +2633,8 @@ def _build_llm_prompts(*, context, language, page_path, message, history, matche
         "- Respect role and portal scope. Never suggest unauthorized actions.\n"
         "- If unsure, say so and ask one clarifying question.\n"
         "- Do not provide legal, medical, or investment advice.\n"
-        "- Keep answers actionable: route/menu, then step-by-step actions.\n"
+        "- Keep answers actionable: menu/module names and step-by-step actions only.\n"
+        "- Never include raw URLs, API endpoints, backend paths, or route strings like /employer/payroll.\n"
         "- If issue seems access-related, include employer context and permission checks.\n"
         "- Avoid hallucinating modules that are not in the knowledge scope.\n"
         "Output style:\n"
@@ -1938,7 +2646,7 @@ def _build_llm_prompts(*, context, language, page_path, message, history, matche
     runtime_context = {
         "portal_mode": context["portal_mode"],
         "available_portals": context["available_portals"],
-        "page_path": page_path,
+        "current_menu": current_topic.sidebar_label if current_topic else None,
         "employer": {
             "id": context["employer"].id,
             "name": context["employer"].company_name,
@@ -2050,6 +2758,7 @@ def generate_assistant_reply(request, validated_payload):
         request,
         requested_portal_mode=validated_payload.get("portal_mode"),
     )
+    actor = _resolve_actor_identity(request, context)
     topics = _available_topics_for_context(context)
     if not topics:
         raise PermissionDenied("No assistant topics are available for your access level.")
@@ -2058,6 +2767,7 @@ def generate_assistant_reply(request, validated_payload):
     lowered_message = _normalize(message)
     out_of_scope = any(term in lowered_message for term in OUT_OF_SCOPE_TERMS)
     attention_intent = _is_attention_copilot_request(message)
+    insight_intent = _is_insight_request(message)
     continue_intent = _is_workflow_continue_request(message)
     small_talk_intent = _detect_small_talk_intent(message)
 
@@ -2072,6 +2782,8 @@ def generate_assistant_reply(request, validated_payload):
     mode = "knowledge"
     llm_status = "not_used"
     attention_snapshot = None
+    insight_snapshot = None
+    insight_payload = None
     memory_items = []
 
     if interaction_type == "nudge":
@@ -2126,6 +2838,31 @@ def generate_assistant_reply(request, validated_payload):
             copilot_topics.append(topic)
         if copilot_topics:
             references = _build_references(copilot_topics)
+    elif insight_intent:
+        insight_year, insight_month = _resolve_insight_period(message)
+        insight_snapshot = _build_operational_insight_snapshot(
+            request,
+            context,
+            year=insight_year,
+            month=insight_month,
+        )
+        reply = _build_operational_insight_reply(insight_snapshot, context, language=language)
+        mode = "insights"
+        confidence = max(confidence, 0.9)
+
+        insight_topics = []
+        for section in (insight_snapshot.get("sections") or {}).values():
+            route = (section.get("route") or "").strip()
+            if not route:
+                continue
+            topic = _topic_from_page_path(route, topics)
+            if not topic:
+                continue
+            if topic.id in {row.id for row in insight_topics}:
+                continue
+            insight_topics.append(topic)
+        if insight_topics:
+            references = _build_references(insight_topics)
     elif continue_intent:
         memory_items = _load_workflow_memory(request.user.id, context)
         memory_entry = _select_workflow_memory_entry(
@@ -2194,6 +2931,21 @@ def generate_assistant_reply(request, validated_payload):
     if employer:
         employer_payload = {"id": employer.id, "name": employer.company_name}
 
+    if insight_snapshot:
+        insight_payload = {
+            "period": {
+                "year": insight_snapshot.get("year"),
+                "month": insight_snapshot.get("month"),
+                "label": _format_period_label(
+                    insight_snapshot.get("year"),
+                    insight_snapshot.get("month"),
+                    language=language,
+                ),
+            },
+            "next_route": (insight_snapshot.get("next_route") or "").strip() or None,
+            "sections": insight_snapshot.get("sections") or {},
+        }
+
     suggestion_topics = matched_topics
     if interaction_type == "nudge" and page_topic:
         suggestion_topics = [page_topic] + [topic for topic in matched_topics if topic.id != page_topic.id]
@@ -2206,6 +2958,7 @@ def generate_assistant_reply(request, validated_payload):
         page_path=page_path,
     )
     last_assistant = _extract_last_assistant_message(history)
+    reply = _sanitize_user_reply_text(reply)
 
     return {
         "reply": reply,
@@ -2217,15 +2970,25 @@ def generate_assistant_reply(request, validated_payload):
         "mode": mode,
         "confidence": confidence,
         "employer": employer_payload,
+        "actor": actor,
+        "insights": insight_payload,
         "context": {
             "current_page": page_path or None,
             "history_used": len(history),
             "had_previous_assistant_reply": bool(last_assistant),
             "llm_status": llm_status,
             "small_talk_intent": small_talk_intent,
+            "insight_intent": insight_intent,
             "knowledge_topics": len(topics),
             "interaction_type": interaction_type,
             "attention_items": (attention_snapshot or {}).get("total", 0),
+            "actor_role": actor.get("role"),
+            "insight_period": {
+                "year": (insight_snapshot or {}).get("year"),
+                "month": (insight_snapshot or {}).get("month"),
+            }
+            if insight_snapshot
+            else None,
             "workflow_memory_items": len(memory_items),
         },
     }

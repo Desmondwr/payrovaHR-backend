@@ -338,6 +338,55 @@ class PayrollFeatureTests(TestCase):
         line = SalaryDeduction.objects.get(salary=salary, code="CNPS_EMP")
         self.assertEqual(line.amount, Decimal("10000"))
 
+    def test_base_salary_alias_is_resolved_for_rate_deduction_basis(self):
+        basic = self._create_allowance(name="Basic Salary", code="BASIC", amount="100000", sys="BASIC_SALARY")
+        self.contract.base_salary = Decimal("100000.00")
+        self.contract.save()
+        self._link_basis("SAL-BRUT", allowance=basic)
+        self._link_basis("SAL-BRUT-TAX", allowance=basic)
+        self._link_basis("SAL-BRUT-TAX-IRPP", allowance=basic)
+        self._add_advantage_element(basic, amount="100000")
+
+        deduction = self._create_deduction(
+            name="Alias Basis Deduction",
+            code="ALIAS10",
+            calculation_basis="BASE_SALARY",
+            is_rate=True,
+            employee_rate=Decimal("10.00"),
+        )
+        self._add_deduction_element(deduction)
+
+        salary = self._run()
+        line = SalaryDeduction.objects.get(salary=salary, code="ALIAS10")
+        self.assertEqual(line.base_amount, Decimal("100000"))
+        self.assertEqual(line.amount, Decimal("10000"))
+
+    def test_irpp_uses_base_salary_alias_for_base_amount(self):
+        self.config.irpp_withholding_threshold = Decimal("0.00")
+        self.config.save(update_fields=["irpp_withholding_threshold", "updated_at"])
+
+        basic = self._create_allowance(name="Basic Salary", code="BASIC", amount="100000", sys="BASIC_SALARY")
+        self.contract.base_salary = Decimal("100000.00")
+        self.contract.save()
+        self._link_basis("SAL-BRUT", allowance=basic)
+        self._link_basis("SAL-BRUT-TAX", allowance=basic)
+        self._link_basis("SAL-BRUT-TAX-IRPP", allowance=basic)
+        self._add_advantage_element(basic, amount="100000")
+
+        irpp = self._create_deduction(
+            name="IRPP",
+            code="IRPP",
+            sys="IRPP",
+            calculation_basis="BASE_SALARY",
+            is_scale=True,
+        )
+        self._add_deduction_element(irpp)
+
+        salary = self._run()
+        line = SalaryDeduction.objects.get(salary=salary, code="IRPP")
+        self.assertEqual(line.base_amount, Decimal("100000"))
+        self.assertGreater(line.amount, Decimal("0"))
+
     def test_fixed_deduction_without_code_or_sys_uses_element_amount(self):
         basic = self._create_allowance(name="Basic Salary", code="BASIC", amount="100000", sys="BASIC_SALARY")
         self._link_basis("SAL-BRUT", allowance=basic)
