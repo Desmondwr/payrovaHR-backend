@@ -788,17 +788,41 @@ class AttendanceRecordViewSet(viewsets.ReadOnlyModelViewSet):
     def approve(self, request, pk=None):
         record = self.get_object()
         tenant_db = record._state.db or "default"
+        requested_value = (
+            request.data.get("overtime_approved_minutes")
+            or request.data.get("approved_extra_minutes")
+            or request.data.get("extra_minutes")
+        )
+        if requested_value is None or requested_value == "":
+            value = int(record.overtime_worked_minutes or 0)
+        else:
+            try:
+                value = max(int(requested_value), 0)
+            except Exception:
+                value = int(record.overtime_worked_minutes or 0)
+        if record.overtime_worked_minutes and value > record.overtime_worked_minutes:
+            value = int(record.overtime_worked_minutes or 0)
+        record.overtime_approved_minutes = value
         record.status = AttendanceRecord.STATUS_APPROVED
-        record.save(using=tenant_db, update_fields=["status", "updated_at"])
+        record.save(using=tenant_db, update_fields=["overtime_approved_minutes", "status", "updated_at"])
         return Response(self.get_serializer(record).data)
 
     @action(detail=True, methods=["post"], url_path="refuse", permission_classes=[IsAuthenticated, EmployerAccessPermission])
     def refuse(self, request, pk=None):
         record = self.get_object()
         tenant_db = record._state.db or "default"
-        record.status = AttendanceRecord.STATUS_REFUSED
-        record.anomaly_reason = request.data.get("reason") or record.anomaly_reason
-        record.save(using=tenant_db, update_fields=["status", "anomaly_reason", "updated_at"])
+        reason = request.data.get("reason")
+        record.overtime_approved_minutes = 0
+        # Reject overtime request but keep attendance checkout registered/approved.
+        record.status = AttendanceRecord.STATUS_APPROVED
+        if reason:
+            record.anomaly_reason = append_anomaly_reason(record.anomaly_reason, f"Overtime rejected: {reason}")
+        else:
+            record.anomaly_reason = append_anomaly_reason(record.anomaly_reason, "Overtime rejected")
+        record.save(
+            using=tenant_db,
+            update_fields=["overtime_approved_minutes", "status", "anomaly_reason", "updated_at"],
+        )
         return Response(self.get_serializer(record).data)
 
     @action(
@@ -809,7 +833,12 @@ class AttendanceRecordViewSet(viewsets.ReadOnlyModelViewSet):
     )
     def partial_approve(self, request, pk=None):
         record = self.get_object()
-        serializer = PartialApproveSerializer(data=request.data)
+        payload = dict(request.data or {})
+        if payload.get("overtime_approved_minutes") in (None, ""):
+            alias = payload.get("approved_extra_minutes")
+            if alias not in (None, ""):
+                payload["overtime_approved_minutes"] = alias
+        serializer = PartialApproveSerializer(data=payload)
         serializer.is_valid(raise_exception=True)
         value = serializer.validated_data["overtime_approved_minutes"]
         if record.overtime_worked_minutes and value > record.overtime_worked_minutes:
@@ -1023,8 +1052,50 @@ class AttendanceStatusView(APIView):
             .order_by("-check_in_at")
             .first()
         )
+
+        now = timezone.now()
+        today = timezone.localdate(now)
+        previous_minutes_today = (
+            AttendanceRecord.objects.using(tenant_db)
+            .filter(
+                employee=employee,
+                check_in_at__date=today,
+                check_out_at__isnull=False,
+            )
+            .aggregate(total=models.Sum("worked_minutes"))
+            .get("total")
+            or 0
+        )
+
+        open_minutes = 0
+        if open_record and timezone.localdate(open_record.check_in_at) == today:
+            config = ensure_attendance_configuration(employee.employer_id, tenant_db)
+            try:
+                open_minutes = compute_worked_minutes_for_employee(
+                    employee,
+                    open_record.check_in_at,
+                    now,
+                    config,
+                    tenant_db,
+                    tz_override=getattr(open_record, "check_in_timezone", None),
+                )
+            except Exception:
+                # Fallback to raw elapsed minutes if schedule-based computation fails.
+                open_minutes = max(int((now - open_record.check_in_at).total_seconds() // 60), 0)
+
+        total_today_minutes = max(int(previous_minutes_today) + int(open_minutes), 0)
         status_payload = {
             "checked_in": open_record is not None,
+            "is_checked_in": open_record is not None,
+            "open_session": open_record is not None,
+            "check_in_at": open_record.check_in_at if open_record else None,
+            "check_in_time": open_record.check_in_at if open_record else None,
+            "current_check_in_at": open_record.check_in_at if open_record else None,
+            "previous_minutes_today": int(previous_minutes_today),
+            "previous_total_today": int(previous_minutes_today),
+            "total_today_minutes": int(total_today_minutes),
+            "total_minutes_today": int(total_today_minutes),
+            "total_minutes": int(total_today_minutes),
             "current_record": AttendanceRecordSerializer(open_record).data if open_record else None,
             "last_record": AttendanceRecordSerializer(last_record).data if last_record else None,
         }

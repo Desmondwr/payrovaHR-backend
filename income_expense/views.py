@@ -420,7 +420,11 @@ class ExpenseClaimViewSet(SoftDeleteMixin, IncomeExpenseTenantViewSet):
                 employer_actor = True
                 employer = resolved
 
-        if employee and not employer_actor:
+        requested_employee = serializer.validated_data.get("employee")
+
+        # Employee portal: always allow self-claims, even when tenant context also resolves
+        # an employer/delegate role through headers.
+        if employee and (not requested_employee or str(requested_employee.id) == str(employee.id)):
             draft = serializer.save(
                 institution_id=institution.id,
                 employee=employee,
@@ -431,6 +435,9 @@ class ExpenseClaimViewSet(SoftDeleteMixin, IncomeExpenseTenantViewSet):
             validate_expense_submission(draft, config)
             draft.save()
             return
+
+        if employee and requested_employee and str(requested_employee.id) != str(employee.id) and not employer_actor:
+            raise PermissionDenied("You can only create expenses for your own employee profile.")
 
         if employer_actor:
             if not serializer.validated_data.get("employee"):

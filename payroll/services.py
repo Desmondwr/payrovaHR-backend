@@ -415,7 +415,12 @@ class PayrollCalculationService:
             if expected > worked:
                 absence_minutes += expected - worked
 
-            overtime = max(int(record.overtime_approved_minutes or record.overtime_worked_minutes or 0), 0)
+            approved_overtime = (
+                record.overtime_approved_minutes
+                if record.overtime_approved_minutes is not None
+                else record.overtime_worked_minutes
+            )
+            overtime = max(int(approved_overtime or 0), 0)
             overtime_minutes += Decimal(str(overtime))
 
         absence_days = absence_minutes / minutes_per_day

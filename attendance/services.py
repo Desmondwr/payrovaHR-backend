@@ -636,6 +636,16 @@ def perform_check_out(
     else:
         record.overtime_worked_minutes = 0
 
+    overtime_reason = str(payload.get("overtime_reason") or "").strip()
+    request_overtime_approval = bool(payload.get("request_overtime_approval"))
+    if record.overtime_worked_minutes > 0 and (request_overtime_approval or overtime_reason):
+        record.status = AttendanceRecord.STATUS_TO_APPROVE
+        if overtime_reason:
+            record.anomaly_reason = append_anomaly_reason(
+                record.anomaly_reason,
+                f"Overtime justification: {overtime_reason}",
+            )
+
     # Auto-flag anomalies
     if config.auto_flag_anomalies and config.max_daily_work_minutes_before_flag:
         if record.worked_minutes > config.max_daily_work_minutes_before_flag:

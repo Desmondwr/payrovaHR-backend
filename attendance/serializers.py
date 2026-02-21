@@ -589,6 +589,8 @@ class AttendanceCheckOutSerializer(serializers.Serializer):
     wifi_bssid = serializers.CharField(required=False, allow_blank=True, allow_null=True)
     device_time = serializers.DateTimeField(required=False)
     timezone = serializers.CharField(required=False, allow_blank=True, allow_null=True)
+    request_overtime_approval = serializers.BooleanField(required=False, default=False)
+    overtime_reason = serializers.CharField(required=False, allow_blank=True, allow_null=True)
 
 
 class AttendanceManualCreateSerializer(serializers.Serializer):
