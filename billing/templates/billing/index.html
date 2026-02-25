@@ -1,0 +1,477 @@
+{% load static %}
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>PayrovaHR Billing</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@300;400;500;600&family=Space+Grotesk:wght@400;600;700&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="{% static 'billing/app.css' %}" />
+    <script defer src="{% static 'billing/app.js' %}"></script>
+  </head>
+  <body>
+    <div class="backdrop"></div>
+    <div class="toast" id="toast" role="status" aria-live="polite"></div>
+
+    <div class="shell">
+      <header class="hero">
+        <div class="hero-copy">
+          <p class="eyebrow">Billing Module</p>
+          <h1>Billing Command Center</h1>
+          <p class="subtitle">
+            Track funding sources, payout destinations, subscriptions, invoices, and payroll flows without
+            mixing responsibilities or compromising audit trails.
+          </p>
+
+          <div class="kpi-grid">
+            <div class="kpi">
+              <p class="kpi-label">Active plan</p>
+              <p class="kpi-value" id="statPlan">No data</p>
+            </div>
+            <div class="kpi">
+              <p class="kpi-label">Next billing date</p>
+              <p class="kpi-value" id="statNext">Not scheduled</p>
+            </div>
+            <div class="kpi">
+              <p class="kpi-label">Open invoices</p>
+              <p class="kpi-value" id="statInvoices">0</p>
+            </div>
+            <div class="kpi">
+              <p class="kpi-label">Pending payouts</p>
+              <p class="kpi-value" id="statPayroll">0</p>
+            </div>
+          </div>
+        </div>
+
+        <aside class="connect-card">
+          <div class="card-head">
+            <div>
+              <h2>API Connection</h2>
+              <p class="muted">Use the correct token for each console mode.</p>
+            </div>
+            <span class="pill" id="modePill" data-tone="info">Employer mode</span>
+          </div>
+          <label>
+            Base URL
+            <input id="baseUrl" placeholder="http://127.0.0.1:8000/api" />
+          </label>
+          <label>
+            Employer token
+            <input id="employerToken" placeholder="Bearer token" />
+          </label>
+          <label>
+            Employee token
+            <input id="employeeToken" placeholder="Bearer token" />
+          </label>
+          <label>
+            Employer ID
+            <input id="employerId" placeholder="Employer ID" />
+          </label>
+          <div class="hero-actions">
+            <button class="btn" id="saveConfig">Save</button>
+            <button class="btn ghost" id="loadConfig">Load</button>
+          </div>
+          <p class="hint">Employer mode uses the employer token and employer ID header.</p>
+        </aside>
+      </header>
+
+      <nav class="mode-toggle">
+        <button id="employerMode" class="btn ghost active">Employer Console</button>
+        <button id="employeeMode" class="btn ghost">Employee Console</button>
+      </nav>
+
+      <main>
+        <section id="employerSection">
+          <div class="section-header">
+            <h2>Employer Console</h2>
+            <p>Manage funding methods, subscriptions, invoices, transactions, and payouts.</p>
+          </div>
+
+          <div class="grid">
+            <div class="card">
+              <div class="card-head">
+                <div>
+                  <h3>GbPay Connections</h3>
+                  <p class="muted">Store employer GbPay agent credentials and validate access.</p>
+                </div>
+                <button class="btn ghost small" id="refreshGbpay">Refresh</button>
+              </div>
+              <form id="gbpayForm">
+                <div class="row">
+                  <label>
+                    Label
+                    <input name="label" placeholder="Primary GbPay agent" />
+                  </label>
+                </div>
+                <div class="row">
+                  <label>
+                    API key
+                    <input name="api_key" placeholder="GbPay API key" />
+                  </label>
+                </div>
+                <div class="row">
+                  <label>
+                    Secret key
+                    <input name="secret_key" placeholder="GbPay secret key" />
+                  </label>
+                </div>
+                <div class="row">
+                  <label>
+                    Scope
+                    <input name="scope" placeholder="third-party" />
+                  </label>
+                </div>
+                <button class="btn" type="submit">Save GbPay connection</button>
+              </form>
+              <div class="list" id="gbpayList"></div>
+            </div>
+
+            <div class="card">
+              <div class="card-head">
+                <div>
+                  <h3>Funding Methods</h3>
+                  <p class="muted">Employer payment instruments for subscriptions and payroll.</p>
+                </div>
+                <button class="btn ghost small" id="refreshFunding">Refresh</button>
+              </div>
+              <form id="fundingForm">
+                <div class="row">
+                  <label>
+                    Type
+                    <select name="method_type">
+                      <option value="BANK_ACCOUNT">Bank account</option>
+                      <option value="CARD">Card</option>
+                      <option value="MOBILE_MONEY">Mobile money</option>
+                      <option value="WALLET">Wallet</option>
+                      <option value="OTHER">Other</option>
+                    </select>
+                  </label>
+                  <label>
+                    Provider
+                    <input name="provider" placeholder="Stripe, Paystack" />
+                  </label>
+                </div>
+                <div class="row">
+                  <label>
+                    Label
+                    <input name="label" placeholder="Primary corporate card" />
+                  </label>
+                  <label>
+                    Currency
+                    <input name="currency" placeholder="XAF" />
+                  </label>
+                </div>
+                <div class="row">
+                  <label>
+                    Last 4
+                    <input name="account_last4" placeholder="1234" />
+                  </label>
+                  <label class="toggle">
+                    <input type="checkbox" name="set_as_default_subscription" />
+                    Default for subscriptions
+                  </label>
+                  <label class="toggle">
+                    <input type="checkbox" name="set_as_default_payroll" />
+                    Default for payroll
+                  </label>
+                </div>
+                <button class="btn" type="submit">Add funding method</button>
+              </form>
+              <div class="list" id="fundingList"></div>
+            </div>
+
+            <div class="card">
+              <div class="card-head">
+                <div>
+                  <h3>Subscriptions</h3>
+                  <p class="muted">Issue invoices and keep subscription status in sync.</p>
+                </div>
+                <button class="btn ghost small" id="refreshSubscriptions">Refresh</button>
+              </div>
+              <form id="subscriptionForm">
+                <div class="row">
+                  <label>
+                    Plan ID
+                    <input name="plan_id" placeholder="Plan UUID" />
+                  </label>
+                  <label>
+                    Funding method ID
+                    <input name="funding_method_id" placeholder="Optional" />
+                  </label>
+                </div>
+                <div class="row">
+                  <label class="toggle">
+                    <input type="checkbox" name="auto_renew" checked />
+                    Auto renew
+                  </label>
+                  <label>
+                    Start date
+                    <input name="start_date" placeholder="YYYY-MM-DD" />
+                  </label>
+                </div>
+                <button class="btn" type="submit">Create subscription</button>
+              </form>
+              <div class="list" id="subscriptionList"></div>
+            </div>
+
+            <div class="card">
+              <div class="card-head">
+                <div>
+                  <h3>Invoices</h3>
+                  <p class="muted">Immutable billing records with PDF downloads.</p>
+                </div>
+                <button class="btn ghost small" id="refreshInvoices">Refresh</button>
+              </div>
+              <div class="list" id="invoiceList"></div>
+            </div>
+
+            <div class="card">
+              <div class="card-head">
+                <div>
+                  <h3>Transactions</h3>
+                  <p class="muted">Unified employer ledger with filters and refunds.</p>
+                </div>
+                <button class="btn ghost small" id="refreshTransactions">Refresh</button>
+              </div>
+              <div class="row">
+                <label>
+                  Category
+                  <select id="txnCategory">
+                    <option value="">All</option>
+                    <option value="SUBSCRIPTION">Subscription</option>
+                    <option value="PAYROLL">Payroll</option>
+                    <option value="EXPENSE">Expense</option>
+                    <option value="REFUND">Refund</option>
+                    <option value="ADJUSTMENT">Adjustment</option>
+                  </select>
+                </label>
+                <label>
+                  Status
+                  <select id="txnStatus">
+                    <option value="">All</option>
+                    <option value="PENDING">Pending</option>
+                    <option value="SUCCESS">Success</option>
+                    <option value="FAILED">Failed</option>
+                    <option value="REVERSED">Reversed</option>
+                  </select>
+                </label>
+                <label>
+                  Direction
+                  <select id="txnDirection">
+                    <option value="">All</option>
+                    <option value="DEBIT">Debit</option>
+                    <option value="CREDIT">Credit</option>
+                  </select>
+                </label>
+              </div>
+              <div class="list" id="transactionList"></div>
+            </div>
+
+            <div class="card">
+              <div class="card-head">
+                <div>
+                  <h3>Payouts</h3>
+                  <p class="muted">Single payouts and payroll run outputs.</p>
+                </div>
+                <button class="btn ghost small" id="refreshPayouts">Refresh</button>
+              </div>
+              <form id="payoutForm">
+                <div class="row">
+                  <label>
+                    Employee ID
+                    <input name="employee_id" placeholder="Employee UUID" />
+                  </label>
+                  <label>
+                    Amount
+                    <input name="amount" placeholder="0.00" />
+                  </label>
+                </div>
+                <div class="row">
+                  <label>
+                    Category
+                    <select name="category">
+                      <option value="PAYROLL">Payroll</option>
+                      <option value="EXPENSE">Expense</option>
+                    </select>
+                  </label>
+                  <label>
+                    Currency
+                    <input name="currency" placeholder="XAF" />
+                  </label>
+                </div>
+                <div class="row">
+                  <label>
+                    Payout method ID
+                    <input name="payout_method_id" placeholder="Optional" />
+                  </label>
+                  <label>
+                    Linked object ID
+                    <input name="linked_object_id" placeholder="Payslip or expense UUID" />
+                  </label>
+                </div>
+                <button class="btn" type="submit">Create payout</button>
+              </form>
+              <p class="hint">New payouts stay pending until you execute them.</p>
+              <div class="list" id="payoutList"></div>
+            </div>
+
+            <div class="card">
+              <div class="card-head">
+                <div>
+                  <h3>Payout Batches</h3>
+                  <p class="muted">Batch payroll runs and grouped reimbursements.</p>
+                </div>
+                <button class="btn ghost small" id="refreshBatches">Refresh</button>
+              </div>
+              <form id="batchForm">
+                <div class="row">
+                  <label>
+                    Batch type
+                    <select name="batch_type">
+                      <option value="PAYROLL">Payroll</option>
+                      <option value="EXPENSE">Expense</option>
+                    </select>
+                  </label>
+                  <label>
+                    Currency
+                    <input name="currency" placeholder="XAF" />
+                  </label>
+                </div>
+                <div class="row">
+                  <label>
+                    Planned date
+                    <input name="planned_date" placeholder="YYYY-MM-DD" />
+                  </label>
+                  <label class="toggle">
+                    <input type="checkbox" name="auto_start" />
+                    Auto start
+                  </label>
+                </div>
+                <label>
+                  Items (JSON array)
+                  <textarea name="items" rows="4" placeholder='[{"employee_id":"...","amount":"50000","currency":"XAF"}]'></textarea>
+                </label>
+                <button class="btn" type="submit">Create batch</button>
+              </form>
+              <div class="list" id="batchList"></div>
+            </div>
+          </div>
+        </section>
+
+        <section id="employeeSection" class="hidden">
+          <div class="section-header">
+            <h2>Employee Console</h2>
+            <p>Manage payout methods and review personal transactions.</p>
+          </div>
+
+          <div class="grid">
+            <div class="card">
+              <div class="card-head">
+                <div>
+                  <h3>Payout Methods</h3>
+                  <p class="muted">Where you receive salary and reimbursements.</p>
+                </div>
+                <button class="btn ghost small" id="refreshEmployeePayouts">Refresh</button>
+              </div>
+              <form id="employeePayoutForm">
+                <div class="row">
+                  <label>
+                    Type
+                    <select name="method_type">
+                      <option value="BANK_ACCOUNT">Bank account</option>
+                      <option value="MOBILE_MONEY">Mobile money</option>
+                    </select>
+                  </label>
+                  <label>
+                    Provider
+                    <input name="provider" placeholder="MTN MoMo" />
+                  </label>
+                </div>
+                <div class="row">
+                  <label>
+                    Label
+                    <input name="label" placeholder="My primary wallet" />
+                  </label>
+                  <label>
+                    Country code
+                    <input name="country" placeholder="CM" />
+                  </label>
+                </div>
+                <div class="row">
+                  <label>
+                    Entity product UUID
+                    <input name="entity_product_uuid" placeholder="GbPay product UUID" />
+                  </label>
+                  <label>
+                    Account holder name
+                    <input name="account_holder_name" placeholder="Optional" />
+                  </label>
+                </div>
+                <div class="row">
+                  <label>
+                    Bank code (bank)
+                    <input name="bank_code" placeholder="Bank code" />
+                  </label>
+                  <label>
+                    Account number (bank)
+                    <input name="account_number" placeholder="Account number" />
+                  </label>
+                </div>
+                <div class="row">
+                  <label>
+                    Operator code (mobile)
+                    <input name="operator_code" placeholder="Operator code" />
+                  </label>
+                  <label>
+                    Wallet destination (mobile)
+                    <input name="wallet_destination" placeholder="+237..." />
+                  </label>
+                </div>
+                <div class="row">
+                  <label class="toggle">
+                    <input type="checkbox" name="set_as_default" />
+                    Set as default
+                  </label>
+                </div>
+                <p class="hint">Bank payouts require bank code + account number. Mobile payouts require operator code + wallet destination.</p>
+                <button class="btn" type="submit">Add payout method</button>
+              </form>
+              <div class="list" id="employeePayoutList"></div>
+            </div>
+
+            <div class="card">
+              <div class="card-head">
+                <div>
+                  <h3>My Transactions</h3>
+                  <p class="muted">Credits, reimbursements, and reversals.</p>
+                </div>
+                <button class="btn ghost small" id="refreshMyTransactions">Refresh</button>
+              </div>
+              <div class="list" id="myTransactionList"></div>
+            </div>
+
+            <div class="card">
+              <div class="card-head">
+                <div>
+                  <h3>My Payouts</h3>
+                  <p class="muted">Track salary and expense payout status.</p>
+                </div>
+                <button class="btn ghost small" id="refreshMyPayouts">Refresh</button>
+              </div>
+              <div class="list" id="myPayoutList"></div>
+            </div>
+          </div>
+        </section>
+      </main>
+
+      <footer>
+        <p>Billing console UI for PayrovaHR. Use valid tokens and tenant context headers.</p>
+      </footer>
+    </div>
+  </body>
+</html>

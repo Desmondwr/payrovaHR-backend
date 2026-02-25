@@ -5,6 +5,55 @@ from datetime import timedelta
 import secrets
 from difflib import SequenceMatcher
 
+CONSENT_SCOPE_IDENTITY = 'identity'
+CONSENT_SCOPE_EMPLOYMENT_DATES = 'employment_dates'
+CONSENT_SCOPE_TERMINATION_REASONS = 'termination_reasons'
+
+CONSENT_SCOPES = [
+    CONSENT_SCOPE_IDENTITY,
+    CONSENT_SCOPE_EMPLOYMENT_DATES,
+    CONSENT_SCOPE_TERMINATION_REASONS,
+]
+
+DEFAULT_CONSENT_REQUESTED_SCOPES = [
+    CONSENT_SCOPE_IDENTITY,
+    CONSENT_SCOPE_EMPLOYMENT_DATES,
+]
+
+DEFAULT_CONSENT_APPROVED_SCOPES = list(DEFAULT_CONSENT_REQUESTED_SCOPES)
+
+
+def clean_consent_scopes(scopes):
+    """Return (valid_scopes, invalid_scopes) for a consent scope list."""
+    if not scopes:
+        return [], []
+    valid = []
+    invalid = []
+    for scope in scopes:
+        if scope in CONSENT_SCOPES:
+            if scope not in valid:
+                valid.append(scope)
+        else:
+            invalid.append(scope)
+    return valid, invalid
+
+
+def resolve_consent_scopes(scopes, default_scopes=None):
+    """Resolve effective scopes, falling back to defaults when empty."""
+    valid, _ = clean_consent_scopes(scopes or [])
+    if valid:
+        return valid
+    return list(default_scopes or DEFAULT_CONSENT_APPROVED_SCOPES)
+
+
+def consent_scopes_allow(scopes, required_scopes=None, default_scopes=None):
+    """Return True if required_scopes are included in scopes (after defaults)."""
+    required, _ = clean_consent_scopes(required_scopes or [])
+    if not required:
+        return True
+    effective = resolve_consent_scopes(scopes, default_scopes=default_scopes)
+    return set(required).issubset(set(effective))
+
 
 def get_or_create_employee_config(employer_id, tenant_db='default'):
     """
@@ -708,8 +757,8 @@ def get_cross_institution_summary(employee, config):
     if not config:
         return {'has_other_institutions': False, 'records': []}
 
-    visibility = getattr(config, 'cross_institution_visibility_level', 'BASIC')
-    require_consent = False  # Consent flow disabled
+    visibility = getattr(config, 'cross_institution_visibility_level', 'NONE')
+    require_consent = True
 
     # Get tenant database for the current employer
     try:
@@ -723,6 +772,24 @@ def get_cross_institution_summary(employee, config):
     records = list(
         EmployeeCrossInstitutionRecord.objects.using(tenant_db).filter(employee_id=employee.id)
     )
+
+    if require_consent:
+        approved_records = [
+            record for record in records
+            if record.consent_status == 'APPROVED'
+        ]
+        approved_records = [
+            record for record in approved_records
+            if consent_scopes_allow(record.consent_scopes, [CONSENT_SCOPE_EMPLOYMENT_DATES])
+        ]
+        if not approved_records:
+            return {
+                'has_other_institutions': False,
+                'count': 0,
+                'records': [],
+                'institutions': []
+            }
+        records = approved_records
 
     def _fetch_detected_employee(record):
         if not record.detected_employer_id or not record.detected_employee_id:
@@ -750,8 +817,8 @@ def get_cross_institution_summary(employee, config):
 
     if visibility == 'NONE':
         return {
-            'has_other_institutions': bool(records),
-            'count': len(records),
+            'has_other_institutions': False,
+            'count': 0,
             'records': [],
             'institutions': []
         }
@@ -775,7 +842,11 @@ def get_cross_institution_summary(employee, config):
         if visibility != 'FULL':
             info['details_restricted'] = True
 
-        if visibility in ['MODERATE', 'FULL']:
+        scopes = resolve_consent_scopes(record.consent_scopes)
+        can_show_employment = CONSENT_SCOPE_EMPLOYMENT_DATES in scopes
+        can_show_termination_reason = CONSENT_SCOPE_TERMINATION_REASONS in scopes
+
+        if visibility in ['MODERATE', 'FULL'] and can_show_employment:
             detected_employee = _fetch_detected_employee(record)
             if detected_employee:
                 info['employment_start_date'] = detected_employee.hire_date
@@ -797,7 +868,7 @@ def get_cross_institution_summary(employee, config):
                 'verified': record.verified,
                 'notes': record.notes,
             })
-            if detected_employee:
+            if detected_employee and can_show_employment:
                 info['employment_status'] = detected_employee.employment_status
                 info['employment_type'] = detected_employee.employment_type
                 info['job_title'] = detected_employee.job_title
@@ -807,6 +878,8 @@ def get_cross_institution_summary(employee, config):
                 info['branch'] = (
                     detected_employee.branch.name if detected_employee.branch else None
                 )
+                if can_show_termination_reason:
+                    info['termination_reason'] = detected_employee.termination_reason
 
         summary.append(info)
 
@@ -1310,6 +1383,296 @@ def generate_consent_token():
     """Generate a secure random token for consent requests"""
     import secrets
     return secrets.token_urlsafe(32)
+
+
+def has_approved_cross_institution_consent(
+    employee_registry_id,
+    target_employer_id,
+    source_employer_ids=None,
+    required_scopes=None
+):
+    """
+    Check if an employee has approved consent for a target employer.
+    Optionally restrict to a set of source employer IDs and required scopes.
+    """
+    if not employee_registry_id or not target_employer_id:
+        return False
+    from django.utils import timezone
+    from django.db.models import Q
+    from employees.models import CrossInstitutionConsent
+
+    qs = CrossInstitutionConsent.objects.using('default').filter(
+        employee_registry_id=employee_registry_id,
+        target_employer_id=target_employer_id,
+        status='APPROVED'
+    )
+    if source_employer_ids:
+        qs = qs.filter(source_employer_id__in=list(source_employer_ids))
+
+    qs = qs.filter(Q(expires_at__isnull=True) | Q(expires_at__gte=timezone.now()))
+    if not required_scopes:
+        return qs.exists()
+
+    for consent in qs:
+        if consent_scopes_allow(consent.approved_scopes, required_scopes):
+            return True
+    return False
+
+
+def has_approved_cross_institution_records(employee, tenant_db=None, required_scopes=None):
+    """Return True if any cross-institution records are approved for this employee."""
+    if not employee:
+        return False
+    from employees.models import EmployeeCrossInstitutionRecord
+    db_alias = tenant_db or getattr(employee._state, 'db', None) or 'default'
+    records = EmployeeCrossInstitutionRecord.objects.using(db_alias).filter(
+        employee_id=employee.id,
+        consent_status='APPROVED'
+    )
+    if not required_scopes:
+        return records.exists()
+    return any(
+        consent_scopes_allow(record.consent_scopes, required_scopes)
+        for record in records
+    )
+
+
+def count_approved_cross_institution_records(employee, tenant_db=None, required_scopes=None):
+    """Count approved cross-institution records honoring required scopes."""
+    if not employee:
+        return 0
+    from employees.models import EmployeeCrossInstitutionRecord
+    db_alias = tenant_db or getattr(employee._state, 'db', None) or 'default'
+    records = EmployeeCrossInstitutionRecord.objects.using(db_alias).filter(
+        employee_id=employee.id,
+        consent_status='APPROVED'
+    )
+    if not required_scopes:
+        return records.count()
+    return sum(
+        1 for record in records
+        if consent_scopes_allow(record.consent_scopes, required_scopes)
+    )
+
+
+def redact_duplicate_result(result):
+    """
+    Return a privacy-safe duplicate detection result for API responses.
+    Cross-institution details are reduced to counts and reasons only.
+    """
+    if not result:
+        return {
+            'duplicates_found': False,
+            'total_matches': 0,
+            'same_institution_matches': [],
+            'cross_institution_matches': [],
+            'cross_institution_count': 0,
+            'match_reasons': {},
+        }
+
+    same_matches = []
+    for match in result.get('same_institution_matches') or []:
+        if isinstance(match, dict) and 'data' in match:
+            same_matches.append(match.get('data'))
+        else:
+            same_matches.append(match)
+
+    safe = {
+        'duplicates_found': bool(result.get('duplicates_found')),
+        'total_matches': int(result.get('total_matches') or 0),
+        'same_institution_matches': same_matches,
+        'match_reasons': result.get('match_reasons') or {},
+    }
+
+    cross_matches = result.get('cross_institution_matches') or []
+    safe['cross_institution_count'] = len(cross_matches)
+    safe['cross_institution_matches'] = [
+        {
+            'match_id': str(idx + 1),
+            'details_restricted': True,
+        }
+        for idx, _ in enumerate(cross_matches)
+    ]
+
+    return safe
+
+
+def generate_certificate_share_token():
+    """Generate a secure random token for certificate sharing."""
+    import secrets
+    return secrets.token_urlsafe(32)
+
+
+def render_employment_certificate_pdf(employee, employer):
+    """Render a simple employment certificate PDF.
+
+    NOTE: Visual design lives in the frontend share page. Backend keeps this minimal
+    for reliability while the frontend handles the styled export.
+    """
+    from django.core.files.base import ContentFile
+    from django.utils import timezone
+    from io import BytesIO
+    from reportlab.pdfgen import canvas
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib import colors
+    from reportlab.lib.utils import ImageReader, simpleSplit
+
+    buffer = BytesIO()
+    width, height = A4  # 595 x 842 pts
+    c = canvas.Canvas(buffer, pagesize=A4)
+
+    # White background (no paper tint, no border)
+    c.setFillColor(colors.white)
+    c.rect(0, 0, width, height, stroke=0, fill=1)
+
+    # Content area (simple white page)
+    margin = 54
+    card_x = margin
+    card_y = margin
+    card_w = width - (margin * 2)
+    card_h = height - (margin * 2)
+
+    # Content area
+    content_x = card_x + 40
+    content_w = card_w - 80
+    y = card_y + card_h - 20
+
+    # Header (centered)
+    logo_size = 42
+    logo_x = card_x + (card_w - logo_size) / 2
+    logo_y = y - logo_size
+    if getattr(employer, "company_logo", None):
+        try:
+            logo_path = employer.company_logo.path
+            logo = ImageReader(logo_path)
+            c.drawImage(logo, logo_x, logo_y, width=logo_size, height=logo_size, mask="auto")
+        except Exception:
+            pass
+
+    header_y = logo_y - 10
+    c.setFillColor(colors.HexColor("#0f172a"))
+    c.setFont("Helvetica-Bold", 12)
+    c.drawCentredString(card_x + card_w / 2, header_y, employer.company_name.upper())
+    if employer.employer_name_or_group:
+        c.setFont("Helvetica", 10)
+        c.setFillColor(colors.HexColor("#6b7280"))
+        c.drawCentredString(card_x + card_w / 2, header_y - 14, employer.employer_name_or_group)
+
+    # Title
+    y = header_y - 54
+    c.setFillColor(colors.HexColor("#0f766e"))
+    c.setFont("Times-Bold", 24)
+    c.drawCentredString(card_x + card_w / 2, y, "Certificate of Employment")
+    y -= 18
+
+    # Reference row
+    y -= 26
+    c.setFillColor(colors.HexColor("#6b7280"))
+    c.setFont("Helvetica", 10)
+    reference = f"CERT-{str(employee.id)[:8].upper()}"
+    issued_date = timezone.now().date().strftime("%Y-%m-%d")
+    c.drawString(content_x, y, f"Ref: {reference}")
+    c.drawRightString(content_x + content_w, y, f"Date: {issued_date}")
+
+    # Body text
+    y -= 50
+    c.setFillColor(colors.HexColor("#374151"))
+    body_font = "Helvetica"
+    body_size = 12.5
+    leading = 18
+
+    def draw_paragraph(text, y_pos):
+        lines = simpleSplit(text, body_font, body_size, content_w)
+        c.setFont(body_font, body_size)
+        for line in lines:
+            c.drawString(content_x, y_pos, line)
+            y_pos -= leading
+        return y_pos
+
+    hire_date = employee.hire_date
+    end_date = employee.termination_date
+    end_label = end_date.strftime("%Y-%m-%d") if end_date else "Present"
+    hire_label = hire_date.strftime("%Y-%m-%d") if hire_date else "N/A"
+
+    y = draw_paragraph(
+        f"This is to certify that {employee.full_name} (Employee ID: {employee.employee_id or employee.id}) has been employed at {employer.company_name}.",
+        y,
+    ) - 24
+    y = draw_paragraph(
+        f"During this period, the employee served as {employee.job_title or 'Employee'}"
+        + (f" in the {employee.department.name} department." if employee.department else "."),
+        y,
+    ) - 18
+
+    # Details (no borders)
+    label_color = colors.HexColor("#6b7280")
+    value_color = colors.HexColor("#111827")
+
+    def draw_detail_line(label, value, y_pos):
+        c.setFillColor(label_color)
+        c.setFont("Helvetica", 9.5)
+        c.drawString(content_x, y_pos, label.upper())
+        c.setFillColor(value_color)
+        c.setFont("Helvetica-Bold", 12)
+        c.drawString(content_x + 160, y_pos, value)
+        return y_pos - 18
+
+    department_val = employee.department.name if employee.department else "—"
+    y = draw_detail_line("Full Name", employee.full_name, y)
+    y = draw_detail_line("Position", employee.job_title or "Employee", y)
+    y = draw_detail_line("Employment Period", f"{hire_label} to {end_label}", y)
+    y = draw_detail_line("Department", department_val, y)
+    y -= 6
+
+    # Footer note (centered)
+    footer_y = card_y + 40
+    c.setFillColor(colors.HexColor("#6b7280"))
+    c.setFont("Helvetica", 10)
+    c.drawCentredString(
+        card_x + card_w / 2,
+        footer_y,
+        "This certificate is issued upon the employee's request for all official and professional purposes.",
+    )
+    footer_y -= 40
+    c.setFont("Helvetica-Bold", 10)
+    c.drawCentredString(card_x + card_w / 2, footer_y, "PayrovaHR")
+    footer_y -= 12
+    c.setFont("Helvetica", 10)
+    c.drawCentredString(card_x + card_w / 2, footer_y, "Terms and conditions apply")
+
+    # Seal removed per request
+    # Signatures removed per request
+
+    # Footer removed per request
+
+    c.showPage()
+    c.save()
+
+    return ContentFile(buffer.getvalue())
+
+
+def create_employment_certificate_document(employee, employer, tenant_db, created_by_id=None):
+    """Generate and store an employment certificate as an EmployeeDocument."""
+    from django.utils import timezone
+    from employees.models import EmployeeDocument
+
+    content = render_employment_certificate_pdf(employee, employer)
+    timestamp = timezone.now().strftime('%Y%m%d_%H%M%S')
+    filename = f"Employment_Certificate_{employee.employee_id or employee.id}_{timestamp}.pdf"
+    content.name = filename
+
+    file_size = content.size if getattr(content, 'size', None) is not None else len(content)
+    document = EmployeeDocument.objects.using(tenant_db).create(
+        employee=employee,
+        document_type='EMPLOYMENT_CERTIFICATE',
+        title=f"Employment Certificate - {employer.company_name}",
+        description="Official employment certificate generated by employer.",
+        file=content,
+        file_size=file_size,
+        has_expiry=False,
+        uploaded_by_id=created_by_id,
+    )
+    return document
 
 
 def check_concurrent_employment(employee_registry_id, new_employer_id, config):

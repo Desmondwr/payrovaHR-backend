@@ -920,7 +920,7 @@ class PaymentLineViewSet(TreasuryTenantViewSet):
 
     @action(detail=True, methods=["post"], url_path="mark-paid")
     def mark_paid(self, request, pk=None):
-        employer, _ = self._require_employer()
+        employer, tenant_db = self._require_employer()
         line = self.get_object()
 
         serializer = PaymentLineStatusUpdateSerializer(data=request.data)
@@ -935,6 +935,27 @@ class PaymentLineViewSet(TreasuryTenantViewSet):
         line.status = PaymentLine.STATUS_PAID
         line.external_reference = serializer.validated_data.get("external_reference")
         line.save(update_fields=["status", "external_reference", "updated_at"])
+
+        try:
+            from billing.models import BillingPayout
+            from billing.services import update_payout_status
+        except Exception:
+            BillingPayout = None
+            update_payout_status = None
+
+        if BillingPayout and update_payout_status:
+            payout = BillingPayout.objects.using(tenant_db).filter(
+                treasury_payment_line_id=line.id,
+                employer_id=employer.id,
+            ).first()
+            if payout:
+                update_payout_status(
+                    payout=payout,
+                    tenant_db=tenant_db,
+                    status="PAID",
+                    provider_reference=line.external_reference,
+                    actor_id=getattr(request.user, "id", None),
+                )
 
         create_notification(
             user=request.user,
@@ -953,7 +974,7 @@ class PaymentLineViewSet(TreasuryTenantViewSet):
 
     @action(detail=True, methods=["post"], url_path="fail")
     def mark_failed(self, request, pk=None):
-        employer, _ = self._require_employer()
+        employer, tenant_db = self._require_employer()
         line = self.get_object()
 
         serializer = PaymentLineStatusUpdateSerializer(data=request.data)
@@ -968,6 +989,27 @@ class PaymentLineViewSet(TreasuryTenantViewSet):
         line.status = PaymentLine.STATUS_FAILED
         line.external_reference = serializer.validated_data.get("external_reference")
         line.save(update_fields=["status", "external_reference", "updated_at"])
+
+        try:
+            from billing.models import BillingPayout
+            from billing.services import update_payout_status
+        except Exception:
+            BillingPayout = None
+            update_payout_status = None
+
+        if BillingPayout and update_payout_status:
+            payout = BillingPayout.objects.using(tenant_db).filter(
+                treasury_payment_line_id=line.id,
+                employer_id=employer.id,
+            ).first()
+            if payout:
+                update_payout_status(
+                    payout=payout,
+                    tenant_db=tenant_db,
+                    status="FAILED",
+                    failure_reason="Treasury payment failed",
+                    actor_id=getattr(request.user, "id", None),
+                )
 
         create_notification(
             user=request.user,

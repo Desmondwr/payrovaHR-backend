@@ -137,7 +137,7 @@ class EmployeeConfiguration(models.Model):
             ('BASIC', 'Institution name only'),
             ('MODERATE', 'Institution name and employment dates'),
             ('FULL', 'Full employment details'),
-        ], default='BASIC', help_text='What information is visible about other institutions')
+        ], default='NONE', help_text='What information is visible about other institutions')
     
     # ===== Duplicate Detection Rules =====
     duplicate_detection_level = models.CharField(max_length=20, choices=DUPLICATE_DETECTION_CHOICES, default=DUPLICATE_MODERATE)
@@ -607,6 +607,7 @@ class EmployeeDocument(models.Model):
         ('PASSPORT_COPY', 'Passport Copy'),
         ('BIRTH_CERTIFICATE', 'Birth Certificate'),
         ('CERTIFICATE', 'Certificate/Diploma'),
+        ('EMPLOYMENT_CERTIFICATE', 'Employment Certificate'),
         ('CONTRACT', 'Employment Contract'),
         ('OFFER_LETTER', 'Offer Letter'),
         ('TERMINATION_LETTER', 'Termination Letter'),
@@ -690,6 +691,11 @@ class EmployeeCrossInstitutionRecord(models.Model):
     consent_requested_at = models.DateTimeField(null=True, blank=True)
     consent_responded_at = models.DateTimeField(null=True, blank=True)
     consent_notes = models.TextField(blank=True, null=True)
+    consent_scopes = models.JSONField(
+        default=list,
+        blank=True,
+        help_text='Approved consent scopes for this cross-institution record'
+    )
     
     detected_at = models.DateTimeField(auto_now_add=True)
     verified = models.BooleanField(default=False)
@@ -847,6 +853,16 @@ class CrossInstitutionConsent(models.Model):
     
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='PENDING')
     consent_token = models.CharField(max_length=100, unique=True, db_index=True)
+    requested_scopes = models.JSONField(
+        default=list,
+        blank=True,
+        help_text='Requested consent scopes for this employer'
+    )
+    approved_scopes = models.JSONField(
+        default=list,
+        blank=True,
+        help_text='Approved consent scopes granted by the employee'
+    )
     requested_at = models.DateTimeField(auto_now_add=True)
     expires_at = models.DateTimeField()
     responded_at = models.DateTimeField(null=True, blank=True)
@@ -864,3 +880,43 @@ class CrossInstitutionConsent(models.Model):
     def is_valid(self):
         from django.utils import timezone
         return self.status == 'PENDING' and timezone.now() < self.expires_at
+
+
+class EmploymentCertificateShare(models.Model):
+    """Portable share token for an employment certificate document."""
+
+    STATUS_CHOICES = [
+        ('ACTIVE', 'Active'),
+        ('REVOKED', 'Revoked'),
+        ('EXPIRED', 'Expired'),
+    ]
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    employee_registry_id = models.IntegerField(db_index=True, help_text='EmployeeRegistry ID from main database')
+    employer_id = models.IntegerField(db_index=True, help_text='Employer ID that issued the certificate')
+    tenant_employee_id = models.CharField(max_length=64, blank=True, null=True, help_text='Employee ID in tenant database')
+    document_id = models.UUIDField(help_text='EmployeeDocument ID in tenant database')
+    token = models.CharField(max_length=100, unique=True, db_index=True)
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='ACTIVE')
+    created_by_id = models.IntegerField(null=True, blank=True, db_index=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    expires_at = models.DateTimeField(null=True, blank=True)
+    revoked_at = models.DateTimeField(null=True, blank=True)
+    notes = models.TextField(blank=True, null=True)
+
+    class Meta:
+        db_table = 'employment_certificate_shares'
+        verbose_name = 'Employment Certificate Share'
+        verbose_name_plural = 'Employment Certificate Shares'
+        ordering = ['-created_at']
+
+    def __str__(self):
+        return f"Certificate Share {self.token} ({self.status})"
+
+    def is_valid(self):
+        from django.utils import timezone
+        if self.status != 'ACTIVE':
+            return False
+        if self.expires_at and timezone.now() > self.expires_at:
+            return False
+        return True

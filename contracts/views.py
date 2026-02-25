@@ -910,15 +910,22 @@ class ContractConfigurationViewSet(viewsets.ModelViewSet):
         from accounts.database_utils import get_tenant_database_alias
         employer = get_active_employer(request, require_context=True)
         tenant_db = get_tenant_database_alias(employer)
-        
-        config, created = ContractConfiguration.objects.using(tenant_db).get_or_create(
-            employer_id=employer.id,
-            contract_type__isnull=True,
-            defaults={
-                'id_prefix': 'CNT',
-                'id_sequence_padding': 5,
-            }
+
+        config = (
+            ContractConfiguration.objects.using(tenant_db)
+            .filter(employer_id=employer.id, contract_type__isnull=True)
+            .order_by('-updated_at', '-created_at', '-id')
+            .first()
         )
+        created = False
+        if not config:
+            config = ContractConfiguration.objects.using(tenant_db).create(
+                employer_id=employer.id,
+                contract_type=None,
+                id_prefix='CNT',
+                id_sequence_padding=5,
+            )
+            created = True
 
         # Seed time-off configuration with defaults for new tenants or empty configs.
         if created or not config.time_off_configuration:

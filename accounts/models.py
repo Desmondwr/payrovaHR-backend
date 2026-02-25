@@ -7,6 +7,10 @@ import secrets
 import uuid
 
 
+def default_consent_scopes():
+    return ['identity', 'employment_dates']
+
+
 class CustomUserManager(BaseUserManager):
     """Custom user manager where email is the unique identifier"""
     
@@ -372,6 +376,13 @@ class EmployeeRegistry(models.Model):
     
     # Profile Picture
     profile_picture = models.ImageField(upload_to='employee_profiles/', blank=True, null=True)
+
+    # Consent Preferences
+    default_consent_scopes = models.JSONField(
+        default=default_consent_scopes,
+        blank=True,
+        help_text='Default data sharing scopes preferred by the employee'
+    )
     
     # Timestamps
     created_at = models.DateTimeField(auto_now_add=True)

@@ -5,6 +5,7 @@ python-decouple>=3.8
 psycopg2-binary>=2.9.9
 pillow>=10.0.0
 reportlab>=4.0.0
+xhtml2pdf>=0.2.13
 python-docx>=1.1.0
 
 # JWT Authentication
@@ -19,6 +20,10 @@ django-anymail>=10.2
 
 # Throttling and Security
 django-ratelimit>=4.1.0
+
+# Payments
+requests>=2.32.0
+cryptography>=42.0.0
 
 # Assistant LLM provider
 openai>=1.61.0

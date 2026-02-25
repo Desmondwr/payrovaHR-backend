@@ -1512,6 +1512,19 @@ def validate_payroll(*, request, tenant_db: str, salaries: Iterable[Salary], all
                 currency=currency,
                 created_by_id=getattr(request.user, "id", None),
             )
+            payout_batch = None
+            try:
+                from billing.services import ensure_payout_batch
+            except Exception:
+                ensure_payout_batch = None
+            if ensure_payout_batch:
+                payout_batch = ensure_payout_batch(
+                    tenant_db=tenant_db,
+                    employer_id=employer.id,
+                    batch_type="PAYROLL",
+                    treasury_batch_id=batch.id,
+                    created_by_id=getattr(request.user, "id", None),
+                )
 
             for salary in batch_salaries:
                 employee = salary.employee
@@ -1535,6 +1548,33 @@ def validate_payroll(*, request, tenant_db: str, salaries: Iterable[Salary], all
                     linked_object_type="PAYSLIP",
                     linked_object_id=salary.id,
                 )
+                try:
+                    from billing.models import BillingPayout
+                    from billing.services import create_payout_with_transactions
+                except Exception:
+                    create_payout_with_transactions = None
+                    BillingPayout = None
+                if create_payout_with_transactions and BillingPayout:
+                    exists = BillingPayout.objects.using(tenant_db).filter(
+                        linked_object_type="PAYSLIP",
+                        linked_object_id=salary.id,
+                        employer_id=employer.id,
+                    ).exists()
+                    if not exists:
+                        create_payout_with_transactions(
+                            tenant_db=tenant_db,
+                            employer_id=employer.id,
+                            employee=employee,
+                            amount=salary.net_salary,
+                            currency=currency,
+                            category="PAYROLL",
+                            batch=payout_batch,
+                            linked_object_type="PAYSLIP",
+                            linked_object_id=salary.id,
+                            treasury_payment_line_id=line.id,
+                            treasury_batch_id=batch.id,
+                            actor_id=getattr(request.user, "id", None),
+                        )
                 if config:
                     apply_line_approval_rules(line, config)
                     line.save(using=tenant_db, update_fields=["requires_approval", "approved", "updated_at"])

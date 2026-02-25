@@ -1129,4 +1129,49 @@ class TreasuryPaymentUpdateView(APIView):
             expense.treasury_external_reference = external_reference
         expense.save()
 
+        try:
+            from billing.models import BillingPayout
+            from billing.services import create_payout_with_transactions, update_payout_status
+        except Exception:
+            BillingPayout = None
+            create_payout_with_transactions = None
+            update_payout_status = None
+
+        if BillingPayout and create_payout_with_transactions and expense.employee:
+            payout = BillingPayout.objects.using(tenant_db).filter(
+                linked_object_type="EXPENSE_CLAIM",
+                linked_object_id=expense.id,
+                employer_id=institution.id,
+            ).first()
+            if not payout:
+                payout = create_payout_with_transactions(
+                    tenant_db=tenant_db,
+                    employer_id=institution.id,
+                    employee=expense.employee,
+                    amount=expense.amount,
+                    currency=expense.currency,
+                    category="EXPENSE",
+                    linked_object_type="EXPENSE_CLAIM",
+                    linked_object_id=expense.id,
+                    treasury_payment_line_id=payment_line_id,
+                    actor_id=getattr(request.user, "id", None),
+                )
+            if update_payout_status:
+                if status_value == "PAID":
+                    update_payout_status(
+                        payout=payout,
+                        tenant_db=tenant_db,
+                        status="PAID",
+                        provider_reference=external_reference,
+                        actor_id=getattr(request.user, "id", None),
+                    )
+                else:
+                    update_payout_status(
+                        payout=payout,
+                        tenant_db=tenant_db,
+                        status="FAILED",
+                        failure_reason="Treasury payment failed",
+                        actor_id=getattr(request.user, "id", None),
+                    )
+
         return api_response(success=True, message="Treasury update applied.", data=ExpenseClaimSerializer(expense).data)

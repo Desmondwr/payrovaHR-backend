@@ -1,4 +1,5 @@
 from django.db import models
+from django.db.models import Q
 from django.contrib.auth import get_user_model
 from django.utils import timezone
 from .notifications import notify_sent_for_signature, notify_signed, notify_activated
@@ -1113,6 +1114,13 @@ class ContractConfiguration(models.Model):
         verbose_name = 'Contract Configuration'
         verbose_name_plural = 'Contract Configurations'
         unique_together = [['employer_id', 'contract_type']]
+        constraints = [
+            models.UniqueConstraint(
+                fields=['employer_id'],
+                condition=Q(contract_type__isnull=True),
+                name='uniq_contract_config_global_per_employer',
+            ),
+        ]
 
     def __str__(self):
         level = "Global" if self.contract_type is None else f"Type: {self.contract_type}"

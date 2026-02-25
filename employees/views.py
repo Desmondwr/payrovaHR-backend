@@ -8,11 +8,13 @@ from django.db.models import Q
 from django.shortcuts import get_object_or_404
 from django.db import IntegrityError
 from datetime import timedelta
+from django.http import FileResponse
 
 from .models import (
     Department, Branch, Employee, EmployeeDocument,
     EmployeeCrossInstitutionRecord, EmployeeAuditLog,
-    EmployeeInvitation, EmployeeConfiguration, CrossInstitutionConsent
+    EmployeeInvitation, EmployeeConfiguration, CrossInstitutionConsent,
+    EmploymentCertificateShare
 )
 from .serializers import (
     DepartmentSerializer, BranchSerializer,
@@ -24,16 +26,19 @@ from .serializers import (
     EmployeeConfigurationSerializer, DuplicateDetectionResultSerializer,
     CreateEmployeeWithDetectionSerializer, EmployeeDocumentUploadSerializer,
     AcceptInvitationSerializer, EmployeeProfileCompletionSerializer,
-    EmployeeSelfProfileSerializer, EmployeePrefillRequestSerializer,
+    EmployeeSelfProfileSerializer, EmployeeProfilePhotoSerializer, EmployeePrefillRequestSerializer,
     EmployeePrefillSerializer, AttendanceCredentialsSerializer,
-    CrossInstitutionConsentSerializer, RespondConsentSerializer
+    CrossInstitutionConsentSerializer, RespondConsentSerializer,
+    EmployeeConsentPreferenceSerializer,
+    EmploymentCertificateShareSerializer
 )
 from .utils import (
     detect_duplicate_employees, generate_employee_invitation_token,
     get_invitation_expiry_date, send_employee_invitation_email,
     create_employee_audit_log, check_required_documents,
     check_expiring_documents, get_cross_institution_summary,
-    notify_employer_users, notify_employee_user
+    notify_employer_users, notify_employee_user,
+    create_employment_certificate_document, generate_certificate_share_token
 )
 from accounts.permissions import (
     IsEmployee,
@@ -158,6 +163,7 @@ class EmployeeViewSet(viewsets.ModelViewSet):
         "terminate": ["employees.employee.terminate", "employees.manage"],
         "reactivate": ["employees.employee.update", "employees.manage"],
         "documents": ["employees.employee.view", "employees.manage"],
+        "generate_certificate": ["employees.employee.update", "employees.manage"],
         "cross_institutions": ["employees.employee.view", "employees.manage"],
         "audit_log": ["employees.employee.view", "employees.manage"],
         "termination_approvals": ["employees.termination_approval.view", "employees.manage"],
@@ -313,28 +319,18 @@ class EmployeeViewSet(viewsets.ModelViewSet):
             )
         
         # Prepare response with duplicate info if available
-        response_data = EmployeeDetailSerializer(employee).data
+        response_data = EmployeeDetailSerializer(employee, context={'request': request}).data
         
         if hasattr(employee, '_duplicate_info') and employee._duplicate_info:
-            duplicate_info = employee._duplicate_info
+            from employees.utils import redact_duplicate_result
+            duplicate_info = redact_duplicate_result(employee._duplicate_info)
             response_data['duplicate_warning'] = {
                 'message': f"Employee created successfully, but {duplicate_info['total_matches']} potential duplicate(s) detected",
                 'duplicates_found': duplicate_info['duplicates_found'],
                 'total_matches': duplicate_info['total_matches'],
-                'same_institution': len(duplicate_info['same_institution_matches']),
-                'cross_institution': len(duplicate_info['cross_institution_matches']),
-                'existing_employers': [
-                    {
-                        'employer_id': match.get('employer_id'),
-                        'employer_name': match.get('employer_name'),
-                        'employee_id': (
-                            match.get('data', {}).get('employee_id')
-                            if isinstance(match.get('data'), dict)
-                            else getattr(match.get('data'), 'employee_id', None)
-                        ),
-                    }
-                    for match in (duplicate_info.get('cross_institution_matches') or [])
-                ],
+                'same_institution': len(duplicate_info.get('same_institution_matches') or []),
+                'cross_institution': duplicate_info.get('cross_institution_count', 0),
+                'details_restricted': True,
             }
 
             # Create in-app notification for warnings
@@ -866,6 +862,26 @@ class EmployeeViewSet(viewsets.ModelViewSet):
                 'expired_count': expiring_check['expired_count']
             }
         })
+
+    @action(detail=True, methods=['post'])
+    def generate_certificate(self, request, pk=None):
+        """Generate an employment certificate PDF for an employee."""
+        from accounts.database_utils import get_tenant_database_alias
+
+        employee = self.get_object()
+        employer = get_active_employer(request, require_context=True)
+        if employee.employer_id != employer.id:
+            raise PermissionDenied("Employee does not belong to your organization.")
+
+        tenant_db = get_tenant_database_alias(employer)
+        document = create_employment_certificate_document(
+            employee=employee,
+            employer=employer,
+            tenant_db=tenant_db,
+            created_by_id=request.user.id,
+        )
+        serializer = EmployeeDocumentSerializer(document, context={'request': request})
+        return Response(serializer.data, status=status.HTTP_201_CREATED)
     
     @action(detail=True, methods=['get'])
     def cross_institutions(self, request, pk=None):
@@ -1148,8 +1164,8 @@ class EmployeeViewSet(viewsets.ModelViewSet):
             phone=serializer.validated_data.get('phone_number'),
             config=config
         )
-        
-        result_serializer = DuplicateDetectionResultSerializer(result)
+        from employees.utils import redact_duplicate_result
+        result_serializer = DuplicateDetectionResultSerializer(redact_duplicate_result(result))
         return Response(result_serializer.data)
     
     @action(detail=False, methods=['post'], url_path='prefill-existing')
@@ -1159,7 +1175,11 @@ class EmployeeViewSet(viewsets.ModelViewSet):
         from accounts.database_utils import get_tenant_database_alias
         from employees.utils import (
             get_or_create_employee_config,
-            validate_existing_employee_against_new_config
+            validate_existing_employee_against_new_config,
+            has_approved_cross_institution_consent,
+            generate_consent_token,
+            clean_consent_scopes,
+            DEFAULT_CONSENT_REQUESTED_SCOPES,
         )
         
         request_serializer = EmployeePrefillRequestSerializer(data=request.data)
@@ -1187,6 +1207,62 @@ class EmployeeViewSet(viewsets.ModelViewSet):
         existing_here = Employee.objects.using(tenant_db).filter(
             Q(user_id=match.user_id) | Q(national_id_number=match.national_id_number)
         ).first()
+
+        consent_ok = has_approved_cross_institution_consent(
+            match.id,
+            employer.id,
+            required_scopes=['identity']
+        )
+        if not consent_ok:
+            consent_requested = False
+            request_consent = bool(request.data.get('request_consent', False))
+            requested_scopes, invalid_scopes = clean_consent_scopes(
+                request.data.get('requested_scopes')
+            )
+            if invalid_scopes:
+                return Response(
+                    {
+                        'error': 'Invalid consent scopes provided.',
+                        'invalid_scopes': invalid_scopes
+                    },
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+            if not requested_scopes:
+                requested_scopes = list(DEFAULT_CONSENT_REQUESTED_SCOPES)
+            if request_consent and match.user_id:
+                try:
+                    from accounts.models import EmployeeMembership
+                    source_membership = (
+                        EmployeeMembership.objects
+                        .filter(user_id=match.user_id)
+                        .exclude(employer_profile_id=employer.id)
+                        .order_by('-updated_at')
+                        .first()
+                    )
+                    if source_membership:
+                        CrossInstitutionConsent.objects.using('default').create(
+                            employee_registry_id=match.id,
+                            source_employer_id=source_membership.employer_profile_id,
+                            target_employer_id=employer.id,
+                            target_employer_name=employer.company_name,
+                            status='PENDING',
+                            consent_token=generate_consent_token(),
+                            expires_at=timezone.now() + timedelta(days=7),
+                            requested_scopes=requested_scopes,
+                            notes="Prefill access requested by employer",
+                        )
+                        consent_requested = True
+                except Exception:
+                    consent_requested = False
+
+            return Response(
+                {
+                    'consent_required': True,
+                    'message': 'Employee consent is required before accessing portable profile data.',
+                    'consent_requested': consent_requested,
+                },
+                status=status.HTTP_403_FORBIDDEN
+            )
         
         # Get employer configuration to validate existing data
         config = get_or_create_employee_config(employer.id, tenant_db)
@@ -1257,6 +1333,7 @@ class EmployeeDocumentViewSet(viewsets.ModelViewSet):
         "update": ["employees.employee.update", "employees.manage"],
         "partial_update": ["employees.employee.update", "employees.manage"],
         "destroy": ["employees.employee.update", "employees.manage"],
+        "share_certificate": ["employees.employee.view", "employees.manage"],
         "*": ["employees.manage"],
     }
     serializer_class = EmployeeDocumentSerializer
@@ -1408,6 +1485,46 @@ class EmployeeDocumentViewSet(viewsets.ModelViewSet):
             EmployeeDocumentSerializer(document).data,
             status=status.HTTP_200_OK
         )
+
+    @action(detail=True, methods=['post'])
+    def share_certificate(self, request, pk=None):
+        """Create a portable share token for an employment certificate."""
+        if not request.user.is_employee:
+            return Response({'error': 'Only employees can share certificates.'}, status=status.HTTP_403_FORBIDDEN)
+
+        document = self.get_object()
+        if document.document_type != 'EMPLOYMENT_CERTIFICATE':
+            return Response({'error': 'Only employment certificates can be shared.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        employee = getattr(document, 'employee', None)
+        if not employee or employee.user_id != request.user.id:
+            return Response({'error': 'You can only share your own certificate.'}, status=status.HTTP_403_FORBIDDEN)
+
+        from accounts.models import EmployeeRegistry
+        registry = EmployeeRegistry.objects.filter(user_id=request.user.id).first()
+        if not registry:
+            return Response({'error': 'Employee registry record not found.'}, status=status.HTTP_404_NOT_FOUND)
+
+        expiry_days = request.data.get('expiry_days')
+        try:
+            expiry_days = int(expiry_days) if expiry_days is not None else 30
+        except (TypeError, ValueError):
+            expiry_days = 30
+
+        expires_at = timezone.now() + timedelta(days=expiry_days)
+        share = EmploymentCertificateShare.objects.using('default').create(
+            employee_registry_id=registry.id,
+            employer_id=employee.employer_id,
+            tenant_employee_id=str(employee.id),
+            document_id=document.id,
+            token=generate_certificate_share_token(),
+            status='ACTIVE',
+            created_by_id=request.user.id,
+            expires_at=expires_at,
+        )
+
+        serializer = EmploymentCertificateShareSerializer(share)
+        return Response(serializer.data, status=status.HTTP_201_CREATED)
     
     @action(detail=False, methods=['get'])
     def expiring_soon(self, request):
@@ -1433,6 +1550,81 @@ class EmployeeDocumentViewSet(viewsets.ModelViewSet):
         
         serializer = self.get_serializer(documents, many=True)
         return Response(serializer.data)
+
+
+class EmploymentCertificateShareViewSet(viewsets.ViewSet):
+    """Public retrieval for shared employment certificates."""
+
+    permission_classes = [permissions.AllowAny]
+
+    def retrieve(self, request, pk=None):
+        token = pk
+        share = EmploymentCertificateShare.objects.using('default').filter(token=token).first()
+        if not share:
+            return Response({'error': 'Share link not found.'}, status=status.HTTP_404_NOT_FOUND)
+
+        if not share.is_valid():
+            if share.status == 'ACTIVE' and share.expires_at and share.expires_at < timezone.now():
+                share.status = 'EXPIRED'
+                share.save(using='default', update_fields=['status'])
+            return Response({'error': 'Share link is invalid or expired.'}, status=status.HTTP_404_NOT_FOUND)
+
+        from accounts.models import EmployerProfile
+        from accounts.database_utils import get_tenant_database_alias
+
+        employer = EmployerProfile.objects.filter(id=share.employer_id).first()
+        if not employer:
+            return Response({'error': 'Employer not found.'}, status=status.HTTP_404_NOT_FOUND)
+
+        tenant_db = get_tenant_database_alias(employer)
+        document = EmployeeDocument.objects.using(tenant_db).filter(id=share.document_id).first()
+        if not document or document.document_type != 'EMPLOYMENT_CERTIFICATE':
+            return Response({'error': 'Certificate not found.'}, status=status.HTTP_404_NOT_FOUND)
+
+        if request.query_params.get('download', '1') == '0':
+            employee = document.employee
+            employer_user = getattr(employer, 'user', None)
+            signatory_name = ''
+            if employer_user:
+                signatory_name = employer_user.get_full_name().strip()
+                if not signatory_name:
+                    signatory_name = employer_user.email
+
+            logo_url = None
+            if employer.company_logo:
+                try:
+                    logo_url = request.build_absolute_uri(employer.company_logo.url)
+                except Exception:
+                    logo_url = None
+
+            base_url = request.build_absolute_uri(request.path)
+            download_url = f"{base_url}?download=1"
+
+            reference = f"CERT-{str(employee.id)[:8].upper()}"
+            return Response({
+                'document_id': str(document.id),
+                'title': document.title,
+                'reference': reference,
+                'share_token': share.token,
+                'employer_id': share.employer_id,
+                'company_name': employer.company_name,
+                'company_logo_url': logo_url,
+                'employer_group_name': employer.employer_name_or_group,
+                'signatory_name': signatory_name or employer.company_name,
+                'employee_name': employee.full_name,
+                'employee_id': employee.employee_id or str(employee.id),
+                'job_title': employee.job_title,
+                'department': employee.department.name if employee.department else None,
+                'hire_date': employee.hire_date,
+                'termination_date': employee.termination_date,
+                'issued_at': document.uploaded_at,
+                'expires_at': share.expires_at,
+                'status': share.status,
+                'download_url': download_url,
+            })
+
+        filename = document.title.replace(' ', '_') + ".pdf"
+        return FileResponse(document.file.open('rb'), filename=filename)
 
 
 class EmployeeConfigurationViewSet(viewsets.ModelViewSet):
@@ -1494,6 +1686,7 @@ class EmployeeConfigurationViewSet(viewsets.ModelViewSet):
             employer_id=employer.id,
             defaults={
                 'employee_id_prefix': 'EMP',
+                'cross_institution_visibility_level': 'NONE',
                 'required_documents': ['RESUME', 'ID_COPY', 'CERTIFICATE'],
                 'document_allowed_formats': ['pdf', 'jpg', 'jpeg', 'png', 'docx']
             }
@@ -1566,6 +1759,7 @@ class EmployeeConfigurationViewSet(viewsets.ModelViewSet):
         config.multi_branch_enabled = False
         config.duplicate_detection_level = 'MODERATE'
         config.duplicate_action = 'WARN'
+        config.cross_institution_visibility_level = 'NONE'
         config.required_documents = ['RESUME', 'ID_COPY', 'CERTIFICATE']
         config.document_allowed_formats = ['pdf', 'jpg', 'jpeg', 'png', 'docx']
         config.save(using=tenant_db)
@@ -1853,7 +2047,11 @@ class CrossInstitutionConsentViewSet(viewsets.ModelViewSet):
         """Create a consent request (employer-only)."""
         from accounts.models import EmployerProfile, EmployeeRegistry
         from accounts.database_utils import get_tenant_database_alias
-        from employees.utils import generate_consent_token
+        from employees.utils import (
+            generate_consent_token,
+            clean_consent_scopes,
+            DEFAULT_CONSENT_REQUESTED_SCOPES,
+        )
 
         user = request.user
         if user.is_employee:
@@ -1868,6 +2066,14 @@ class CrossInstitutionConsentViewSet(viewsets.ModelViewSet):
         employee_id = request.data.get('employee_id')
         user_id = request.data.get('user_id')
         notes = request.data.get('notes') or ''
+        requested_scopes, invalid_scopes = clean_consent_scopes(request.data.get('requested_scopes'))
+        if invalid_scopes:
+            return Response(
+                {'error': 'Invalid consent scopes provided.', 'invalid_scopes': invalid_scopes},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        if not requested_scopes:
+            requested_scopes = list(DEFAULT_CONSENT_REQUESTED_SCOPES)
 
         if not employee_registry_id:
             if user_id:
@@ -1926,6 +2132,7 @@ class CrossInstitutionConsentViewSet(viewsets.ModelViewSet):
             status='PENDING',
             consent_token=generate_consent_token(),
             expires_at=expires_at,
+            requested_scopes=requested_scopes,
             notes=notes or None,
         )
 
@@ -1949,6 +2156,13 @@ class CrossInstitutionConsentViewSet(viewsets.ModelViewSet):
         """Employee responds to a consent request."""
         from accounts.models import EmployeeRegistry, EmployerProfile, EmployeeMembership
         from accounts.database_utils import get_tenant_database_alias
+        from employees.utils import (
+            clean_consent_scopes,
+            resolve_consent_scopes,
+            DEFAULT_CONSENT_REQUESTED_SCOPES,
+            CONSENT_SCOPE_EMPLOYMENT_DATES,
+            consent_scopes_allow,
+        )
 
         consent = self.get_object()
 
@@ -1960,7 +2174,7 @@ class CrossInstitutionConsentViewSet(viewsets.ModelViewSet):
         if not registry or consent.employee_registry_id != registry.id:
             return Response({'error': 'Consent request not found for this employee.'}, status=status.HTTP_404_NOT_FOUND)
 
-        if consent.status != 'PENDING':
+        if consent.status not in ['PENDING', 'APPROVED']:
             return Response({'error': 'Consent request has already been processed.'}, status=status.HTTP_400_BAD_REQUEST)
 
         if consent.expires_at and consent.expires_at < timezone.now():
@@ -1971,12 +2185,39 @@ class CrossInstitutionConsentViewSet(viewsets.ModelViewSet):
 
         response_value = serializer.validated_data['response']
         notes = serializer.validated_data.get('notes') or None
+        approved_scopes_raw = serializer.validated_data.get('approved_scopes')
+        approved_scopes, invalid_scopes = clean_consent_scopes(approved_scopes_raw)
+        if invalid_scopes:
+            return Response(
+                {'error': 'Invalid consent scopes provided.', 'invalid_scopes': invalid_scopes},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        if consent.status == 'APPROVED' and response_value == 'approve':
+            return Response({'error': 'Consent is already approved.'}, status=status.HTTP_400_BAD_REQUEST)
         decision = 'APPROVED' if response_value == 'approve' else 'REJECTED'
+
+        requested_scopes = resolve_consent_scopes(
+            consent.requested_scopes,
+            default_scopes=DEFAULT_CONSENT_REQUESTED_SCOPES
+        )
+        if decision == 'APPROVED':
+            if approved_scopes:
+                approved_scopes = [scope for scope in approved_scopes if scope in requested_scopes]
+            else:
+                approved_scopes = list(requested_scopes)
+            if not approved_scopes:
+                return Response(
+                    {'error': 'At least one consent scope must be approved.'},
+                    status=status.HTTP_400_BAD_REQUEST
+                )
+        else:
+            approved_scopes = []
 
         consent.status = decision
         consent.responded_at = timezone.now()
         consent.notes = notes
-        consent.save(using='default', update_fields=['status', 'responded_at', 'notes'])
+        consent.approved_scopes = approved_scopes
+        consent.save(using='default', update_fields=['status', 'responded_at', 'notes', 'approved_scopes'])
 
         # Update cross-institution record in target tenant if membership is known
         try:
@@ -1994,13 +2235,27 @@ class CrossInstitutionConsentViewSet(viewsets.ModelViewSet):
                 ).update(
                     consent_status=decision,
                     consent_responded_at=timezone.now(),
-                    consent_notes=notes
+                    consent_notes=notes,
+                    consent_scopes=approved_scopes
                 )
 
-                if decision == 'APPROVED':
+                if decision == 'APPROVED' and CONSENT_SCOPE_EMPLOYMENT_DATES in approved_scopes:
                     Employee.objects.using(tenant_db).filter(id=membership.tenant_employee_id).update(
                         is_concurrent_employment=True
                     )
+                else:
+                    # Revoke concurrent flag if no other approved records remain
+                    remaining = list(EmployeeCrossInstitutionRecord.objects.using(tenant_db).filter(
+                        employee_id=membership.tenant_employee_id,
+                        consent_status='APPROVED'
+                    ))
+                    if not any(
+                        consent_scopes_allow(record.consent_scopes, [CONSENT_SCOPE_EMPLOYMENT_DATES])
+                        for record in remaining
+                    ):
+                        Employee.objects.using(tenant_db).filter(id=membership.tenant_employee_id).update(
+                            is_concurrent_employment=False
+                        )
         except EmployerProfile.DoesNotExist:
             pass
 
@@ -2015,7 +2270,7 @@ class EmployeeProfileViewSet(viewsets.GenericViewSet):
     def get_queryset(self):
         """Get the employee record for the authenticated user"""
         from accounts.database_utils import get_tenant_database_alias
-        
+
         user = self.request.user
         if not user.is_employee or not hasattr(user, 'employee_profile') or not user.employee_profile:
             return Employee.objects.none()
@@ -2030,6 +2285,203 @@ class EmployeeProfileViewSet(viewsets.GenericViewSet):
             return Employee.objects.using(tenant_db).filter(user_id=user.id)
         except:
             return Employee.objects.none()
+
+    def _get_employee_registry(self, user):
+        from accounts.models import EmployeeRegistry
+        return EmployeeRegistry.objects.filter(user_id=user.id).first()
+
+    def get_consent_preferences(self, request):
+        """Return the employee's default consent preferences."""
+        from employees.utils import CONSENT_SCOPES, DEFAULT_CONSENT_REQUESTED_SCOPES
+
+        user = request.user
+        if not user.is_employee:
+            return Response(
+                {'error': 'Only employees can access this endpoint'},
+                status=status.HTTP_403_FORBIDDEN
+            )
+
+        registry = self._get_employee_registry(user)
+        if not registry:
+            return Response(
+                {'error': 'Employee registry record not found'},
+                status=status.HTTP_404_NOT_FOUND
+            )
+
+        default_scopes = (
+            list(DEFAULT_CONSENT_REQUESTED_SCOPES)
+            if registry.default_consent_scopes is None
+            else registry.default_consent_scopes
+        )
+        return Response({
+            'default_scopes': default_scopes,
+            'available_scopes': list(CONSENT_SCOPES),
+        }, status=status.HTTP_200_OK)
+
+    def update_consent_preferences(self, request):
+        """Update the employee's default consent preferences."""
+        from employees.utils import clean_consent_scopes, DEFAULT_CONSENT_REQUESTED_SCOPES
+
+        user = request.user
+        if not user.is_employee:
+            return Response(
+                {'error': 'Only employees can update this endpoint'},
+                status=status.HTTP_403_FORBIDDEN
+            )
+
+        registry = self._get_employee_registry(user)
+        if not registry:
+            return Response(
+                {'error': 'Employee registry record not found'},
+                status=status.HTTP_404_NOT_FOUND
+            )
+
+        serializer = EmployeeConsentPreferenceSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        scopes_raw = serializer.validated_data.get('default_scopes', [])
+        valid_scopes, invalid_scopes = clean_consent_scopes(scopes_raw)
+        if invalid_scopes:
+            return Response(
+                {'error': 'Invalid consent scopes provided.', 'invalid_scopes': invalid_scopes},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        registry.default_consent_scopes = valid_scopes
+        registry.save(update_fields=['default_consent_scopes'])
+
+        default_scopes = (
+            list(DEFAULT_CONSENT_REQUESTED_SCOPES)
+            if registry.default_consent_scopes is None
+            else registry.default_consent_scopes
+        )
+        return Response({
+            'default_scopes': default_scopes,
+        }, status=status.HTTP_200_OK)
+
+    def get_profile(self, request):
+        """Alias for the authenticated employee profile (same as /profile/me)."""
+        return self.get_own_profile(request)
+
+    def update_profile(self, request):
+        """Update authenticated employee profile (partial or full)."""
+        from accounts.database_utils import get_tenant_database_alias
+        from .serializers import EmployeeProfileCompletionSerializer
+
+        user = request.user
+
+        if not user.is_employee:
+            return Response(
+                {'error': 'Only employees can update their profile'},
+                status=status.HTTP_403_FORBIDDEN
+            )
+
+        try:
+            # Get employee record
+            if hasattr(user, 'employee_profile') and user.employee_profile:
+                employee = user.employee_profile
+                from accounts.models import EmployerProfile
+                employer = EmployerProfile.objects.get(id=employee.employer_id)
+                tenant_db = get_tenant_database_alias(employer)
+            else:
+                # Fallback: search all tenant databases
+                from accounts.models import EmployerProfile
+                employers = EmployerProfile.objects.filter(user__is_active=True).select_related('user')
+                employee = None
+                tenant_db = None
+
+                for employer in employers:
+                    tenant_db = get_tenant_database_alias(employer)
+                    try:
+                        employee = Employee.objects.using(tenant_db).get(user_id=user.id)
+                        break
+                    except Employee.DoesNotExist:
+                        continue
+
+                if not employee:
+                    return Response(
+                        {'error': 'Employee record not found'},
+                        status=status.HTTP_404_NOT_FOUND
+                    )
+
+            partial = request.method == 'PATCH'
+            serializer = EmployeeProfileCompletionSerializer(
+                employee,
+                data=request.data,
+                partial=partial,
+                context={'tenant_db': tenant_db}
+            )
+
+            if serializer.is_valid():
+                updated_employee = serializer.save()
+
+                update_fields = {
+                    field: getattr(updated_employee, field)
+                    for field in serializer.validated_data.keys()
+                }
+
+                if update_fields:
+                    Employee.objects.using(tenant_db).filter(id=updated_employee.id).update(**update_fields)
+
+                updated_employee = Employee.objects.using(tenant_db).select_related(
+                    'department', 'branch', 'manager'
+                ).get(id=updated_employee.id)
+
+                from employees.utils import check_missing_fields_against_config, get_or_create_employee_config
+                config = get_or_create_employee_config(updated_employee.employer_id, tenant_db)
+                validation_result = check_missing_fields_against_config(updated_employee, config)
+
+                updated_employee.profile_completion_state = validation_result['completion_state']
+                updated_employee.profile_completion_required = validation_result['requires_update']
+                updated_employee.missing_required_fields = validation_result['missing_critical']
+                updated_employee.missing_optional_fields = validation_result['missing_non_critical']
+
+                completion_update_fields = [
+                    'profile_completion_state', 'profile_completion_required',
+                    'missing_required_fields', 'missing_optional_fields',
+                ]
+
+                if validation_result['completion_state'] == 'COMPLETE' and not updated_employee.profile_completed:
+                    updated_employee.profile_completed = True
+                    updated_employee.profile_completed_at = timezone.now()
+                    if updated_employee.employment_status == 'PENDING':
+                        updated_employee.employment_status = 'ACTIVE'
+                    completion_update_fields += [
+                        'profile_completed', 'profile_completed_at', 'employment_status'
+                    ]
+
+                updated_employee.save(using=tenant_db, update_fields=completion_update_fields)
+
+                create_employee_audit_log(
+                    employee=updated_employee,
+                    action='PROFILE_UPDATED',
+                    performed_by=user,
+                    notes='Employee updated their profile',
+                    request=request,
+                    tenant_db=tenant_db
+                )
+
+                return Response({
+                    'message': 'Profile updated successfully.',
+                    'profile': EmployeeSelfProfileSerializer(
+                        updated_employee,
+                        context={'tenant_db': tenant_db, 'request': request}
+                    ).data,
+                    'profile_completion': {
+                        'state': validation_result['completion_state'],
+                        'is_blocking': validation_result['is_blocking'],
+                        'missing_critical_fields': validation_result['missing_critical'],
+                        'missing_non_critical_fields': validation_result['missing_non_critical'],
+                        'missing_documents': validation_result.get('missing_documents', []),
+                    }
+                }, status=status.HTTP_200_OK)
+
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+        except Exception as e:
+            return Response(
+                {'error': 'Failed to update profile', 'detail': str(e)},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
     
     @action(detail=False, methods=['get'], url_path='me')
     def get_own_profile(self, request):
@@ -2108,7 +2560,10 @@ class EmployeeProfileViewSet(viewsets.GenericViewSet):
                 ])
             
             # Pass tenant_db in context for serializer
-            serializer = EmployeeSelfProfileSerializer(employee, context={'tenant_db': tenant_db})
+            serializer = EmployeeSelfProfileSerializer(
+                employee,
+                context={'tenant_db': tenant_db, 'request': request}
+            )
             return Response(serializer.data, status=status.HTTP_200_OK)
             
         except Exception as e:
@@ -2116,6 +2571,100 @@ class EmployeeProfileViewSet(viewsets.GenericViewSet):
                 'error': 'Failed to retrieve employee profile',
                 'detail': str(e)
             }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+
+    @action(detail=False, methods=['post'], url_path='photo')
+    def upload_profile_photo(self, request):
+        """Upload or replace the authenticated employee's profile photo."""
+        from accounts.database_utils import get_tenant_database_alias
+        from accounts.models import EmployerProfile, EmployeeRegistry
+
+        user = request.user
+
+        if not user.is_employee:
+            return Response(
+                {'error': 'Only employees can update their profile photo'},
+                status=status.HTTP_403_FORBIDDEN
+            )
+
+        employee = None
+        tenant_db = None
+
+        try:
+            if hasattr(user, 'employee_profile') and user.employee_profile:
+                employee = user.employee_profile
+                employer = EmployerProfile.objects.get(id=employee.employer_id)
+                tenant_db = get_tenant_database_alias(employer)
+                employee = Employee.objects.using(tenant_db).get(id=employee.id)
+            else:
+                employers = EmployerProfile.objects.filter(user__is_active=True).select_related('user')
+                for employer in employers:
+                    tenant_db = get_tenant_database_alias(employer)
+                    try:
+                        employee = Employee.objects.using(tenant_db).get(user_id=user.id)
+                        break
+                    except Employee.DoesNotExist:
+                        continue
+        except EmployerProfile.DoesNotExist:
+            employee = None
+
+        if not employee or not tenant_db:
+            return Response(
+                {'error': 'Employee record not found'},
+                status=status.HTTP_404_NOT_FOUND
+            )
+
+        serializer = EmployeeProfilePhotoSerializer(data=request.data)
+        if not serializer.is_valid():
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+        new_photo = serializer.validated_data['profile_photo']
+
+        if employee.profile_photo:
+            employee.profile_photo.delete(save=False)
+
+        employee.profile_photo = new_photo
+        employee.save(using=tenant_db, update_fields=['profile_photo'])
+
+        try:
+            registry = EmployeeRegistry.objects.filter(user_id=user.id).first()
+            if registry:
+                registry.profile_picture = employee.profile_photo
+                registry.save(update_fields=['profile_picture'])
+        except Exception:
+            pass
+
+        try:
+            from employees.utils import check_missing_fields_against_config, get_or_create_employee_config
+
+            config = get_or_create_employee_config(employee.employer_id, tenant_db)
+            validation_result = check_missing_fields_against_config(employee, config)
+
+            update_fields = [
+                'profile_completion_state', 'profile_completion_required',
+                'missing_required_fields', 'missing_optional_fields',
+            ]
+
+            employee.profile_completion_state = validation_result['completion_state']
+            employee.profile_completion_required = validation_result['requires_update']
+            employee.missing_required_fields = validation_result['missing_critical']
+            employee.missing_optional_fields = validation_result['missing_non_critical']
+
+            if validation_result['completion_state'] == 'COMPLETE' and not employee.profile_completed:
+                employee.profile_completed = True
+                employee.profile_completed_at = timezone.now()
+                update_fields += ['profile_completed', 'profile_completed_at']
+
+            employee.save(using=tenant_db, update_fields=update_fields)
+        except Exception:
+            pass
+
+        return Response({
+            'message': 'Profile photo updated successfully.',
+            'profile': EmployeeSelfProfileSerializer(
+                employee,
+                context={'tenant_db': tenant_db, 'request': request}
+            ).data
+        }, status=status.HTTP_200_OK)
     
     @action(detail=False, methods=['put', 'patch'], url_path='complete-profile')
     def complete_profile(self, request):
@@ -2264,7 +2813,10 @@ class EmployeeProfileViewSet(viewsets.GenericViewSet):
                 from .serializers import EmployeeSelfProfileSerializer
                 return Response({
                     'message': 'Profile updated successfully.' if not updated_employee.profile_completed else 'Profile completed successfully.',
-                    'profile': EmployeeSelfProfileSerializer(updated_employee, context={'tenant_db': tenant_db}).data,
+                    'profile': EmployeeSelfProfileSerializer(
+                        updated_employee,
+                        context={'tenant_db': tenant_db, 'request': request}
+                    ).data,
                     'profile_completion': {
                         'state': validation_result['completion_state'],
                         'is_blocking': validation_result['is_blocking'],

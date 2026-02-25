@@ -65,6 +65,7 @@ INSTALLED_APPS = [
     'notifications',
     'treasury.apps.TreasuryConfig',
     'income_expense.apps.IncomeExpenseConfig',
+    'billing.apps.BillingConfig',
     'recruitment.apps.RecruitmentConfig',
     'communications',
     'assistant.apps.AssistantConfig',
@@ -252,6 +253,27 @@ ASSISTANT_OPENAI_API_KEY = config('ASSISTANT_OPENAI_API_KEY', default='')
 ASSISTANT_OPENAI_MODEL = config('ASSISTANT_OPENAI_MODEL', default='gpt-4.1-mini')
 ASSISTANT_OPENAI_TEMPERATURE = config('ASSISTANT_OPENAI_TEMPERATURE', default=0.2, cast=float)
 ASSISTANT_OPENAI_MAX_TOKENS = config('ASSISTANT_OPENAI_MAX_TOKENS', default=700, cast=int)
+
+# GbPay Integration
+GBPAY_API_BASE_URL = config('GBPAY_API_BASE_URL', default='https://mygbpay.com/backend/api/v1')
+GBPAY_MOCK_MODE = config('GBPAY_MOCK_MODE', default=False, cast=bool)
+GBPAY_ENDPOINTS = {
+    "authenticate": "/authenticate/auth/login",
+    "countries": "/config/third-party/countries-by-provider-type",
+    "category_products": "/config/third-party/products-by-category-country",
+    "banks": "/config/third-party/products-by-category-country",
+    "operators": "/config/third-party/products-by-category-country",
+    "lookup": "/trans/account/search",
+    "initiate_transfer": "/trans/quote",
+    "execute_transfer": "/trans/transaction",
+    "transaction_status": "/trans/transaction/{transactionReference}/status",
+    "cancel_cashout": "/trans/transaction/cashout/cancel",
+    "transfer_fee": "/trans/fee",
+    "supported_currencies": "/countries/{countryCode}/currencies",
+}
+GBPAY_MOCK_COUNTRIES = []
+GBPAY_MOCK_BANKS = []
+GBPAY_MOCK_OPERATORS = []
 
 # Multi-tenancy Settings
 CURRENT_TENANT_DB = None  # Thread-local storage for current tenant database

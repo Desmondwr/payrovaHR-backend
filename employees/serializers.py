@@ -5,7 +5,8 @@ from django.contrib.auth import get_user_model
 from .models import (
     Department, Branch, Employee, EmployeeDocument,
     EmployeeCrossInstitutionRecord, EmployeeAuditLog, EmployeeInvitation,
-    EmployeeConfiguration, TerminationApproval, CrossInstitutionConsent
+    EmployeeConfiguration, TerminationApproval, CrossInstitutionConsent,
+    EmploymentCertificateShare
 )
 from accounts.models import EmployerProfile, EmployeeMembership
 
@@ -163,6 +164,7 @@ class EmployeeListSerializer(serializers.ModelSerializer):
     branch_names = serializers.SerializerMethodField()
     branches = serializers.SerializerMethodField()
     manager_name = serializers.SerializerMethodField()
+    is_concurrent_employment = serializers.SerializerMethodField()
     
     class Meta:
         model = Employee
@@ -228,6 +230,34 @@ class EmployeeListSerializer(serializers.ModelSerializer):
             pass
         return None
 
+    def get_is_concurrent_employment(self, obj):
+        """Mask concurrent employment unless consent has been approved."""
+        try:
+            from accounts.rbac import get_active_employer
+            from accounts.database_utils import get_tenant_database_alias
+            from employees.utils import (
+                get_or_create_employee_config,
+                has_approved_cross_institution_records,
+                CONSENT_SCOPE_EMPLOYMENT_DATES,
+            )
+
+            request = self.context.get('request')
+            if request and hasattr(request.user, 'employer_profile'):
+                employer = get_active_employer(request, require_context=True)
+                tenant_db = get_tenant_database_alias(employer)
+                config = get_or_create_employee_config(employer.id, tenant_db)
+                if getattr(config, 'cross_institution_visibility_level', 'NONE') == 'NONE':
+                    return False
+
+            if not has_approved_cross_institution_records(
+                obj,
+                required_scopes=[CONSENT_SCOPE_EMPLOYMENT_DATES]
+            ):
+                return False
+        except Exception:
+            return False
+        return bool(getattr(obj, 'is_concurrent_employment', False))
+
 
 class EmployeeDetailSerializer(serializers.ModelSerializer):
     """Serializer for Employee detail view (all fields)"""
@@ -240,6 +270,7 @@ class EmployeeDetailSerializer(serializers.ModelSerializer):
     has_user_account = serializers.SerializerMethodField()
     cross_institution_count = serializers.SerializerMethodField()
     documents = serializers.SerializerMethodField()
+    is_concurrent_employment = serializers.SerializerMethodField()
     
     class Meta:
         model = Employee
@@ -307,12 +338,66 @@ class EmployeeDetailSerializer(serializers.ModelSerializer):
         return obj.user_id is not None
     
     def get_cross_institution_count(self, obj):
-        return obj.cross_institution_records.count()
+        try:
+            from accounts.rbac import get_active_employer
+            from accounts.database_utils import get_tenant_database_alias
+            from employees.utils import get_or_create_employee_config
+            from employees.utils import (
+                count_approved_cross_institution_records,
+                CONSENT_SCOPE_EMPLOYMENT_DATES,
+            )
+
+            request = self.context.get('request')
+            if request and hasattr(request.user, 'employer_profile'):
+                employer = get_active_employer(request, require_context=True)
+                tenant_db = get_tenant_database_alias(employer)
+                config = get_or_create_employee_config(employer.id, tenant_db)
+                if getattr(config, 'cross_institution_visibility_level', 'NONE') == 'NONE':
+                    return 0
+                db_alias = tenant_db
+            else:
+                db_alias = getattr(obj._state, 'db', None) or 'default'
+
+            return count_approved_cross_institution_records(
+                obj,
+                tenant_db=db_alias,
+                required_scopes=[CONSENT_SCOPE_EMPLOYMENT_DATES]
+            )
+        except Exception:
+            return 0
     
     def get_documents(self, obj):
         """Get all documents for this employee"""
         documents = obj.documents.all()
         return EmployeeDocumentSerializer(documents, many=True, context=self.context).data
+
+    def get_is_concurrent_employment(self, obj):
+        """Mask concurrent employment unless consent has been approved."""
+        try:
+            from accounts.rbac import get_active_employer
+            from accounts.database_utils import get_tenant_database_alias
+            from employees.utils import (
+                get_or_create_employee_config,
+                has_approved_cross_institution_records,
+                CONSENT_SCOPE_EMPLOYMENT_DATES,
+            )
+
+            request = self.context.get('request')
+            if request and hasattr(request.user, 'employer_profile'):
+                employer = get_active_employer(request, require_context=True)
+                tenant_db = get_tenant_database_alias(employer)
+                config = get_or_create_employee_config(employer.id, tenant_db)
+                if getattr(config, 'cross_institution_visibility_level', 'NONE') == 'NONE':
+                    return False
+
+            if not has_approved_cross_institution_records(
+                obj,
+                required_scopes=[CONSENT_SCOPE_EMPLOYMENT_DATES]
+            ):
+                return False
+        except Exception:
+            return False
+        return bool(getattr(obj, 'is_concurrent_employment', False))
 
 
 class CreateEmployeeSerializer(serializers.ModelSerializer):
@@ -1207,13 +1292,21 @@ class EmployeeConfigurationSerializer(serializers.ModelSerializer):
             return None
 
 
+class CrossInstitutionMatchSummarySerializer(serializers.Serializer):
+    """Redacted cross-institution match summary (no PII)."""
+
+    match_id = serializers.CharField()
+    details_restricted = serializers.BooleanField(default=True)
+
+
 class DuplicateDetectionResultSerializer(serializers.Serializer):
     """Serializer for duplicate detection results"""
     
     duplicates_found = serializers.BooleanField()
     total_matches = serializers.IntegerField()
     same_institution_matches = EmployeeListSerializer(many=True)
-    cross_institution_matches = EmployeeListSerializer(many=True)
+    cross_institution_matches = CrossInstitutionMatchSummarySerializer(many=True)
+    cross_institution_count = serializers.IntegerField()
     match_reasons = serializers.DictField()
 
 
@@ -1540,7 +1633,13 @@ class CreateEmployeeWithDetectionSerializer(serializers.ModelSerializer):
     
     def validate(self, data):
         """Validate employee data against configuration"""
-        from employees.utils import validate_employee_data, detect_duplicate_employees, get_or_create_employee_config, check_concurrent_employment
+        from employees.utils import (
+            validate_employee_data,
+            detect_duplicate_employees,
+            get_or_create_employee_config,
+            check_concurrent_employment,
+            has_approved_cross_institution_consent,
+        )
         from accounts.database_utils import get_tenant_database_alias
         
         request = self.context['request']
@@ -1597,9 +1696,11 @@ class CreateEmployeeWithDetectionSerializer(serializers.ModelSerializer):
                 concurrent_check = check_concurrent_employment(registry.id, employer.id, config)
                 
                 if not concurrent_check['allowed']:
+                    existing_count = len(concurrent_check.get('existing_employers') or [])
                     raise serializers.ValidationError({
                         'concurrent_employment': concurrent_check['reason'],
-                        'existing_employers': concurrent_check['existing_employers']
+                        'existing_employers_count': existing_count,
+                        'consent_required': True,
                     })
                 
             except EmployeeRegistry.DoesNotExist:
@@ -1621,18 +1722,12 @@ class CreateEmployeeWithDetectionSerializer(serializers.ModelSerializer):
             same_matches = duplicate_result.get('same_institution_matches') or []
             cross_matches = duplicate_result.get('cross_institution_matches') or []
             if cross_matches:
-                existing_employers = []
-                for match in cross_matches:
-                    entry = {
-                        'employer_id': match.get('employer_id'),
-                        'employer_name': match.get('employer_name'),
-                    }
-                    data_obj = match.get('data')
-                    if isinstance(data_obj, dict):
-                        entry['employee_id'] = data_obj.get('employee_id') or data_obj.get('id')
-                    else:
-                        entry['employee_id'] = getattr(data_obj, 'employee_id', None) or getattr(data_obj, 'id', None)
-                    existing_employers.append(entry)
+                source_employer_ids = [
+                    match.get('employer_id')
+                    for match in cross_matches
+                    if match.get('employer_id')
+                ]
+                existing_employers_count = len(cross_matches)
 
                 # Contract-level gating for multi-institution employment
                 contract_blocks_multi = False
@@ -1660,7 +1755,7 @@ class CreateEmployeeWithDetectionSerializer(serializers.ModelSerializer):
                             data={
                                 "event": "employees.concurrent_employment_blocked",
                                 "reason": "contract_policy",
-                                "existing_employers": existing_employers,
+                                "existing_employers_count": existing_employers_count,
                             },
                             employer_profile=employer,
                         )
@@ -1668,8 +1763,9 @@ class CreateEmployeeWithDetectionSerializer(serializers.ModelSerializer):
                         pass
                     raise serializers.ValidationError({
                         'concurrent_employment': 'Concurrent employment is not allowed by contract configuration',
-                        'existing_employers': existing_employers,
+                        'existing_employers_count': existing_employers_count,
                         'concurrent_employment_detected': True,
+                        'consent_required': True,
                     })
 
                 if config and not config.allow_concurrent_employment:
@@ -1683,7 +1779,7 @@ class CreateEmployeeWithDetectionSerializer(serializers.ModelSerializer):
                             data={
                                 "event": "employees.concurrent_employment_blocked",
                                 "reason": "employer_policy",
-                                "existing_employers": existing_employers,
+                                "existing_employers_count": existing_employers_count,
                             },
                             employer_profile=employer,
                         )
@@ -1691,11 +1787,41 @@ class CreateEmployeeWithDetectionSerializer(serializers.ModelSerializer):
                         pass
                     raise serializers.ValidationError({
                         'concurrent_employment': 'Concurrent employment is not allowed by this employer',
-                        'existing_employers': existing_employers,
+                        'existing_employers_count': existing_employers_count,
                         'concurrent_employment_detected': True,
+                        'consent_required': True,
                     })
 
-                # Consent flow disabled: do not require employee consent to proceed.
+                # Require employee consent before linking to existing user data.
+                chosen_user_id = data.get('link_existing_user') or data.get('user_id')
+                if chosen_user_id:
+                    try:
+                        from accounts.models import EmployeeRegistry
+                        registry = EmployeeRegistry.objects.filter(user_id=chosen_user_id).first()
+                        if registry:
+                            consent_ok = has_approved_cross_institution_consent(
+                                registry.id,
+                                employer.id,
+                                source_employer_ids or None,
+                                required_scopes=['identity']
+                            )
+                            if not consent_ok:
+                                raise serializers.ValidationError({
+                                    'consent_required': True,
+                                    'concurrent_employment_detected': True,
+                                    'message': 'Employee consent is required before linking cross-institution data.',
+                                    'existing_employers_count': existing_employers_count,
+                                })
+                    except serializers.ValidationError:
+                        raise
+                    except Exception:
+                        # Fail closed if consent validation fails
+                        raise serializers.ValidationError({
+                            'consent_required': True,
+                            'concurrent_employment_detected': True,
+                            'message': 'Employee consent is required before linking cross-institution data.',
+                            'existing_employers_count': existing_employers_count,
+                        })
 
             # Check duplicate action from config (skip if force_create)
             force_create = data.get('force_create', False)
@@ -1846,9 +1972,30 @@ class CreateEmployeeWithDetectionSerializer(serializers.ModelSerializer):
                 )
                 validated_data['user_id'] = user.id
         
-        # Mark as concurrent employment if cross-institution matches found
+        # Mark as concurrent employment only when consent has been approved
         if duplicate_info and duplicate_info.get('cross_institution_matches'):
-            validated_data['is_concurrent_employment'] = True
+            try:
+                from accounts.models import EmployeeRegistry
+                from employees.utils import has_approved_cross_institution_consent
+                registry = None
+                if validated_data.get('user_id'):
+                    registry = EmployeeRegistry.objects.filter(user_id=validated_data['user_id']).first()
+                if registry:
+                    source_employer_ids = [
+                        match.get('employer_id')
+                        for match in (duplicate_info.get('cross_institution_matches') or [])
+                        if match.get('employer_id')
+                    ]
+                    consent_ok = has_approved_cross_institution_consent(
+                        registry.id,
+                        employer.id,
+                        source_employer_ids or None,
+                        required_scopes=['employment_dates']
+                    )
+                    if consent_ok:
+                        validated_data['is_concurrent_employment'] = True
+            except Exception:
+                pass
         
         # Create employee in tenant database
         employee = Employee.objects.using(tenant_db).create(**validated_data)
@@ -1915,7 +2062,7 @@ class CreateEmployeeWithDetectionSerializer(serializers.ModelSerializer):
                 last_active_employer_id=employer.id
             )
 
-            # Consent flow disabled: do not create consent requests.
+            # Consent requests are created explicitly via the consent endpoint.
         
         # Create audit log in tenant database
         create_employee_audit_log(
@@ -1971,9 +2118,9 @@ class CreateEmployeeWithDetectionSerializer(serializers.ModelSerializer):
                     detected_employer_id=employer_id,
                     detected_employee_id=str(detected_employee_id) if detected_employee_id is not None else '',
                     status=status_val or 'PENDING',
-                    consent_status='NOT_REQUIRED',
+                    consent_status='PENDING',
                     consent_requested_at=None,
-                    notes=f"Detected during employee creation. Match reasons: {', '.join(reasons or [])}"
+                    notes=f"Detected during employee creation. Consent required. Match reasons: {', '.join(reasons or [])}"
                 )
         
         # Store flags for view to handle
@@ -2671,6 +2818,12 @@ class EmployeeSelfProfileSerializer(serializers.ModelSerializer):
         return EmployeeDocumentSerializer(documents, many=True, context=self.context).data
 
 
+class EmployeeProfilePhotoSerializer(serializers.Serializer):
+    """Serializer for uploading an employee profile photo."""
+
+    profile_photo = serializers.ImageField(required=True)
+
+
 class TerminationApprovalSerializer(serializers.ModelSerializer):
     """Serializer for Termination Approval"""
     
@@ -2759,6 +2912,7 @@ class CrossInstitutionConsentSerializer(serializers.ModelSerializer):
         fields = [
             'id', 'employee_registry_id', 'source_employer_id', 'target_employer_id',
             'source_employer_name', 'target_employer_name', 'status', 'consent_token',
+            'requested_scopes', 'approved_scopes',
             'requested_at', 'expires_at', 'responded_at', 'notes'
         ]
         read_only_fields = ['id', 'consent_token', 'requested_at', 'responded_at']
@@ -2772,10 +2926,37 @@ class CrossInstitutionConsentSerializer(serializers.ModelSerializer):
             return None
 
 
+class EmploymentCertificateShareSerializer(serializers.ModelSerializer):
+    """Serializer for employment certificate share tokens"""
+
+    class Meta:
+        model = EmploymentCertificateShare
+        fields = [
+            'id', 'employee_registry_id', 'employer_id', 'tenant_employee_id',
+            'document_id', 'token', 'status', 'created_at', 'expires_at', 'revoked_at'
+        ]
+        read_only_fields = ['id', 'token', 'status', 'created_at', 'revoked_at']
+
+
 class RespondConsentSerializer(serializers.Serializer):
     """Serializer for responding to cross-institution consent"""
     
-    response = serializers.ChoiceField(choices=['approve', 'reject'], required=True)
+    response = serializers.ChoiceField(choices=['approve', 'reject', 'revoke'], required=True)
     notes = serializers.CharField(required=False, allow_blank=True)
+    approved_scopes = serializers.ListField(
+        child=serializers.CharField(),
+        required=False,
+        allow_empty=True
+    )
+
+
+class EmployeeConsentPreferenceSerializer(serializers.Serializer):
+    """Serializer for employee consent preferences"""
+
+    default_scopes = serializers.ListField(
+        child=serializers.CharField(),
+        required=True,
+        allow_empty=True
+    )
 
 

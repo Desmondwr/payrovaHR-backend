@@ -2,7 +2,8 @@ from django.contrib import admin
 from .models import (
     Department, Branch, Employee, EmployeeDocument,
     EmployeeCrossInstitutionRecord, EmployeeAuditLog, EmployeeInvitation,
-    EmployeeConfiguration, TerminationApproval, CrossInstitutionConsent
+    EmployeeConfiguration, TerminationApproval, CrossInstitutionConsent,
+    EmploymentCertificateShare
 )
 
 
@@ -208,4 +209,13 @@ class CrossInstitutionConsentAdmin(admin.ModelAdmin):
     search_fields = ['target_employer_name', 'consent_token']
     readonly_fields = ['id', 'consent_token', 'requested_at']
     ordering = ['-requested_at']
+
+
+@admin.register(EmploymentCertificateShare)
+class EmploymentCertificateShareAdmin(admin.ModelAdmin):
+    list_display = ['token', 'employee_registry_id', 'employer_id', 'status', 'created_at', 'expires_at']
+    list_filter = ['status', 'created_at']
+    search_fields = ['token', 'employee_registry_id', 'employer_id']
+    readonly_fields = ['id', 'token', 'created_at', 'revoked_at']
+    ordering = ['-created_at']
 
