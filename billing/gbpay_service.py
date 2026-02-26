@@ -145,10 +145,21 @@ class GbPayService:
 
         if response.status_code >= 400:
             code = ""
+            detail = ""
             if isinstance(payload, dict):
                 code = payload.get("code") or payload.get("errorCode") or payload.get("error_code") or ""
+                detail = (
+                    payload.get("message")
+                    or payload.get("error")
+                    or payload.get("errorDescription")
+                    or payload.get("detail")
+                    or ""
+                )
+            message = f"GbPay request failed with status {response.status_code}."
+            if detail:
+                message = f"{message} {detail}"
             raise GbPayApiError(
-                f"GbPay request failed with status {response.status_code}.",
+                message,
                 status_code=response.status_code,
                 code=code,
                 payload=payload,
@@ -167,6 +178,21 @@ class GbPayService:
             "password": creds.get("secret_key") or creds.get("secretKey") or creds.get("password"),
             "scope": creds.get("scope") or creds.get("auth_scope"),
         }
+        def _mask(value: Optional[str], visible: int = 4) -> str:
+            if not value:
+                return ""
+            value = str(value)
+            if len(value) <= visible:
+                return "*" * len(value)
+            return f"{'*' * (len(value) - visible)}{value[-visible:]}"
+
+        logger.info(
+            "GbPay auth request prepared (connection_id=%s username=%s scope=%s secret_len=%s)",
+            self.context.connection_id,
+            _mask(payload.get("username")),
+            payload.get("scope"),
+            len(payload.get("password") or ""),
+        )
         payload = {key: value for key, value in payload.items() if value not in (None, "")}
         response = None
         primary_path = self.endpoints.get("authenticate", "")
@@ -197,10 +223,30 @@ class GbPayService:
                         raise
             if response is None:
                 raise last_exc
-        token = response.get("accessToken") or response.get("token") or response.get("access_token")
+        content = response.get("content") if isinstance(response, dict) else None
+        if not content and isinstance(response, dict):
+            content = response.get("data")
+
+        token = (
+            response.get("accessToken")
+            or response.get("token")
+            or response.get("access_token")
+            or (content.get("accessToken") if isinstance(content, dict) else None)
+            or (content.get("access_token") if isinstance(content, dict) else None)
+            or (content.get("token") if isinstance(content, dict) else None)
+        )
         if not token:
+            if isinstance(response, dict) and response.get("success") is False:
+                message = response.get("message") or response.get("error") or "GbPay authentication failed."
+                raise GbPayApiError(message, payload=response)
             raise GbPayApiError("GbPay authentication did not return an access token.", payload=response)
-        expires_in = response.get("expiresIn") or response.get("expires_in") or 3600
+        expires_in = (
+            response.get("expiresIn")
+            or response.get("expires_in")
+            or (content.get("expiresIn") if isinstance(content, dict) else None)
+            or (content.get("expires_in") if isinstance(content, dict) else None)
+            or 3600
+        )
         self.token_store.set(self.context.connection_id, token, int(expires_in))
         return token
 
@@ -215,7 +261,14 @@ class GbPayService:
         if getattr(settings, "GBPAY_MOCK_MODE", False):
             return {"data": getattr(settings, "GBPAY_MOCK_COUNTRIES", [])}
         params = {"type": providerType} if providerType else None
-        return self._request("get", self.endpoints["countries"], params=params)
+        try:
+            return self._request("get", self.endpoints["countries"], params=params)
+        except GbPayApiError as exc:
+            if exc.status_code != 400 or not providerType:
+                raise
+            # Fallback for providers expecting providerType param name
+            params = {"providerType": providerType}
+            return self._request("get", self.endpoints["countries"], params=params)
 
     def getCategoryProducts(self, category: str, countryId: str) -> Dict[str, Any]:
         params = {"category": category, "countryId": countryId}
@@ -260,7 +313,7 @@ class GbPayService:
     def getSimplifiedOperatorsByCountry(self, countryId: str) -> Dict[str, Any]:
         if getattr(settings, "GBPAY_MOCK_MODE", False):
             return {"data": getattr(settings, "GBPAY_MOCK_OPERATORS", [])}
-        response = self.getCategoryProducts("ACCOUNT_TO_WALLET", countryId)
+        response = self.getCategoryProducts("MOBILE_MONEY", countryId)
         items = response
         if isinstance(response, dict):
             items = response.get("data") or response.get("content") or response

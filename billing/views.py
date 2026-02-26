@@ -493,8 +493,10 @@ class GbPayCatalogContextMixin(BillingEmployerContextMixin):
     @staticmethod
     def _normalize_provider_type(provider_type: str) -> str:
         value = (provider_type or "").upper()
-        if value in {"BANK", "MOBILE"}:
-            return "MOBILE_BANK"
+        if value in {"BANK", "BANK_ACCOUNT"}:
+            return "BANK_ACCOUNT"
+        if value in {"MOBILE", "MOBILE_MONEY", "MOBILE_WALLET"}:
+            return "MOBILE_MONEY"
         return value
 
     def _normalize_countries(self, items):
@@ -580,8 +582,14 @@ class GbPayCountriesView(GbPayCatalogContextMixin, APIView):
     required_permissions = ["billing.gbpay.view", "billing.manage"]
 
     def get(self, request):
-        provider_type = request.query_params.get("provider_type") or request.query_params.get("providerType")
+        provider_type = (
+            request.query_params.get("provider_type")
+            or request.query_params.get("providerType")
+            or request.query_params.get("type")
+        )
         provider_type = self._normalize_provider_type(provider_type)
+        if not provider_type:
+            provider_type = "BANK_ACCOUNT"
         try:
             payload = self.get_gbpay_service().getCountries(provider_type)
         except GbPayApiError as exc:

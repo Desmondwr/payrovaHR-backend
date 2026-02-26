@@ -257,6 +257,7 @@ ASSISTANT_OPENAI_MAX_TOKENS = config('ASSISTANT_OPENAI_MAX_TOKENS', default=700,
 # GbPay Integration
 GBPAY_API_BASE_URL = config('GBPAY_API_BASE_URL', default='https://mygbpay.com/backend/api/v1')
 GBPAY_MOCK_MODE = config('GBPAY_MOCK_MODE', default=False, cast=bool)
+GBPAY_ENCRYPTION_KEY = config('GBPAY_ENCRYPTION_KEY', default='')
 GBPAY_ENDPOINTS = {
     "authenticate": "/authenticate/auth/login",
     "countries": "/config/third-party/countries-by-provider-type",
