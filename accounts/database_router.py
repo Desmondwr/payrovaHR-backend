@@ -31,6 +31,8 @@ class TenantDatabaseRouter:
         'contenttype',
         'group',
         'logentry',
+        'outstandingtoken',
+        'blacklistedtoken',
     ]
     
     def db_for_read(self, model, **hints):
@@ -146,7 +148,7 @@ class TenantDatabaseRouter:
             # Never apply accounts app migrations to tenant databases (accounts models live in default DB)
             if app_label == 'accounts':
                 return False
-            if app_label in ['auth', 'admin', 'sessions', 'contenttypes', 'notifications']:
+            if app_label in ['auth', 'admin', 'sessions', 'contenttypes', 'notifications', 'token_blacklist']:
                 # These tables should not be created in tenant databases
                 return False
             

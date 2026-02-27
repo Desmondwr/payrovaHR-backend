@@ -2,9 +2,9 @@ import calendar
 import re
 import uuid
 from dataclasses import dataclass
-from datetime import date, datetime, time as dtime
+from datetime import date, datetime, time as dtime, timedelta
 from decimal import Decimal, ROUND_DOWN, ROUND_HALF_UP, ROUND_UP
-from typing import Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 from django.db import transaction
 from django.db.models import Q
@@ -13,7 +13,8 @@ from rest_framework.exceptions import ValidationError
 
 from accounts.models import EmployerProfile
 from accounts.rbac import get_active_employer
-from attendance.models import AttendanceConfiguration, AttendanceRecord, WorkingSchedule
+from attendance.models import AttendanceConfiguration, AttendanceRecord, WorkingSchedule, WorkingScheduleDay
+from attendance.services import resolve_check_in_timing
 from contracts.models import (
     Allowance,
     CalculationScale,
@@ -41,9 +42,11 @@ from treasury.services import (
 )
 
 from .models import (
+    AttendancePayrollImpactConfig,
     CalculationBasis,
     CalculationBasisAdvantage,
     PayrollConfiguration,
+    PayrollGeneratedItem,
     Salary,
     SalaryAdvantage,
     SalaryDeduction,
@@ -78,6 +81,16 @@ SOCIAL_DEDUCTION_SYS_CODES = {
     "PENSION",
     "PV",
     "PVID",
+}
+
+ATTENDANCE_EVENT_LABELS = {
+    AttendancePayrollImpactConfig.EVENT_LATENESS: "Attendance Lateness",
+    AttendancePayrollImpactConfig.EVENT_ABSENCE: "Attendance Absence",
+    AttendancePayrollImpactConfig.EVENT_OVERTIME: "Attendance Overtime",
+    AttendancePayrollImpactConfig.EVENT_EARLY_DEPARTURE: "Attendance Early Departure",
+    AttendancePayrollImpactConfig.EVENT_WEEKEND_WORK: "Attendance Weekend Work",
+    AttendancePayrollImpactConfig.EVENT_HOLIDAY_WORK: "Attendance Holiday Work",
+    AttendancePayrollImpactConfig.EVENT_UNPAID_LEAVE: "Attendance Unpaid Leave",
 }
 
 
@@ -168,6 +181,573 @@ class PayrollRunResult:
     reason: str = ""
 
 
+class AttendancePayrollImpactService:
+    def __init__(
+        self,
+        *,
+        employer_id: int,
+        year: int,
+        month: int,
+        tenant_db: str,
+        round_money,
+    ):
+        self.employer_id = employer_id
+        self.year = year
+        self.month = month
+        self.tenant_db = tenant_db
+        self.round_money = round_money
+        self._month_start, self._month_end, self._month_days = _month_bounds(self.year, self.month)
+        self._attendance_config_cache: Dict[int, Optional[AttendanceConfiguration]] = {}
+        self._unpaid_leave_codes: Optional[Set[str]] = None
+
+    def has_active_configs(self) -> bool:
+        return AttendancePayrollImpactConfig.objects.using(self.tenant_db).filter(
+            employer_id=self.employer_id,
+            is_active=True,
+        ).exists()
+
+    def _event_label(self, event_code: str) -> str:
+        return ATTENDANCE_EVENT_LABELS.get(event_code, str(event_code or "Attendance Impact").replace("_", " ").title())
+
+    def _resolve_attendance_config(self, employer_id: int) -> Optional[AttendanceConfiguration]:
+        if employer_id not in self._attendance_config_cache:
+            self._attendance_config_cache[employer_id] = (
+                AttendanceConfiguration.objects.using(self.tenant_db)
+                .filter(employer_id=employer_id)
+                .first()
+            )
+        return self._attendance_config_cache[employer_id]
+
+    def _resolve_unpaid_leave_codes(self) -> Set[str]:
+        if self._unpaid_leave_codes is None:
+            rows = TimeOffType.objects.using(self.tenant_db).filter(
+                employer_id=self.employer_id,
+                paid=False,
+            )
+            self._unpaid_leave_codes = {str(row.code) for row in rows if row.code}
+        return self._unpaid_leave_codes
+
+    def _resolve_schedule_context(self, contract: Contract, record: AttendanceRecord) -> Tuple[Optional[datetime], Optional[datetime]]:
+        employee = contract.employee
+        if not employee or not record.check_in_at:
+            return None, None
+
+        schedule = None
+        employee_schedule_id = getattr(employee, "working_schedule_id", None)
+        if employee_schedule_id:
+            schedule = (
+                WorkingSchedule.objects.using(self.tenant_db)
+                .filter(employer_id=self.employer_id, id=employee_schedule_id)
+                .first()
+            )
+        if not schedule:
+            schedule = (
+                WorkingSchedule.objects.using(self.tenant_db)
+                .filter(employer_id=self.employer_id, is_default=True)
+                .first()
+            )
+        if not schedule:
+            return None, None
+
+        tz = timezone.get_current_timezone()
+        if schedule.timezone:
+            try:
+                from zoneinfo import ZoneInfo
+
+                tz = ZoneInfo(schedule.timezone)
+            except Exception:
+                tz = timezone.get_current_timezone()
+
+        check_in_at = record.check_in_at
+        if timezone.is_naive(check_in_at):
+            local_check_in = timezone.make_aware(check_in_at, tz)
+        else:
+            local_check_in = timezone.localtime(check_in_at, tz)
+
+        weekday = local_check_in.weekday()
+        day_rule = (
+            WorkingScheduleDay.objects.using(self.tenant_db)
+            .filter(schedule=schedule, weekday=weekday)
+            .first()
+        )
+        if not day_rule or not day_rule.start_time or not day_rule.end_time:
+            return None, None
+
+        scheduled_start = datetime.combine(local_check_in.date(), day_rule.start_time)
+        scheduled_end = datetime.combine(local_check_in.date(), day_rule.end_time)
+        if timezone.is_naive(scheduled_start):
+            scheduled_start = timezone.make_aware(scheduled_start, tz)
+        if timezone.is_naive(scheduled_end):
+            scheduled_end = timezone.make_aware(scheduled_end, tz)
+        return scheduled_start, scheduled_end
+
+    def _build_attendance_metrics(
+        self,
+        *,
+        contract: Contract,
+        config: AttendancePayrollImpactConfig,
+        minutes_per_day: Decimal,
+    ) -> List[Dict[str, Any]]:
+        employee = contract.employee
+        if not employee:
+            return []
+
+        records_qs = AttendanceRecord.objects.using(self.tenant_db).filter(
+            employer_id=self.employer_id,
+            employee=employee,
+            check_out_at__isnull=False,
+            check_in_at__date__gte=self._month_start,
+            check_in_at__date__lte=self._month_end,
+        )
+        if config.requires_validation:
+            records_qs = records_qs.filter(status=AttendanceRecord.STATUS_APPROVED)
+        else:
+            records_qs = records_qs.filter(status__in=[AttendanceRecord.STATUS_APPROVED, AttendanceRecord.STATUS_TO_APPROVE])
+        records = list(records_qs.order_by("check_in_at"))
+
+        grace_minutes = max(int(config.grace_minutes or 0), 0)
+        metrics: List[Dict[str, Any]] = []
+
+        for record in records:
+            minutes = Decimal("0.0000")
+            hours = Decimal("0.0000")
+            days = Decimal("0.0000")
+
+            if config.event_code == AttendancePayrollImpactConfig.EVENT_LATENESS:
+                attendance_cfg = self._resolve_attendance_config(self.employer_id)
+                timing = resolve_check_in_timing(
+                    employee=employee,
+                    check_in_at=record.check_in_at,
+                    config=attendance_cfg,
+                    db_alias=self.tenant_db,
+                )
+                late_minutes = int((timing or {}).get("late_minutes") or 0)
+                payable_minutes = max(late_minutes - grace_minutes, 0)
+                minutes = Decimal(str(payable_minutes))
+                if minutes_per_day > 0:
+                    days = minutes / minutes_per_day
+                hours = minutes / Decimal("60")
+            elif config.event_code == AttendancePayrollImpactConfig.EVENT_ABSENCE:
+                expected = Decimal(str(max(int(record.expected_minutes or 0), 0)))
+                worked = Decimal(str(max(int(record.worked_minutes or 0), 0)))
+                minutes = max(expected - worked, Decimal("0.0000"))
+                if minutes_per_day > 0:
+                    days = minutes / minutes_per_day
+                hours = minutes / Decimal("60")
+            elif config.event_code == AttendancePayrollImpactConfig.EVENT_OVERTIME:
+                overtime_minutes = int(record.overtime_worked_minutes or 0)
+                if config.requires_validation:
+                    overtime_minutes = int(record.overtime_approved_minutes or 0)
+                minutes = Decimal(str(max(overtime_minutes, 0)))
+                hours = minutes / Decimal("60")
+                if minutes_per_day > 0:
+                    days = minutes / minutes_per_day
+            elif config.event_code == AttendancePayrollImpactConfig.EVENT_EARLY_DEPARTURE:
+                if not record.check_out_at:
+                    continue
+                _scheduled_start, scheduled_end = self._resolve_schedule_context(contract, record)
+                if not scheduled_end:
+                    continue
+                check_out = record.check_out_at
+                if timezone.is_naive(check_out):
+                    check_out = timezone.make_aware(check_out, timezone.get_current_timezone())
+                check_out_local = timezone.localtime(check_out, scheduled_end.tzinfo)
+                if check_out_local < scheduled_end:
+                    delta = scheduled_end - check_out_local
+                    raw_minutes = max(int(delta.total_seconds() // 60), 0)
+                    payable_minutes = max(raw_minutes - grace_minutes, 0)
+                    minutes = Decimal(str(payable_minutes))
+                    hours = minutes / Decimal("60")
+                    if minutes_per_day > 0:
+                        days = minutes / minutes_per_day
+            elif config.event_code == AttendancePayrollImpactConfig.EVENT_WEEKEND_WORK:
+                check_in = record.check_in_at
+                if timezone.is_naive(check_in):
+                    check_in = timezone.make_aware(check_in, timezone.get_current_timezone())
+                if timezone.localtime(check_in).weekday() in {5, 6}:
+                    minutes = Decimal(str(max(int(record.worked_minutes or 0), 0)))
+                    hours = minutes / Decimal("60")
+                    if minutes_per_day > 0:
+                        days = minutes / minutes_per_day
+            elif config.event_code == AttendancePayrollImpactConfig.EVENT_HOLIDAY_WORK:
+                # No holiday calendar exists in attendance module today.
+                minutes = Decimal("0.0000")
+            else:
+                continue
+
+            if minutes <= 0 and hours <= 0 and days <= 0:
+                continue
+            metrics.append(
+                {
+                    "source_record_id": record.id,
+                    "minutes": minutes,
+                    "hours": hours,
+                    "days": days,
+                    "event_date_key": record.check_in_at.date().isoformat() if record.check_in_at else None,
+                }
+            )
+        return metrics
+
+    def _build_unpaid_leave_metrics(
+        self,
+        *,
+        contract: Contract,
+        config: AttendancePayrollImpactConfig,
+        minutes_per_day: Decimal,
+    ) -> List[Dict[str, Any]]:
+        employee = contract.employee
+        if not employee:
+            return []
+
+        unpaid_codes = self._resolve_unpaid_leave_codes()
+        if not unpaid_codes:
+            return []
+
+        start_dt = datetime.combine(self._month_start, dtime.min)
+        end_dt = datetime.combine(self._month_end, dtime.max)
+        if timezone.is_naive(start_dt):
+            start_dt = timezone.make_aware(start_dt)
+        if timezone.is_naive(end_dt):
+            end_dt = timezone.make_aware(end_dt)
+
+        requests_qs = TimeOffRequest.objects.using(self.tenant_db).filter(
+            employer_id=self.employer_id,
+            employee=employee,
+            leave_type_code__in=unpaid_codes,
+            start_at__lte=end_dt,
+            end_at__gte=start_dt,
+            status="APPROVED",
+        )
+        requests = list(requests_qs.order_by("start_at"))
+
+        metrics: List[Dict[str, Any]] = []
+        for request in requests:
+            overlap_start = max(request.start_at, start_dt)
+            overlap_end = min(request.end_at, end_dt)
+            if overlap_end <= overlap_start:
+                continue
+            minutes = Decimal(str((overlap_end - overlap_start).total_seconds() / 60))
+            if minutes <= 0:
+                continue
+            days = Decimal("0.0000")
+            if minutes_per_day > 0:
+                days = minutes / minutes_per_day
+            metrics.append(
+                {
+                    "source_record_id": request.id,
+                    "minutes": minutes,
+                    "hours": minutes / Decimal("60"),
+                    "days": days,
+                    "event_date_key": overlap_start.date().isoformat(),
+                }
+            )
+        return metrics
+
+    def _compute_amount_and_rate(
+        self,
+        *,
+        config: AttendancePayrollImpactConfig,
+        metric: Dict[str, Any],
+        basic_salary: Decimal,
+        daily_rate: Decimal,
+        hourly_rate: Decimal,
+    ) -> Tuple[Decimal, Decimal, Decimal]:
+        minutes = _to_decimal(metric.get("minutes"), default=Decimal("0.0000"))
+        hours = _to_decimal(metric.get("hours"), default=Decimal("0.0000"))
+        days = _to_decimal(metric.get("days"), default=Decimal("0.0000"))
+        value = _to_decimal(config.value, default=Decimal("0.0000"))
+
+        if config.calc_method == AttendancePayrollImpactConfig.CALC_FIXED_AMOUNT:
+            quantity = Decimal("1.0000")
+            unit_rate = value
+            amount = unit_rate
+        elif config.calc_method == AttendancePayrollImpactConfig.CALC_PER_MINUTE:
+            quantity = minutes
+            unit_rate = value
+            amount = quantity * unit_rate
+        elif config.calc_method == AttendancePayrollImpactConfig.CALC_PER_HOUR:
+            quantity = hours
+            unit_rate = value
+            amount = quantity * unit_rate
+        elif config.calc_method == AttendancePayrollImpactConfig.CALC_PER_DAY:
+            quantity = days
+            unit_rate = value
+            amount = quantity * unit_rate
+        elif config.calc_method == AttendancePayrollImpactConfig.CALC_PERCENT_DAILY_RATE:
+            quantity = days
+            unit_rate = daily_rate * value / Decimal("100")
+            amount = quantity * unit_rate
+        elif config.calc_method == AttendancePayrollImpactConfig.CALC_PERCENT_BASIC:
+            quantity = days if days > 0 else Decimal("1.0000")
+            unit_rate = basic_salary * value / Decimal("100")
+            amount = quantity * unit_rate
+        elif config.calc_method == AttendancePayrollImpactConfig.CALC_MULTIPLIER_HOURLY_RATE:
+            quantity = hours
+            multiplier = _to_decimal(config.multiplier, default=Decimal("0.0000"))
+            if multiplier <= 0:
+                multiplier = value if value > 0 else Decimal("1.0000")
+            unit_rate = hourly_rate * multiplier
+            amount = quantity * unit_rate
+        else:
+            quantity = Decimal("0.0000")
+            unit_rate = Decimal("0.000000")
+            amount = Decimal("0.00")
+
+        return quantity, unit_rate, amount
+
+    def _resolve_effective_target(self, contract: Contract, config: AttendancePayrollImpactConfig) -> Tuple[Optional[Deduction], Optional[Allowance]]:
+        deduction = None
+        allowance = None
+        target_code = str(getattr(config, "target_code", "") or "").strip().upper()
+
+        if config.bucket == AttendancePayrollImpactConfig.BUCKET_DEDUCTION:
+            selected = config.deduction
+            if selected and selected.contract_id == contract.id:
+                deduction = selected
+            elif target_code:
+                deduction = (
+                    Deduction.objects.using(self.tenant_db)
+                    .filter(contract=contract, code=target_code, is_enable=True)
+                    .first()
+                )
+            elif selected and selected.code:
+                deduction = (
+                    Deduction.objects.using(self.tenant_db)
+                    .filter(contract=contract, code=selected.code, is_enable=True)
+                    .first()
+                )
+        else:
+            selected = config.allowance
+            if selected and selected.contract_id == contract.id:
+                allowance = selected
+            elif target_code:
+                allowance = (
+                    Allowance.objects.using(self.tenant_db)
+                    .filter(contract=contract, code=target_code, is_enable=True)
+                    .first()
+                )
+            elif selected and selected.code:
+                allowance = (
+                    Allowance.objects.using(self.tenant_db)
+                    .filter(contract=contract, code=selected.code, is_enable=True)
+                    .first()
+                )
+
+        return deduction, allowance
+
+    def generate_for_contract(
+        self,
+        *,
+        contract: Contract,
+        existing_salary: Optional[Salary],
+        minutes_per_day: Decimal,
+    ) -> Tuple[List[SalaryAdvantage], List[SalaryDeduction]]:
+        employee = contract.employee
+        if not employee:
+            return [], []
+
+        configs = list(
+            AttendancePayrollImpactConfig.objects.using(self.tenant_db)
+            .filter(employer_id=self.employer_id, is_active=True)
+            .order_by("event_code", "id")
+        )
+        if not configs:
+            return [], []
+
+        basic_salary = _to_decimal(getattr(contract, "base_salary", None), default=Decimal("0.00"))
+        month_days = Decimal(str(max(self._month_days, 1)))
+        daily_rate = basic_salary / month_days
+        minutes_per_day = _to_decimal(minutes_per_day, default=Decimal("480"))
+        if minutes_per_day <= 0:
+            minutes_per_day = Decimal("480")
+        hourly_rate = daily_rate / (minutes_per_day / Decimal("60"))
+
+        active_keys: Set[str] = set()
+        created_or_updated_items: List[PayrollGeneratedItem] = []
+        impacted_events = {cfg.event_code for cfg in configs}
+
+        for config in configs:
+            if config.event_code == AttendancePayrollImpactConfig.EVENT_UNPAID_LEAVE:
+                metrics = self._build_unpaid_leave_metrics(
+                    contract=contract,
+                    config=config,
+                    minutes_per_day=minutes_per_day,
+                )
+            else:
+                metrics = self._build_attendance_metrics(
+                    contract=contract,
+                    config=config,
+                    minutes_per_day=minutes_per_day,
+                )
+
+            running_total = Decimal("0.00")
+            cap_amount = _to_decimal(config.cap_amount, default=None)
+            deduction_target, allowance_target = self._resolve_effective_target(contract, config)
+
+            if not config.affects_payroll:
+                continue
+
+            for metric in metrics:
+                quantity, unit_rate, raw_amount = self._compute_amount_and_rate(
+                    config=config,
+                    metric=metric,
+                    basic_salary=basic_salary,
+                    daily_rate=daily_rate,
+                    hourly_rate=hourly_rate,
+                )
+                amount = self.round_money(raw_amount)
+                if amount <= Decimal("0.00"):
+                    continue
+
+                if cap_amount is not None and cap_amount > Decimal("0.00"):
+                    remaining = cap_amount - running_total
+                    if remaining <= Decimal("0.00"):
+                        continue
+                    if amount > remaining:
+                        amount = self.round_money(remaining)
+                        if unit_rate > 0:
+                            quantity = amount / unit_rate
+                    running_total += amount
+                else:
+                    running_total += amount
+
+                source_id = metric.get("source_record_id")
+                source_id_text = str(source_id) if source_id else str(metric.get("event_date_key") or "period")
+                idempotency_key = (
+                    f"ATT:{self.employer_id}:{contract.id}:{employee.id}:{self.year:04d}{self.month:02d}:"
+                    f"{config.event_code}:{config.bucket}:{source_id_text}"
+                )
+                active_keys.add(idempotency_key)
+
+                defaults = {
+                    "employer_id": self.employer_id,
+                    "salary": existing_salary,
+                    "contract": contract,
+                    "employee": employee,
+                    "year": self.year,
+                    "month": self.month,
+                    "source_type": PayrollGeneratedItem.SOURCE_ATTENDANCE,
+                    "source_event_code": config.event_code,
+                    "source_record_id": source_id,
+                    "source_date_range_key": metric.get("event_date_key"),
+                    "bucket": config.bucket,
+                    "deduction": deduction_target,
+                    "allowance": allowance_target,
+                    "quantity": quantity,
+                    "unit_rate": unit_rate,
+                    "amount": amount,
+                    "status": PayrollGeneratedItem.STATUS_DRAFT,
+                    "metadata": {
+                        "config_id": str(config.id),
+                        "calc_method": config.calc_method,
+                        "grace_minutes": int(config.grace_minutes or 0),
+                        "requires_validation": bool(config.requires_validation),
+                        "target_code": config.target_code,
+                        "target_name": config.target_name,
+                    },
+                    "is_active": True,
+                }
+                item, _ = PayrollGeneratedItem.objects.using(self.tenant_db).update_or_create(
+                    idempotency_key=idempotency_key,
+                    defaults=defaults,
+                )
+                created_or_updated_items.append(item)
+
+        stale_qs = PayrollGeneratedItem.objects.using(self.tenant_db).filter(
+            employer_id=self.employer_id,
+            contract=contract,
+            employee=employee,
+            year=self.year,
+            month=self.month,
+            source_type=PayrollGeneratedItem.SOURCE_ATTENDANCE,
+            source_event_code__in=impacted_events,
+            status=PayrollGeneratedItem.STATUS_DRAFT,
+            is_active=True,
+        )
+        if active_keys:
+            stale_qs = stale_qs.exclude(idempotency_key__in=active_keys)
+        stale_qs.update(
+            is_active=False,
+            salary=existing_salary,
+            updated_at=timezone.now(),
+        )
+
+        active_items = [
+            item
+            for item in created_or_updated_items
+            if item.is_active and item.amount and _to_decimal(item.amount) > Decimal("0.00")
+        ]
+        advantage_lines: List[SalaryAdvantage] = []
+        deduction_lines: List[SalaryDeduction] = []
+
+        for item in active_items:
+            label = self._event_label(item.source_event_code)
+            amount = self.round_money(_to_decimal(item.amount))
+            if amount <= Decimal("0.00"):
+                continue
+            metadata = item.metadata or {}
+            template_target_code = str(metadata.get("target_code") or "").strip().upper()
+            template_target_name = str(metadata.get("target_name") or "").strip()
+
+            if item.bucket == AttendancePayrollImpactConfig.BUCKET_ADVANTAGE:
+                allowance = item.allowance
+                advantage_lines.append(
+                    SalaryAdvantage(
+                        employer_id=self.employer_id,
+                        allowance=allowance,
+                        code=(
+                            allowance.code
+                            if allowance and allowance.code
+                            else (template_target_code or f"ATT_{item.source_event_code}")
+                        ),
+                        name=(
+                            allowance.name
+                            if allowance and allowance.name
+                            else (template_target_name or label)
+                        ),
+                        base=self.round_money(_to_decimal(item.quantity, default=Decimal("0.00"))),
+                        amount=amount,
+                    )
+                )
+            else:
+                deduction = item.deduction
+                deduction_lines.append(
+                    SalaryDeduction(
+                        employer_id=self.employer_id,
+                        deduction=deduction,
+                        code=(
+                            deduction.code
+                            if deduction and deduction.code
+                            else (template_target_code or f"ATT_{item.source_event_code}")
+                        ),
+                        name=(
+                            deduction.name
+                            if deduction and deduction.name
+                            else (template_target_name or label)
+                        ),
+                        base_amount=self.round_money(_to_decimal(item.quantity, default=Decimal("0.00"))),
+                        rate=None,
+                        amount=amount,
+                        is_employee=True,
+                        is_employer=False,
+                    )
+                )
+
+        return advantage_lines, deduction_lines
+
+    def attach_salary_to_generated_items(self, *, contract: Contract, salary: Salary) -> None:
+        PayrollGeneratedItem.objects.using(self.tenant_db).filter(
+            employer_id=self.employer_id,
+            contract=contract,
+            employee=contract.employee,
+            year=self.year,
+            month=self.month,
+            source_type=PayrollGeneratedItem.SOURCE_ATTENDANCE,
+            status=PayrollGeneratedItem.STATUS_DRAFT,
+            is_active=True,
+        ).update(salary=salary, updated_at=timezone.now())
+
+
 class PayrollCalculationService:
     def __init__(self, *, employer_id: int, year: int, month: int, tenant_db: str):
         self.employer_id = employer_id
@@ -176,6 +756,14 @@ class PayrollCalculationService:
         self.tenant_db = tenant_db or "default"
         self.config = self._ensure_config()
         self._ranges_cache: Dict[str, List[ScaleRange]] = {}
+        self.attendance_impact_service = AttendancePayrollImpactService(
+            employer_id=self.employer_id,
+            year=self.year,
+            month=self.month,
+            tenant_db=self.tenant_db,
+            round_money=self._round_money,
+        )
+        self._has_attendance_impact_configs = self.attendance_impact_service.has_active_configs()
         self._ensure_cameroon_default_scales()
         self._ensure_payroll_default_bases()
 
@@ -391,6 +979,11 @@ class PayrollCalculationService:
         return paid_days, unpaid_days
 
     def _resolve_attendance_adjustments(self, contract: Contract) -> Tuple[Decimal, Decimal]:
+        # Attendance payroll impact is now config-driven. When impact configs exist,
+        # legacy prorata/overtime attendance adjustments are disabled to avoid double counting.
+        if self._has_attendance_impact_configs:
+            return Decimal("0.00"), Decimal("0.00")
+
         if not self._should_apply_attendance_adjustments(contract):
             return Decimal("0.00"), Decimal("0.00")
 
@@ -1264,6 +1857,16 @@ class PayrollCalculationService:
                 adjusted_basic_salary=adjusted_basic_salary,
                 adjustments=adjustments,
             )
+            attendance_advantage_lines: List[SalaryAdvantage] = []
+            attendance_deduction_lines: List[SalaryDeduction] = []
+            if self._has_attendance_impact_configs:
+                attendance_advantage_lines, attendance_deduction_lines = self.attendance_impact_service.generate_for_contract(
+                    contract=contract,
+                    existing_salary=existing_salary,
+                    minutes_per_day=self._resolve_attendance_minutes_per_day(contract),
+                )
+                if attendance_advantage_lines:
+                    advantage_lines.extend(attendance_advantage_lines)
 
             membership = self._build_basis_membership()
             bases = self._calculate_bases(
@@ -1299,6 +1902,20 @@ class PayrollCalculationService:
                 bases=bases,
                 adjusted_basic_salary=adjusted_basic_salary,
             )
+            for line in attendance_deduction_lines:
+                amount = self._round_money(_to_decimal(line.amount))
+                if amount <= Decimal("0.00"):
+                    continue
+                line.amount = amount
+                line.base_amount = self._round_money(_to_decimal(line.base_amount))
+                deduction_lines.append(line)
+                should_count = True
+                if line.deduction and line.deduction.is_count is False:
+                    should_count = False
+                if should_count and line.is_employee:
+                    deduction_totals["employee"] += amount
+                if should_count and line.is_employer:
+                    deduction_totals["employer"] += amount
 
             total_advantages = self._sum_advantage_amounts(advantage_lines)
             total_employee_deductions = deduction_totals["employee"]
@@ -1339,6 +1956,8 @@ class PayrollCalculationService:
                 salary.absence_days = self._round_money(adjustments.absence_days)
                 salary.overtime_hours = self._round_money(adjustments.overtime_hours)
                 salary.save(using=self.tenant_db)
+                if self._has_attendance_impact_configs:
+                    self.attendance_impact_service.attach_salary_to_generated_items(contract=contract, salary=salary)
 
                 SalaryAdvantage.objects.using(self.tenant_db).filter(salary=salary).delete()
                 SalaryDeduction.objects.using(self.tenant_db).filter(salary=salary).delete()
@@ -1593,5 +2212,11 @@ def validate_payroll(*, request, tenant_db: str, salaries: Iterable[Salary], all
             for salary in batch_salaries:
                 salary.status = Salary.STATUS_VALIDATED
                 salary.save(using=tenant_db, update_fields=["status", "updated_at"])
+                PayrollGeneratedItem.objects.using(tenant_db).filter(
+                    salary=salary,
+                    source_type=PayrollGeneratedItem.SOURCE_ATTENDANCE,
+                    status=PayrollGeneratedItem.STATUS_DRAFT,
+                    is_active=True,
+                ).update(status=PayrollGeneratedItem.STATUS_LOCKED, updated_at=timezone.now())
 
     return batches

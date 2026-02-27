@@ -448,8 +448,16 @@ class SetActiveEmployerSerializer(serializers.Serializer):
             employer_profile_id=value,
             status=EmployeeMembership.STATUS_ACTIVE,
         ).exists()
-        if not membership:
-            raise serializers.ValidationError("Active membership not found for this employer.")
+        if membership:
+            return value
+
+        # Fallback for legacy/single-employer employee accounts without a
+        # membership row: allow selecting their own employee employer context.
+        employee = getattr(user, "employee_profile", None)
+        if employee and getattr(employee, "employer_id", None) == value:
+            return value
+
+        raise serializers.ValidationError("Active membership not found for this employer.")
         return value
 
     def save(self, **kwargs):

@@ -3,11 +3,12 @@ from rest_framework.routers import DefaultRouter
 from .views import (
     ContractViewSet, ContractAmendmentViewSet,
     ContractConfigurationViewSet, SalaryScaleViewSet,
-    CalculationScaleViewSet, ScaleRangeViewSet, ContractTemplateViewSet
+    CalculationScaleViewSet, ContractComponentTemplateViewSet, ScaleRangeViewSet, ContractTemplateViewSet
 )
 
 router = DefaultRouter()
 router.register(r'config', ContractConfigurationViewSet, basename='contract-config')
+router.register(r'component-templates', ContractComponentTemplateViewSet, basename='contract-component-template')
 router.register(r'salary-scales', SalaryScaleViewSet, basename='salary-scale')
 router.register(r'calculation-scales', CalculationScaleViewSet, basename='calculation-scale')
 router.register(r'scale-ranges', ScaleRangeViewSet, basename='scale-range')

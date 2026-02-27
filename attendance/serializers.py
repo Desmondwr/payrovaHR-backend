@@ -547,8 +547,16 @@ class AttendanceRecordSerializer(serializers.ModelSerializer):
             schedule = self._resolve_default_schedule(db_alias, employee.employer_id)
         if not schedule:
             return False
+        if not schedule_id:
+            schedule_id = schedule.id
 
         tz = self._resolve_timezone(schedule)
+        tz_override = getattr(obj, "check_in_timezone", None)
+        if tz_override and ZoneInfo:
+            try:
+                tz = ZoneInfo(tz_override)
+            except Exception:
+                tz = tz
         check_in_at = obj.check_in_at
         if timezone.is_naive(check_in_at):
             check_in_at = timezone.make_aware(check_in_at, tz)

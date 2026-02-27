@@ -1,13 +1,15 @@
 from rest_framework import viewsets, permissions, status
 from rest_framework.decorators import action
 from rest_framework.response import Response
-from rest_framework.exceptions import PermissionDenied
+from rest_framework.exceptions import PermissionDenied, ValidationError as DRFValidationError
+from django.db import connections
 from .models import (
-    Contract, ContractConfiguration, ContractTemplate, ContractTemplateVersion, SalaryScale,
+    Contract, ContractConfiguration, ContractComponentTemplate, ContractTemplate, ContractTemplateVersion, SalaryScale,
     CalculationScale, ScaleRange, ContractDocument, ContractSignature
 )
 from .serializers import (
     ContractSerializer,
+    ContractComponentTemplateSerializer,
     ContractConfigurationSerializer,
     SalaryScaleSerializer,
     CalculationScaleSerializer,
@@ -119,6 +121,19 @@ class ContractViewSet(viewsets.ModelViewSet):
         Also allows employees to view their own contracts.
         """
         user = self.request.user
+        portal_mode = (
+            self.request.headers.get("X-Portal-Mode")
+            or self.request.query_params.get("portal_mode")
+            or ""
+        ).strip().lower()
+
+        # Default to employee self-scope whenever an employee profile exists.
+        # Only explicit employer mode may use employer-wide scope.
+        employee = getattr(user, "employee_profile", None) if user.is_authenticated else None
+        if employee and portal_mode != "employer":
+            tenant_db = employee._state.db or 'default'
+            self._set_tenant_alias(tenant_db)
+            return Contract.objects.using(tenant_db).filter(employee=employee)
         
         # 1. Employer Access
         employer = None
@@ -150,8 +165,7 @@ class ContractViewSet(viewsets.ModelViewSet):
             return qs
             
         # 2. Employee Access
-        if user.is_authenticated and user.employee_profile:
-            employee = user.employee_profile
+        if employee:
             tenant_db = employee._state.db or 'default'
             self._set_tenant_alias(tenant_db)
             return Contract.objects.using(tenant_db).filter(employee=employee)
@@ -940,6 +954,109 @@ class ContractConfigurationViewSet(viewsets.ModelViewSet):
 
         serializer = self.get_serializer(config)
         return Response(serializer.data)
+
+
+class ContractComponentTemplateViewSet(viewsets.ModelViewSet):
+    permission_classes = [permissions.IsAuthenticated, EmployerAccessPermission]
+    permission_map = {
+        "list": [
+            "contracts.configuration.view",
+            "contracts.contract.view",
+            "contracts.contract.create",
+            "contracts.contract.update",
+            "contracts.manage",
+        ],
+        "retrieve": [
+            "contracts.configuration.view",
+            "contracts.contract.view",
+            "contracts.contract.create",
+            "contracts.contract.update",
+            "contracts.manage",
+        ],
+        "create": ["contracts.configuration.update", "contracts.manage"],
+        "update": ["contracts.configuration.update", "contracts.manage"],
+        "partial_update": ["contracts.configuration.update", "contracts.manage"],
+        "destroy": ["contracts.configuration.update", "contracts.manage"],
+        "*": ["contracts.manage"],
+    }
+    serializer_class = ContractComponentTemplateSerializer
+
+    @staticmethod
+    def _template_table_exists(tenant_db: str) -> bool:
+        try:
+            table_name = ContractComponentTemplate._meta.db_table
+            return table_name in connections[tenant_db].introspection.table_names()
+        except Exception:
+            return False
+
+    def get_queryset(self):
+        from accounts.database_utils import get_tenant_database_alias
+
+        user = self.request.user
+        employer = None
+        if getattr(user, "employer_profile", None):
+            employer = user.employer_profile
+        else:
+            resolved = get_active_employer(self.request, require_context=False)
+            if resolved and (user.is_admin or user.is_superuser or is_delegate_user(user, resolved.id)):
+                employer = resolved
+        if not employer:
+            return ContractComponentTemplate.objects.none()
+
+        tenant_db = get_tenant_database_alias(employer)
+        if not self._template_table_exists(tenant_db):
+            return ContractComponentTemplate.objects.none()
+        qs = ContractComponentTemplate.objects.using(tenant_db).filter(employer_id=employer.id)
+        component_type = self.request.query_params.get("component_type")
+        if component_type:
+            qs = qs.filter(component_type=str(component_type).upper())
+        is_active = self.request.query_params.get("is_active")
+        if is_active is not None:
+            truthy = {"1", "true", "yes", "on"}
+            falsy = {"0", "false", "no", "off"}
+            value = str(is_active).strip().lower()
+            if value in truthy:
+                qs = qs.filter(is_active=True)
+            elif value in falsy:
+                qs = qs.filter(is_active=False)
+        return qs.order_by("component_type", "name", "id")
+
+    def perform_create(self, serializer):
+        from accounts.database_utils import get_tenant_database_alias
+
+        employer = get_active_employer(self.request, require_context=True)
+        tenant_db = get_tenant_database_alias(employer)
+        if not self._template_table_exists(tenant_db):
+            raise DRFValidationError(
+                {"detail": "Missing contract component templates table for this tenant. Run contracts migrations (0011)."}
+            )
+        instance = serializer.save(employer_id=employer.id)
+        if instance._state.db != tenant_db:
+            instance.save(using=tenant_db)
+
+    def perform_update(self, serializer):
+        from accounts.database_utils import get_tenant_database_alias
+
+        employer = get_active_employer(self.request, require_context=True)
+        tenant_db = get_tenant_database_alias(employer)
+        if not self._template_table_exists(tenant_db):
+            raise DRFValidationError(
+                {"detail": "Missing contract component templates table for this tenant. Run contracts migrations (0011)."}
+            )
+        instance = serializer.save()
+        if instance._state.db != tenant_db:
+            instance.save(using=tenant_db)
+
+    def perform_destroy(self, instance):
+        from accounts.database_utils import get_tenant_database_alias
+
+        employer = get_active_employer(self.request, require_context=True)
+        tenant_db = get_tenant_database_alias(employer)
+        if not self._template_table_exists(tenant_db):
+            raise DRFValidationError(
+                {"detail": "Missing contract component templates table for this tenant. Run contracts migrations (0011)."}
+            )
+        instance.delete(using=tenant_db)
 
 
 class SalaryScaleViewSet(viewsets.ModelViewSet):

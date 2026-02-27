@@ -64,6 +64,13 @@ def get_active_employer(request, require_context=False):
         .first()
     )
     if not membership:
+        # Legacy/single-employer fallback: allow employee profile employer context
+        # when membership rows are not yet present.
+        employee = getattr(user, "employee_profile", None)
+        if employee and getattr(employee, "employer_id", None) == employer_id:
+            employer = EmployerProfile.objects.filter(id=employer_id).first()
+            if employer:
+                return employer
         raise PermissionDenied("You do not have access to the requested employer.")
     return membership.employer_profile
 

@@ -355,10 +355,16 @@ def get_employee_tenant_db_from_membership(request, require_context=None):
             employer_profile_id=employer_id,
         ).select_related('employer_profile').first()
         if not membership:
-            raise PermissionDenied("You do not have access to the requested employer.")
-        if membership.status != EmployeeMembership.STATUS_ACTIVE:
-            raise PermissionDenied("Your membership with this employer is not active.")
-        employer_profile = membership.employer_profile
+            # Legacy/single-employer fallback when membership rows are absent.
+            employee = getattr(user, 'employee_profile', None)
+            if employee and getattr(employee, 'employer_id', None) == employer_id:
+                employer_profile = EmployerProfile.objects.filter(id=employer_id).first()
+            else:
+                raise PermissionDenied("You do not have access to the requested employer.")
+        else:
+            if membership.status != EmployeeMembership.STATUS_ACTIVE:
+                raise PermissionDenied("Your membership with this employer is not active.")
+            employer_profile = membership.employer_profile
     else:
         # Allow implicit resolution only when the feature flag is disabled
         if require_context:

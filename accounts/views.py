@@ -859,11 +859,30 @@ class MyEmployersView(APIView):
             user=request.user,
             status=EmployeeMembership.STATUS_ACTIVE,
         ).select_related('employer_profile')
-        serializer = EmployeeMembershipSerializer(memberships, many=True)
+        if memberships.exists():
+            serializer = EmployeeMembershipSerializer(memberships, many=True)
+            data = serializer.data
+        else:
+            # Fallback for legacy/single-employer employees that don't yet have
+            # employee_membership rows.
+            data = []
+            employee = getattr(request.user, "employee_profile", None)
+            employer_id = getattr(employee, "employer_id", None) if employee else None
+            if employer_id:
+                employer = EmployerProfile.objects.filter(id=employer_id).first()
+                if employer:
+                    data = [
+                        {
+                            "employer_id": employer.id,
+                            "employer_name": employer.company_name or employer.email or f"Employer {employer.id}",
+                            "role": "employee",
+                            "status": EmployeeMembership.STATUS_ACTIVE,
+                        }
+                    ]
         return api_response(
             success=True,
             message='Active employer memberships retrieved.',
-            data=serializer.data,
+            data=data,
             status=status.HTTP_200_OK,
         )
 

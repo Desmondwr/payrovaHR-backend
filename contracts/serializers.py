@@ -4,7 +4,7 @@ from decimal import Decimal
 from django.db import transaction
 from .models import (
     Contract, Allowance, Deduction, ContractElement, ContractAmendment,
-    ContractConfiguration, SalaryScale, CalculationScale, ScaleRange,
+    ContractConfiguration, ContractComponentTemplate, SalaryScale, CalculationScale, ScaleRange,
     ContractTemplate, ContractTemplateVersion
 )
 from timeoff.defaults import merge_time_off_defaults, validate_time_off_config
@@ -467,9 +467,17 @@ class ContractSerializer(serializers.ModelSerializer):
         return year, month
 
     def _resolve_component_period(self, component):
+        year_value = getattr(component, 'component_year', None)
+        if year_value in (None, ''):
+            year_value = getattr(component, 'year', None)
+
+        month_value = getattr(component, 'component_month', None)
+        if month_value in (None, ''):
+            month_value = getattr(component, 'month', None)
+
         return self._normalize_element_period_values(
-            getattr(component, 'year', None),
-            getattr(component, 'month', None),
+            year_value,
+            month_value,
         )
 
     def _build_element_from_allowance(self, contract, allowance):
@@ -682,6 +690,79 @@ class ContractConfigurationSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError(errors)
         return merged
 
+    @staticmethod
+    def _normalize_component_catalog(raw_items, *, field_name: str):
+        if raw_items in (None, ""):
+            return []
+        if not isinstance(raw_items, list):
+            raise serializers.ValidationError({field_name: "Must be a list."})
+
+        normalized = []
+        seen_codes = set()
+        max_id = 0
+
+        for idx, item in enumerate(raw_items):
+            if not isinstance(item, dict):
+                raise serializers.ValidationError(
+                    {field_name: f"Item #{idx + 1} must be an object with code/name."}
+                )
+
+            code = str(item.get("code") or "").strip().upper()
+            name = str(item.get("name") or "").strip()
+            if not code:
+                raise serializers.ValidationError({field_name: f"Item #{idx + 1} is missing code."})
+            if not name:
+                raise serializers.ValidationError({field_name: f"Item #{idx + 1} is missing name."})
+            if code in seen_codes:
+                raise serializers.ValidationError({field_name: f"Duplicate code found: {code}."})
+
+            seen_codes.add(code)
+
+            row_id = item.get("id")
+            if row_id in (None, ""):
+                row_id = None
+            else:
+                try:
+                    row_id = int(row_id)
+                except (TypeError, ValueError):
+                    raise serializers.ValidationError(
+                        {field_name: f"Item #{idx + 1} has an invalid id."}
+                    )
+                if row_id <= 0:
+                    raise serializers.ValidationError(
+                        {field_name: f"Item #{idx + 1} id must be a positive integer."}
+                    )
+                max_id = max(max_id, row_id)
+
+            normalized.append(
+                {
+                    "id": row_id,
+                    "code": code,
+                    "name": name,
+                    "is_active": bool(item.get("is_active", True)),
+                }
+            )
+
+        next_id = max_id
+        for row in normalized:
+            if row["id"] is None:
+                next_id += 1
+                row["id"] = next_id
+
+        return normalized
+
+    def validate_payroll_configuration(self, value):
+        merged = CONFIGURATION_MERGE_FUNCTIONS["payroll_configuration"](value or {})
+        merged["advantage_catalog"] = self._normalize_component_catalog(
+            merged.get("advantage_catalog"),
+            field_name="advantage_catalog",
+        )
+        merged["deduction_catalog"] = self._normalize_component_catalog(
+            merged.get("deduction_catalog"),
+            field_name="deduction_catalog",
+        )
+        return merged
+
     def _normalize_json_sections(self, data, include_missing=False):
         for field, merge_fn in CONFIGURATION_MERGE_FUNCTIONS.items():
             if field in data:
@@ -703,3 +784,26 @@ class ContractConfigurationSerializer(serializers.ModelSerializer):
             )
         self._normalize_json_sections(validated_data, include_missing=False)
         return super().update(instance, validated_data)
+
+
+class ContractComponentTemplateSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = ContractComponentTemplate
+        fields = "__all__"
+        read_only_fields = ("id", "employer_id", "created_at", "updated_at")
+
+    def validate(self, attrs):
+        attrs = super().validate(attrs)
+        current_code = attrs.get("code", getattr(self.instance, "code", ""))
+        current_name = attrs.get("name", getattr(self.instance, "name", ""))
+
+        code = str(current_code or "").strip().upper()
+        name = str(current_name or "").strip()
+        if not code:
+            raise serializers.ValidationError({"code": "Code is required."})
+        if not name:
+            raise serializers.ValidationError({"name": "Name is required."})
+
+        attrs["code"] = code
+        attrs["name"] = name
+        return attrs

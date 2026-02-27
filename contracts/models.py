@@ -1127,6 +1127,41 @@ class ContractConfiguration(models.Model):
         return f"Contract Config ({level}) - Employer: {self.employer_id}"
 
 
+class ContractComponentTemplate(models.Model):
+    COMPONENT_ADVANTAGE = "ADVANTAGE"
+    COMPONENT_DEDUCTION = "DEDUCTION"
+    COMPONENT_CHOICES = [
+        (COMPONENT_ADVANTAGE, "Advantage"),
+        (COMPONENT_DEDUCTION, "Deduction"),
+    ]
+
+    id = models.AutoField(primary_key=True)
+    employer_id = models.IntegerField(db_index=True)
+    component_type = models.CharField(max_length=16, choices=COMPONENT_CHOICES, db_index=True)
+    code = models.CharField(max_length=100)
+    name = models.CharField(max_length=255)
+    is_active = models.BooleanField(default=True, db_index=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        db_table = "contract_component_templates"
+        verbose_name = "Contract Component Template"
+        verbose_name_plural = "Contract Component Templates"
+        constraints = [
+            models.UniqueConstraint(
+                fields=["employer_id", "component_type", "code"],
+                name="uniq_contract_component_template_code_per_employer",
+            )
+        ]
+        indexes = [
+            models.Index(fields=["employer_id", "component_type", "is_active"]),
+        ]
+
+    def __str__(self):
+        return f"{self.component_type} - {self.code}: {self.name}"
+
+
 class ContractComponentBase(models.Model):
     """Base class for Allowances and Deductions"""
     
@@ -1212,6 +1247,13 @@ class ContractComponentBase(models.Model):
         null=True,
         blank=True,
         help_text='Optional fiscal year reference (e.g., 2026)'
+    )
+
+    component_month = models.CharField(
+        max_length=10,
+        null=True,
+        blank=True,
+        help_text='Optional fiscal month reference (e.g., 01-12)'
     )
 
     position = models.IntegerField(

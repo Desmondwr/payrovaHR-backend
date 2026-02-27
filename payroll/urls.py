@@ -3,6 +3,7 @@ from rest_framework.routers import DefaultRouter
 
 from .models import Salary
 from .views import (
+    AttendancePayrollImpactConfigViewSet,
     CalculationBasisAdvantageViewSet,
     CalculationBasisViewSet,
     PayrollArchiveView,
@@ -17,6 +18,7 @@ from .views import (
 
 router = DefaultRouter()
 router.register(r"config", PayrollConfigurationViewSet, basename="payroll-config")
+router.register(r"attendance-impacts", AttendancePayrollImpactConfigViewSet, basename="payroll-attendance-impacts")
 router.register(r"bases", CalculationBasisViewSet, basename="payroll-bases")
 router.register(r"basis-advantages", CalculationBasisAdvantageViewSet, basename="payroll-basis-advantages")
 
@@ -31,4 +33,3 @@ urlpatterns = [
     path("validate/", PayrollValidateView.as_view()),
     path("archive/", PayrollArchiveView.as_view()),
 ]
-

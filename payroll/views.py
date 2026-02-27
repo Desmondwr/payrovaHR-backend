@@ -2,6 +2,7 @@ from django.db import transaction
 from django.db.models import Q
 from django.shortcuts import get_object_or_404
 from rest_framework import permissions, viewsets
+from rest_framework.decorators import action
 from rest_framework.exceptions import PermissionDenied, ValidationError
 from rest_framework.views import APIView
 
@@ -13,8 +14,15 @@ from accounts.rbac import get_active_employer, is_delegate_user
 from accounts.utils import api_response
 from contracts.payroll_defaults import ensure_payroll_default_bases
 
-from .models import CalculationBasis, CalculationBasisAdvantage, PayrollConfiguration, Salary
+from .models import (
+    AttendancePayrollImpactConfig,
+    CalculationBasis,
+    CalculationBasisAdvantage,
+    PayrollConfiguration,
+    Salary,
+)
 from .serializers import (
+    AttendancePayrollImpactConfigSerializer,
     CalculationBasisAdvantageSerializer,
     CalculationBasisSerializer,
     PayrollConfigurationSerializer,
@@ -122,6 +130,68 @@ class PayrollConfigurationViewSet(PayrollTenantViewSet):
                 is_active=True,
             ).update(is_active=False)
             self._create_in_tenant(serializer, employer_id=employer_id, is_active=True)
+
+
+class AttendancePayrollImpactConfigViewSet(PayrollTenantViewSet):
+    queryset = AttendancePayrollImpactConfig.objects.all()
+    serializer_class = AttendancePayrollImpactConfigSerializer
+
+    @action(detail=False, methods=["post"], url_path="clone-defaults")
+    def clone_defaults(self, request):
+        tenant_db = self.get_tenant_db_alias()
+        employer_id = self.get_employer_id()
+        default_rows = [
+            {
+                "event_code": AttendancePayrollImpactConfig.EVENT_LATENESS,
+                "bucket": AttendancePayrollImpactConfig.BUCKET_DEDUCTION,
+                "calc_method": AttendancePayrollImpactConfig.CALC_PER_MINUTE,
+                "value": 0,
+                "requires_validation": True,
+            },
+            {
+                "event_code": AttendancePayrollImpactConfig.EVENT_ABSENCE,
+                "bucket": AttendancePayrollImpactConfig.BUCKET_DEDUCTION,
+                "calc_method": AttendancePayrollImpactConfig.CALC_PER_DAY,
+                "value": 0,
+                "requires_validation": True,
+            },
+            {
+                "event_code": AttendancePayrollImpactConfig.EVENT_OVERTIME,
+                "bucket": AttendancePayrollImpactConfig.BUCKET_ADVANTAGE,
+                "calc_method": AttendancePayrollImpactConfig.CALC_MULTIPLIER_HOURLY_RATE,
+                "value": 1,
+                "multiplier": 1,
+                "requires_validation": True,
+            },
+        ]
+
+        created = 0
+        existing = 0
+        with transaction.atomic(using=tenant_db):
+            for row in default_rows:
+                _, was_created = AttendancePayrollImpactConfig.objects.using(tenant_db).get_or_create(
+                    employer_id=employer_id,
+                    event_code=row["event_code"],
+                    is_active=True,
+                    defaults={
+                        "affects_payroll": False,
+                        "bucket": row["bucket"],
+                        "calc_method": row["calc_method"],
+                        "value": row["value"],
+                        "multiplier": row.get("multiplier"),
+                        "requires_validation": row["requires_validation"],
+                    },
+                )
+                if was_created:
+                    created += 1
+                else:
+                    existing += 1
+
+        return api_response(
+            success=True,
+            message="Default attendance payroll impact configurations cloned.",
+            data={"created": created, "existing": existing},
+        )
 
 
 class CalculationBasisViewSet(PayrollTenantViewSet):

@@ -882,7 +882,7 @@ class EmployeeViewSet(viewsets.ModelViewSet):
         )
         serializer = EmployeeDocumentSerializer(document, context={'request': request})
         return Response(serializer.data, status=status.HTTP_201_CREATED)
-    
+
     @action(detail=True, methods=['get'])
     def cross_institutions(self, request, pk=None):
         """Get cross-institution information for an employee"""
@@ -1263,7 +1263,7 @@ class EmployeeViewSet(viewsets.ModelViewSet):
                 },
                 status=status.HTTP_403_FORBIDDEN
             )
-        
+
         # Get employer configuration to validate existing data
         config = get_or_create_employee_config(employer.id, tenant_db)
         
@@ -1525,7 +1525,7 @@ class EmployeeDocumentViewSet(viewsets.ModelViewSet):
 
         serializer = EmploymentCertificateShareSerializer(share)
         return Response(serializer.data, status=status.HTTP_201_CREATED)
-    
+
     @action(detail=False, methods=['get'])
     def expiring_soon(self, request):
         """Get documents expiring soon"""
@@ -2482,7 +2482,7 @@ class EmployeeProfileViewSet(viewsets.GenericViewSet):
                 {'error': 'Failed to update profile', 'detail': str(e)},
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR
             )
-    
+
     @action(detail=False, methods=['get'], url_path='me')
     def get_own_profile(self, request):
         """Get authenticated employee's own profile"""
@@ -2665,7 +2665,144 @@ class EmployeeProfileViewSet(viewsets.GenericViewSet):
                 context={'tenant_db': tenant_db, 'request': request}
             ).data
         }, status=status.HTTP_200_OK)
-    
+
+
+    @action(detail=False, methods=['get'], url_path='colleagues-birthdays')
+    def colleagues_birthdays(self, request):
+        """Return colleagues' birthday data for the authenticated employee's employer."""
+        from accounts.database_utils import get_tenant_database_alias
+        from accounts.models import EmployerProfile
+
+        user = request.user
+        if not user.is_employee:
+            return Response(
+                {'error': 'Only employees can access this endpoint'},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        try:
+            if not hasattr(user, 'employee_profile') or not user.employee_profile:
+                return Response({'error': 'Employee record not found'}, status=status.HTTP_404_NOT_FOUND)
+
+            employee = user.employee_profile
+            employer = EmployerProfile.objects.get(id=employee.employer_id)
+            tenant_db = get_tenant_database_alias(employer)
+
+            colleagues = (
+                Employee.objects.using(tenant_db)
+                .filter(
+                    employer_id=employee.employer_id,
+                    employment_status='ACTIVE',
+                    date_of_birth__isnull=False,
+                )
+                .exclude(id=employee.id)
+                .only(
+                    'id',
+                    'employee_id',
+                    'first_name',
+                    'last_name',
+                    'email',
+                    'job_title',
+                    'date_of_birth',
+                )
+            )
+
+            results = [
+                {
+                    'id': str(item.id),
+                    'employee_id': item.employee_id,
+                    'first_name': item.first_name,
+                    'last_name': item.last_name,
+                    'full_name': item.full_name,
+                    'email': item.email,
+                    'job_title': item.job_title,
+                    'date_of_birth': item.date_of_birth,
+                }
+                for item in colleagues
+            ]
+
+            return Response({'count': len(results), 'results': results}, status=status.HTTP_200_OK)
+        except EmployerProfile.DoesNotExist:
+            return Response({'error': 'Employer not found'}, status=status.HTTP_404_NOT_FOUND)
+        except Exception as e:
+            return Response(
+                {'error': 'Failed to retrieve colleague birthdays', 'detail': str(e)},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+
+    @action(detail=False, methods=['post'], url_path='send-birthday-wish')
+    def send_birthday_wish(self, request):
+        """Send in-app birthday wishes to a colleague from the same employer."""
+        from accounts.database_utils import get_tenant_database_alias
+        from accounts.models import EmployerProfile
+
+        user = request.user
+        if not user.is_employee:
+            return Response(
+                {'error': 'Only employees can access this endpoint'},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        colleague_id = request.data.get('colleague_id') or request.data.get('employee_id')
+        if not colleague_id:
+            return Response({'error': 'colleague_id is required'}, status=status.HTTP_400_BAD_REQUEST)
+
+        custom_message = str(request.data.get('message') or '').strip()
+
+        try:
+            if not hasattr(user, 'employee_profile') or not user.employee_profile:
+                return Response({'error': 'Employee record not found'}, status=status.HTTP_404_NOT_FOUND)
+
+            sender = user.employee_profile
+            employer = EmployerProfile.objects.get(id=sender.employer_id)
+            tenant_db = get_tenant_database_alias(employer)
+
+            colleague = (
+                Employee.objects.using(tenant_db)
+                .filter(id=colleague_id, employer_id=sender.employer_id, employment_status='ACTIVE')
+                .first()
+            )
+            if not colleague:
+                return Response({'error': 'Colleague not found'}, status=status.HTTP_404_NOT_FOUND)
+            if str(colleague.id) == str(sender.id):
+                return Response({'error': 'You cannot send a birthday wish to yourself'}, status=status.HTTP_400_BAD_REQUEST)
+
+            sender_name = sender.full_name or user.get_full_name() or user.email or 'A colleague'
+            title = f"Birthday wishes from {sender_name}"
+            body = (
+                custom_message[:500]
+                if custom_message
+                else f"Happy Birthday {colleague.first_name or colleague.full_name}! Wishing you a great day."
+            )
+
+            created = notify_employee_user(
+                colleague,
+                title=title,
+                body=body,
+                type='INFO',
+                data={
+                    'event': 'employees.birthday_wish',
+                    'from_employee_id': str(sender.id),
+                    'from_name': sender_name,
+                    'path': '/employee/dashboard',
+                },
+                employer_profile=employer,
+            )
+            if not created:
+                return Response(
+                    {'error': 'Could not deliver wish because recipient has no active user account'},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            return Response({'message': 'Birthday wishes sent successfully.'}, status=status.HTTP_200_OK)
+        except EmployerProfile.DoesNotExist:
+            return Response({'error': 'Employer not found'}, status=status.HTTP_404_NOT_FOUND)
+        except Exception as e:
+            return Response(
+                {'error': 'Failed to send birthday wish', 'detail': str(e)},
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            )
+
     @action(detail=False, methods=['put', 'patch'], url_path='complete-profile')
     def complete_profile(self, request):
         """Employee completes their own profile after accepting invitation"""

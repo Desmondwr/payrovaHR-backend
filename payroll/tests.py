@@ -10,17 +10,28 @@ from rest_framework.test import APIRequestFactory
 
 from accounts.models import EmployerProfile
 from attendance.models import AttendanceConfiguration, AttendanceRecord, WorkingSchedule
-from contracts.models import Allowance, CalculationScale, Contract, ContractElement, Deduction, ScaleRange
+from contracts.models import (
+    Allowance,
+    CalculationScale,
+    Contract,
+    ContractComponentTemplate,
+    ContractElement,
+    Deduction,
+    ScaleRange,
+)
 from contracts.payroll_defaults import PAYROLL_DEFAULT_BASIS_ROWS, ensure_payroll_default_bases
 from employees.models import Employee
 from timeoff.models import TimeOffConfiguration, TimeOffRequest, TimeOffType
 from treasury.models import BankAccount, PaymentBatch, PaymentLine
 
 from payroll.models import (
+    AttendancePayrollImpactConfig,
     CalculationBasis,
     CalculationBasisAdvantage,
+    PayrollGeneratedItem,
     PayrollConfiguration,
     Salary,
+    SalaryAdvantage,
     SalaryDeduction,
 )
 from payroll.services import PayrollCalculationService, validate_payroll
@@ -1034,3 +1045,414 @@ class PayrollFeatureTests(TestCase):
         message = str(exc.exception.detail).lower()
         self.assertIn("employer treasury bank account", message)
         self.assertIn("employee bank accounts are beneficiary details only", message)
+
+
+class AttendancePayrollImpactConfigTests(TestCase):
+    def setUp(self):
+        User = get_user_model()
+        self.user = User.objects.create_user(
+            email="owner-impact@acme.test",
+            password="pass",
+            is_employer=True,
+            is_employer_owner=True,
+        )
+        self.employer = EmployerProfile.objects.create(
+            user=self.user,
+            company_name="Acme Payroll",
+            employer_name_or_group="Acme",
+            organization_type="PRIVATE",
+            industry_sector="Tech",
+            date_of_incorporation=date.today(),
+            company_location="City",
+            physical_address="123 Street",
+            phone_number="1234567890",
+            official_company_email="hr@acme.test",
+            rccm="rccm",
+            taxpayer_identification_number="tin",
+            cnps_employer_number="cnps",
+            labour_inspectorate_declaration="decl",
+            business_license="license",
+            bank_name="Bank",
+            bank_account_number="123",
+        )
+        self.employee = Employee.objects.create(
+            employer_id=self.employer.id,
+            employee_id="EMP-IMPACT-001",
+            first_name="John",
+            last_name="Smith",
+            email="john@example.com",
+            job_title="Engineer",
+            employment_type="FULL_TIME",
+            employment_status="ACTIVE",
+            hire_date=date(2025, 1, 1),
+        )
+        self.year = 2026
+        self.month = 1
+        self.contract = Contract.objects.create(
+            employer_id=self.employer.id,
+            contract_id=f"CNT-IMP-{uuid.uuid4().hex[:8].upper()}",
+            employee=self.employee,
+            contract_type="PERMANENT",
+            start_date=date(self.year, self.month, 1),
+            status="ACTIVE",
+            base_salary=Decimal("100000.00"),
+            currency="XAF",
+            pay_frequency="MONTHLY",
+            created_by=self.user.id,
+        )
+        PayrollConfiguration.objects.create(
+            employer_id=self.employer.id,
+            rounding_scale=0,
+            rounding_mode=PayrollConfiguration.ROUND_HALF_UP,
+        )
+        AttendanceConfiguration.objects.create(
+            employer_id=self.employer.id,
+            is_enabled=True,
+            allow_systray_portal=True,
+        )
+        self._create_schedule()
+        self.basic_allowance = self._create_allowance(
+            name="Basic Salary",
+            code="BASIC",
+            amount="100000",
+            sys="BASIC_SALARY",
+        )
+        self._add_advantage_element(self.basic_allowance, amount="100000")
+
+        for code in [
+            "SAL-BRUT",
+            "SAL-NON-TAX",
+            "SAL-BRUT-TAX",
+            "SAL-BRUT-TAX-IRPP",
+            "SAL-BRUT-COT-AF-PV",
+            "SAL-BRUT-COT-AT",
+            "SAL-BASE",
+        ]:
+            CalculationBasis.objects.create(employer_id=self.employer.id, code=code, name=code)
+        self._link_basis("SAL-BRUT", allowance=self.basic_allowance)
+        self._link_basis("SAL-BRUT-TAX", allowance=self.basic_allowance)
+        self._link_basis("SAL-BRUT-TAX-IRPP", allowance=self.basic_allowance)
+        self._link_basis("SAL-BRUT-COT-AF-PV", allowance=self.basic_allowance)
+        self._link_basis("SAL-BRUT-COT-AT", allowance=self.basic_allowance)
+
+    def _create_schedule(self):
+        schedule = WorkingSchedule.objects.create(
+            employer_id=self.employer.id,
+            name="Default Schedule",
+            default_daily_minutes=480,
+            is_default=True,
+            timezone="UTC",
+        )
+        for weekday in range(0, 5):
+            start = datetime(self.year, self.month, 5, 9, 0, 0).time()
+            end = datetime(self.year, self.month, 5, 17, 0, 0).time()
+            schedule.days.create(
+                weekday=weekday,
+                start_time=start,
+                end_time=end,
+                break_minutes=0,
+            )
+
+    def _basis(self, code):
+        return CalculationBasis.objects.get(employer_id=self.employer.id, code=code)
+
+    def _link_basis(self, basis_code, allowance=None, allowance_code=None):
+        CalculationBasisAdvantage.objects.create(
+            employer_id=self.employer.id,
+            basis=self._basis(basis_code),
+            allowance=allowance,
+            allowance_code=allowance_code,
+        )
+
+    def _create_allowance(self, *, name, code, amount, sys=None):
+        return Allowance.objects.create(
+            contract=self.contract,
+            name=name,
+            code=code,
+            type="FIXED",
+            amount=Decimal(str(amount)),
+            sys=sys,
+            is_enable=True,
+        )
+
+    def _create_deduction(self, *, name, code):
+        return Deduction.objects.create(
+            contract=self.contract,
+            name=name,
+            code=code,
+            type="FIXED",
+            amount=Decimal("0.00"),
+            is_employee=True,
+            is_employer=False,
+            is_enable=True,
+            is_count=True,
+        )
+
+    def _add_advantage_element(self, allowance, amount=None, month="__", year="__"):
+        ContractElement.objects.create(
+            contract=self.contract,
+            advantage=allowance,
+            amount=Decimal(str(amount if amount is not None else allowance.amount)),
+            month=month,
+            year=year,
+            institution_id=self.employer.id,
+            is_enable=True,
+        )
+
+    def _run(self):
+        service = PayrollCalculationService(
+            employer_id=self.employer.id,
+            year=self.year,
+            month=self.month,
+            tenant_db="default",
+        )
+        return service.run(mode=Salary.STATUS_SIMULATED)[0].salary
+
+    def _create_attendance_record(
+        self,
+        *,
+        check_in_at,
+        check_out_at,
+        expected_minutes,
+        worked_minutes,
+        overtime_worked_minutes=0,
+        overtime_approved_minutes=0,
+        status=AttendanceRecord.STATUS_APPROVED,
+    ):
+        AttendanceRecord.objects.create(
+            employer_id=self.employer.id,
+            employee=self.employee,
+            check_in_at=check_in_at,
+            check_out_at=check_out_at,
+            expected_minutes=expected_minutes,
+            worked_minutes=worked_minutes,
+            overtime_worked_minutes=overtime_worked_minutes,
+            overtime_approved_minutes=overtime_approved_minutes,
+            status=status,
+            mode=AttendanceRecord.MODE_MANUAL,
+        )
+
+    def test_lateness_deduction_computed_with_grace_minutes(self):
+        late_deduction = self._create_deduction(name="Late Penalty", code="LATE_PEN")
+        AttendancePayrollImpactConfig.objects.create(
+            employer_id=self.employer.id,
+            event_code=AttendancePayrollImpactConfig.EVENT_LATENESS,
+            affects_payroll=True,
+            bucket=AttendancePayrollImpactConfig.BUCKET_DEDUCTION,
+            deduction=late_deduction,
+            calc_method=AttendancePayrollImpactConfig.CALC_PER_MINUTE,
+            value=Decimal("10.00"),
+            grace_minutes=5,
+            requires_validation=True,
+            is_active=True,
+        )
+
+        check_in = timezone.make_aware(datetime(self.year, self.month, 5, 9, 20, 0))
+        check_out = timezone.make_aware(datetime(self.year, self.month, 5, 17, 0, 0))
+        self._create_attendance_record(
+            check_in_at=check_in,
+            check_out_at=check_out,
+            expected_minutes=480,
+            worked_minutes=460,
+        )
+
+        salary = self._run()
+        line = SalaryDeduction.objects.get(salary=salary, code="LATE_PEN")
+        self.assertEqual(line.amount, Decimal("150"))
+        self.assertEqual(salary.total_employee_deductions, Decimal("150"))
+
+    def test_absence_deduction_based_on_daily_rate(self):
+        absence_deduction = self._create_deduction(name="Absence Penalty", code="ABS_PEN")
+        AttendancePayrollImpactConfig.objects.create(
+            employer_id=self.employer.id,
+            event_code=AttendancePayrollImpactConfig.EVENT_ABSENCE,
+            affects_payroll=True,
+            bucket=AttendancePayrollImpactConfig.BUCKET_DEDUCTION,
+            deduction=absence_deduction,
+            calc_method=AttendancePayrollImpactConfig.CALC_PERCENT_DAILY_RATE,
+            value=Decimal("100.00"),
+            requires_validation=True,
+            is_active=True,
+        )
+
+        check_in = timezone.make_aware(datetime(self.year, self.month, 6, 9, 0, 0))
+        check_out = timezone.make_aware(datetime(self.year, self.month, 6, 17, 0, 0))
+        self._create_attendance_record(
+            check_in_at=check_in,
+            check_out_at=check_out,
+            expected_minutes=480,
+            worked_minutes=0,
+        )
+
+        salary = self._run()
+        line = SalaryDeduction.objects.get(salary=salary, code="ABS_PEN")
+        self.assertEqual(line.amount, Decimal("3226"))
+
+    def test_deduction_target_code_from_contract_configuration_template(self):
+        self._create_deduction(name="Late Penalty", code="LATE_PEN")
+        ContractComponentTemplate.objects.create(
+            employer_id=self.employer.id,
+            component_type=ContractComponentTemplate.COMPONENT_DEDUCTION,
+            code="LATE_PEN",
+            name="Late Penalty",
+            is_active=True,
+        )
+        AttendancePayrollImpactConfig.objects.create(
+            employer_id=self.employer.id,
+            event_code=AttendancePayrollImpactConfig.EVENT_LATENESS,
+            affects_payroll=True,
+            bucket=AttendancePayrollImpactConfig.BUCKET_DEDUCTION,
+            target_code="LATE_PEN",
+            target_name="Late Penalty",
+            calc_method=AttendancePayrollImpactConfig.CALC_PER_MINUTE,
+            value=Decimal("10.00"),
+            grace_minutes=5,
+            requires_validation=True,
+            is_active=True,
+        )
+
+        check_in = timezone.make_aware(datetime(self.year, self.month, 5, 9, 20, 0))
+        check_out = timezone.make_aware(datetime(self.year, self.month, 5, 17, 0, 0))
+        self._create_attendance_record(
+            check_in_at=check_in,
+            check_out_at=check_out,
+            expected_minutes=480,
+            worked_minutes=460,
+        )
+
+        salary = self._run()
+        line = SalaryDeduction.objects.get(salary=salary, code="LATE_PEN")
+        self.assertEqual(line.name, "Late Penalty")
+        self.assertEqual(line.amount, Decimal("150"))
+
+    def test_overtime_advantage_computed_with_multiplier(self):
+        overtime_allowance = self._create_allowance(name="Overtime Pay", code="OT_PAY", amount="0")
+        AttendancePayrollImpactConfig.objects.create(
+            employer_id=self.employer.id,
+            event_code=AttendancePayrollImpactConfig.EVENT_OVERTIME,
+            affects_payroll=True,
+            bucket=AttendancePayrollImpactConfig.BUCKET_ADVANTAGE,
+            allowance=overtime_allowance,
+            calc_method=AttendancePayrollImpactConfig.CALC_MULTIPLIER_HOURLY_RATE,
+            value=Decimal("1.50"),
+            multiplier=Decimal("1.50"),
+            requires_validation=True,
+            is_active=True,
+        )
+
+        check_in = timezone.make_aware(datetime(self.year, self.month, 7, 9, 0, 0))
+        check_out = timezone.make_aware(datetime(self.year, self.month, 7, 19, 0, 0))
+        self._create_attendance_record(
+            check_in_at=check_in,
+            check_out_at=check_out,
+            expected_minutes=480,
+            worked_minutes=600,
+            overtime_worked_minutes=120,
+            overtime_approved_minutes=120,
+        )
+
+        salary = self._run()
+        line = SalaryAdvantage.objects.get(salary=salary, code="OT_PAY")
+        self.assertEqual(line.amount, Decimal("1210"))
+
+    def test_advantage_target_code_from_contract_configuration_template(self):
+        self._create_allowance(name="Overtime Pay", code="OT_PAY", amount="0")
+        ContractComponentTemplate.objects.create(
+            employer_id=self.employer.id,
+            component_type=ContractComponentTemplate.COMPONENT_ADVANTAGE,
+            code="OT_PAY",
+            name="Overtime Pay",
+            is_active=True,
+        )
+        AttendancePayrollImpactConfig.objects.create(
+            employer_id=self.employer.id,
+            event_code=AttendancePayrollImpactConfig.EVENT_OVERTIME,
+            affects_payroll=True,
+            bucket=AttendancePayrollImpactConfig.BUCKET_ADVANTAGE,
+            target_code="OT_PAY",
+            target_name="Overtime Pay",
+            calc_method=AttendancePayrollImpactConfig.CALC_MULTIPLIER_HOURLY_RATE,
+            value=Decimal("1.50"),
+            multiplier=Decimal("1.50"),
+            requires_validation=True,
+            is_active=True,
+        )
+
+        check_in = timezone.make_aware(datetime(self.year, self.month, 7, 9, 0, 0))
+        check_out = timezone.make_aware(datetime(self.year, self.month, 7, 19, 0, 0))
+        self._create_attendance_record(
+            check_in_at=check_in,
+            check_out_at=check_out,
+            expected_minutes=480,
+            worked_minutes=600,
+            overtime_worked_minutes=120,
+            overtime_approved_minutes=120,
+        )
+
+        salary = self._run()
+        line = SalaryAdvantage.objects.get(salary=salary, code="OT_PAY")
+        self.assertEqual(line.name, "Overtime Pay")
+        self.assertEqual(line.amount, Decimal("1210"))
+
+    def test_idempotency_rerun_updates_amount_without_duplicates(self):
+        overtime_allowance = self._create_allowance(name="Overtime Pay", code="OT_PAY", amount="0")
+        AttendancePayrollImpactConfig.objects.create(
+            employer_id=self.employer.id,
+            event_code=AttendancePayrollImpactConfig.EVENT_OVERTIME,
+            affects_payroll=True,
+            bucket=AttendancePayrollImpactConfig.BUCKET_ADVANTAGE,
+            allowance=overtime_allowance,
+            calc_method=AttendancePayrollImpactConfig.CALC_MULTIPLIER_HOURLY_RATE,
+            multiplier=Decimal("1.50"),
+            value=Decimal("1.50"),
+            requires_validation=True,
+            is_active=True,
+        )
+
+        check_in = timezone.make_aware(datetime(self.year, self.month, 8, 9, 0, 0))
+        check_out = timezone.make_aware(datetime(self.year, self.month, 8, 18, 0, 0))
+        record = AttendanceRecord.objects.create(
+            employer_id=self.employer.id,
+            employee=self.employee,
+            check_in_at=check_in,
+            check_out_at=check_out,
+            expected_minutes=480,
+            worked_minutes=540,
+            overtime_worked_minutes=60,
+            overtime_approved_minutes=60,
+            status=AttendanceRecord.STATUS_APPROVED,
+            mode=AttendanceRecord.MODE_MANUAL,
+        )
+
+        first_salary = self._run()
+        first_line = SalaryAdvantage.objects.get(salary=first_salary, code="OT_PAY")
+        self.assertEqual(first_line.amount, Decimal("605"))
+        self.assertEqual(
+            PayrollGeneratedItem.objects.filter(
+                employer_id=self.employer.id,
+                employee=self.employee,
+                year=self.year,
+                month=self.month,
+                source_event_code=AttendancePayrollImpactConfig.EVENT_OVERTIME,
+                is_active=True,
+            ).count(),
+            1,
+        )
+
+        record.overtime_worked_minutes = 120
+        record.overtime_approved_minutes = 120
+        record.save(update_fields=["overtime_worked_minutes", "overtime_approved_minutes", "updated_at"])
+
+        second_salary = self._run()
+        second_line = SalaryAdvantage.objects.get(salary=second_salary, code="OT_PAY")
+        self.assertEqual(second_line.amount, Decimal("1210"))
+        generated_items = PayrollGeneratedItem.objects.filter(
+            employer_id=self.employer.id,
+            employee=self.employee,
+            year=self.year,
+            month=self.month,
+            source_event_code=AttendancePayrollImpactConfig.EVENT_OVERTIME,
+            is_active=True,
+        )
+        self.assertEqual(generated_items.count(), 1)
+        self.assertEqual(generated_items.first().amount, Decimal("1210"))

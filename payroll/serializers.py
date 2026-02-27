@@ -1,9 +1,10 @@
 from rest_framework import serializers
 
 from accounts.models import EmployerProfile
-from contracts.models import Allowance
+from contracts.models import Allowance, ContractComponentTemplate, Deduction
 
 from .models import (
+    AttendancePayrollImpactConfig,
     CalculationBasis,
     CalculationBasisAdvantage,
     PayrollConfiguration,
@@ -18,6 +19,140 @@ class PayrollConfigurationSerializer(serializers.ModelSerializer):
         model = PayrollConfiguration
         fields = "__all__"
         read_only_fields = ["id", "created_at", "updated_at", "employer_id"]
+
+
+class AttendancePayrollImpactConfigSerializer(serializers.ModelSerializer):
+    deduction_name = serializers.CharField(source="deduction.name", read_only=True)
+    deduction_code = serializers.CharField(source="deduction.code", read_only=True)
+    allowance_name = serializers.CharField(source="allowance.name", read_only=True)
+    allowance_code = serializers.CharField(source="allowance.code", read_only=True)
+
+    class Meta:
+        model = AttendancePayrollImpactConfig
+        fields = "__all__"
+        read_only_fields = [
+            "id",
+            "created_at",
+            "updated_at",
+            "employer_id",
+            "deduction_name",
+            "deduction_code",
+            "allowance_name",
+            "allowance_code",
+        ]
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        tenant_db = self.context.get("tenant_db")
+        employer_id = self.context.get("employer_id")
+        if tenant_db and "deduction" in self.fields:
+            deduction_qs = Deduction.objects.using(tenant_db)
+            if employer_id is not None:
+                deduction_qs = deduction_qs.filter(contract__employer_id=employer_id)
+            self.fields["deduction"].queryset = deduction_qs
+        if tenant_db and "allowance" in self.fields:
+            allowance_qs = Allowance.objects.using(tenant_db)
+            if employer_id is not None:
+                allowance_qs = allowance_qs.filter(contract__employer_id=employer_id)
+            self.fields["allowance"].queryset = allowance_qs
+
+    def validate(self, attrs):
+        attrs = super().validate(attrs)
+        target_code_in_payload = "target_code" in attrs
+        bucket = attrs.get("bucket", getattr(self.instance, "bucket", None))
+        affects = attrs.get("affects_payroll", getattr(self.instance, "affects_payroll", False))
+        deduction = attrs.get("deduction", getattr(self.instance, "deduction", None))
+        allowance = attrs.get("allowance", getattr(self.instance, "allowance", None))
+        target_code = attrs.get("target_code", getattr(self.instance, "target_code", None))
+        target_name = attrs.get("target_name", getattr(self.instance, "target_name", None))
+        grace_minutes = attrs.get("grace_minutes", getattr(self.instance, "grace_minutes", None))
+        cap_amount = attrs.get("cap_amount", getattr(self.instance, "cap_amount", None))
+        value = attrs.get("value", getattr(self.instance, "value", None))
+        multiplier = attrs.get("multiplier", getattr(self.instance, "multiplier", None))
+
+        target_code = str(target_code or "").strip().upper() or None
+        target_name = str(target_name or "").strip() or None
+        attrs["target_code"] = target_code
+        attrs["target_name"] = target_name
+
+        if grace_minutes is not None and int(grace_minutes) < 0:
+            raise serializers.ValidationError({"grace_minutes": "grace_minutes must be >= 0."})
+        if cap_amount is not None and cap_amount < 0:
+            raise serializers.ValidationError({"cap_amount": "cap_amount must be >= 0."})
+        if value is not None and value < 0:
+            raise serializers.ValidationError({"value": "value must be >= 0."})
+        if multiplier is not None and multiplier < 0:
+            raise serializers.ValidationError({"multiplier": "multiplier must be >= 0."})
+
+        if affects:
+            if bucket == AttendancePayrollImpactConfig.BUCKET_DEDUCTION:
+                if not deduction and not target_code:
+                    raise serializers.ValidationError(
+                        {"target_code": "A deduction target is required when bucket is DEDUCTION."}
+                    )
+                if allowance:
+                    raise serializers.ValidationError(
+                        {"allowance": "allowance must be null when bucket is DEDUCTION."}
+                    )
+                if not target_code and deduction and deduction.code:
+                    attrs["target_code"] = str(deduction.code).strip().upper()
+                if not attrs.get("target_name") and deduction and deduction.name:
+                    attrs["target_name"] = str(deduction.name).strip()
+            elif bucket == AttendancePayrollImpactConfig.BUCKET_ADVANTAGE:
+                if not allowance and not target_code:
+                    raise serializers.ValidationError(
+                        {"target_code": "An allowance target is required when bucket is ADVANTAGE."}
+                    )
+                if deduction:
+                    raise serializers.ValidationError(
+                        {"deduction": "deduction must be null when bucket is ADVANTAGE."}
+                    )
+                if not target_code and allowance and allowance.code:
+                    attrs["target_code"] = str(allowance.code).strip().upper()
+                if not attrs.get("target_name") and allowance and allowance.name:
+                    attrs["target_name"] = str(allowance.name).strip()
+
+        tenant_db = self.context.get("tenant_db")
+        employer_id = self.context.get("employer_id")
+        effective_target_code = attrs.get("target_code")
+        requires_template_lookup = (
+            bool(effective_target_code)
+            and (
+                target_code_in_payload
+                or (bucket == AttendancePayrollImpactConfig.BUCKET_DEDUCTION and not deduction)
+                or (bucket == AttendancePayrollImpactConfig.BUCKET_ADVANTAGE and not allowance)
+            )
+        )
+        if affects and requires_template_lookup and bucket in {
+            AttendancePayrollImpactConfig.BUCKET_DEDUCTION,
+            AttendancePayrollImpactConfig.BUCKET_ADVANTAGE,
+        } and tenant_db and employer_id is not None:
+            expected_component_type = (
+                ContractComponentTemplate.COMPONENT_DEDUCTION
+                if bucket == AttendancePayrollImpactConfig.BUCKET_DEDUCTION
+                else ContractComponentTemplate.COMPONENT_ADVANTAGE
+            )
+            try:
+                template = (
+                    ContractComponentTemplate.objects.using(tenant_db)
+                    .filter(
+                        employer_id=employer_id,
+                        component_type=expected_component_type,
+                        code=effective_target_code,
+                        is_active=True,
+                    )
+                    .first()
+                )
+            except Exception:
+                template = None
+            if not template:
+                raise serializers.ValidationError(
+                    {"target_code": "Selected target code is not an active Contract Configuration template."}
+                )
+            if not attrs.get("target_name"):
+                attrs["target_name"] = str(template.name or "").strip() or None
+
+        return attrs
 
 
 class CalculationBasisSerializer(serializers.ModelSerializer):

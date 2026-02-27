@@ -42,6 +42,8 @@ _DEFAULT_PAYROLL_CONFIGURATION = {
     "cnps_applicable": None,
     "probation_period_days": None,
     "proration_rule_id": None,
+    "advantage_catalog": [],
+    "deduction_catalog": [],
 }
 
 _DEFAULT_EXPENSE_CONFIGURATION = {

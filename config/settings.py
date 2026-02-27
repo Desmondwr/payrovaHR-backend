@@ -51,6 +51,7 @@ INSTALLED_APPS = [
     # Third-party apps
     'rest_framework',
     'rest_framework_simplejwt',
+    'rest_framework_simplejwt.token_blacklist',
     'corsheaders',
     
     # Local apps
@@ -226,6 +227,7 @@ CORS_ALLOW_CREDENTIALS = True
 CORS_ALLOW_HEADERS = list(default_headers) + [
     'x-employer-id',
     'x-employer-slug',
+    'x-portal-mode',
 ]
 
 
